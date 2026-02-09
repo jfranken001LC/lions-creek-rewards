@@ -1,0 +1,14 @@
+name = "React Router"
+roles = ["frontend", "backend"]
+
+# Where Shopify CLI should send webhooks during `shopify app dev --reset` and local dev.
+# This must match your route file at app/routes/webhooks.tsx
+webhooks_path = "/webhooks"
+
+# Pin the web port so your app is deterministic locally.
+# (Avoid using this same port for `--tunnel-url :<port>`; let the CLI proxy use a different port, e.g. 443.)
+port = 3010
+
+[commands]
+predev = "npx prisma generate"
+dev = "npx prisma migrate deploy && npm exec react-router dev"

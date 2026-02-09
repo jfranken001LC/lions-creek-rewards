@@ -1,0 +1,19 @@
+{
+  "name": "Bottle Equivalent Discount Settings",
+  "description": "Admin configuration UI for the Bottle Equivalent Discount Function.",
+  "title": "Bottle Equivalent (BE) discount configuration",
+  "loading": "Loading...",
+  "label": "Bottle Equivalent Discount",
+  "collections": {
+    "buttonLabel": "Choose collections",
+    "allProducts": "All products",
+    "collections": "Collections",
+    "appliesTo": "Applies to"
+  },
+  "discountClasses": {
+    "product": "Product discount",
+    "order": "Order discount",
+    "shipping": "Shipping discount"
+  },
+  "error": "Unable to update discount configuration. Please try again."
+}

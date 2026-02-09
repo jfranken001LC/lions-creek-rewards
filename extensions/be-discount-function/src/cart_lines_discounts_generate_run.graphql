@@ -1,0 +1,41 @@
+query Input {
+  cart {
+    cost {
+      subtotalAmount { amount }
+    }
+    lines {
+      id
+      quantity
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          # Preferred: store metafield definition "loyalty.bottle_equivalent"
+          beMetafield: metafield(namespace: "loyalty", key: "bottle_equivalent") {
+            value
+          }
+          # Legacy fallback: prior implementation "custom.loyalty_bottle_equivalent"
+          legacyBeMetafield: metafield(namespace: "custom", key: "loyalty_bottle_equivalent") {
+            value
+          }
+          product {
+            beMetafield: metafield(namespace: "loyalty", key: "bottle_equivalent") {
+              value
+            }
+            legacyBeMetafield: metafield(namespace: "custom", key: "loyalty_bottle_equivalent") {
+              value
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # IMPORTANT: use CUSTOM config because your active discount node stores it there
+  # and $app is null for the Automatic discount node.
+  discount {
+    metafield(namespace: "custom", key: "function-configuration") {
+      jsonValue
+      value
+    }
+  }
+}
