@@ -160,4 +160,7 @@ curl -fsS "http://${HOST}:${PORT}/" >/dev/null 2>&1 || curl -fsS "http://127.0.0
 }
 
 echo "OK: app is responding on localhost:${PORT}"
+say "Setting exec status for upgrade file for next iteration"
+cd "$REPO_DIR"
+sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh
 say "Done"

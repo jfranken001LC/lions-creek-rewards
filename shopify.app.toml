@@ -1,8 +1,6 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
-
 client_id = "018d1d4d00f8544b759266b72d17c00e"
 name = "Lions Creek Rewards"
-application_url = "https://loaylty.basketbooster.ca"
+application_url = "https://loyalty.basketbooster.ca"
 embedded = true
 
 [build]
@@ -13,18 +11,14 @@ dev_store_url = "lions-creek-dev-3.myshopify.com"
 api_version = "2026-01"
 
   [[webhooks.subscriptions]]
-  topics = [ "app/scopes_update" ]
-  uri = "/webhooks/app/scopes_update"
-
-  [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled", "app/scopes_update" ]
+  uri = "/webhooks"
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_customers,write_customers,write_discounts,read_orders,read_products"
+scopes = "read_orders,read_customers,write_customers,read_products,write_discounts"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://loaylty.basketbooster.ca" ]
+redirect_urls = [ "https://loyalty.basketbooster.ca/auth/callback" ]
