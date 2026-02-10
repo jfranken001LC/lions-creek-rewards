@@ -13,12 +13,11 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-
 model Session {
-  id            String    @id
+  id            String   @id
   shop          String
   state         String
-  isOnline      Boolean   @default(false)
+  isOnline      Boolean  @default(false)
   scope         String?
   expires       DateTime?
   accessToken   String
@@ -26,10 +25,11 @@ model Session {
   firstName     String?
   lastName      String?
   email         String?
-  accountOwner  Boolean   @default(false)
+  accountOwner  Boolean  @default(false)
   locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  collaborator  Boolean? @default(false)
+  emailVerified Boolean? @default(false)
+
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
@@ -52,28 +52,40 @@ enum RedemptionStatus {
   EXPIRED
 }
 
+/**
+ * NEW: webhook processing outcome status (audit/logging)
+ */
+enum WebhookOutcome {
+  RECEIVED
+  PROCESSED
+  SKIPPED
+  FAILED
+}
+
 model ShopSettings {
-  shop                String   @id
-  earnRate             Int      @default(1)
-  redemptionMinOrder   Int      @default(0)
+  shop              String   @id
+  earnRate          Int      @default(1)
+  redemptionMinOrder Int     @default(0)
+
   /// Arrays and maps (SQLite): store as Json (TEXT-backed).
   excludedCustomerTags Json?
   includeProductTags   Json?
   excludeProductTags   Json?
   redemptionSteps      Json?
   redemptionValueMap   Json?
-  updatedAt            DateTime @default(now())
+
+  updatedAt DateTime @default(now())
 }
 
 model CustomerPointsBalance {
-  id              String   @id @default(cuid())
-  shop            String
-  customerId      String
-  balance         Int      @default(0)
-  lifetimeEarned  Int      @default(0)
-  lifetimeRedeemed Int     @default(0)
-  lastActivityAt  DateTime @default(now())
-  expiredAt       DateTime?
+  id               String   @id @default(cuid())
+  shop             String
+  customerId       String
+  balance          Int      @default(0)
+  lifetimeEarned   Int      @default(0)
+  lifetimeRedeemed Int      @default(0)
+  lastActivityAt   DateTime @default(now())
+  expiredAt        DateTime?
 
   @@unique([shop, customerId], name: "shop_customerId")
   @@index([shop, customerId])
@@ -96,16 +108,16 @@ model PointsLedger {
 }
 
 model OrderPointsSnapshot {
-  id                   String   @id @default(cuid())
-  shop                 String
-  orderId              String
-  customerId           String
-  eligibleNetMerchandise Float   @default(0)
-  pointsAwarded        Int      @default(0)
-  pointsReversedToDate Int      @default(0)
-  paidAt               DateTime
-  cancelledAt          DateTime?
-  currency             String   @default("CAD")
+  id                     String   @id @default(cuid())
+  shop                   String
+  orderId                String
+  customerId             String
+  eligibleNetMerchandise Float    @default(0)
+  pointsAwarded          Int      @default(0)
+  pointsReversedToDate   Int      @default(0)
+  paidAt                 DateTime
+  cancelledAt            DateTime?
+  currency               String   @default("CAD")
 
   @@unique([shop, orderId], name: "shop_orderId")
   @@index([shop, customerId])
@@ -136,6 +148,12 @@ model WebhookEvent {
   resourceId String
   receivedAt DateTime @default(now())
 
+  // NEW: outcome logging fields
+  outcome        WebhookOutcome @default(RECEIVED)
+  outcomeCode    String?
+  outcomeMessage String?
+  processedAt    DateTime?
+
   @@unique([shop, webhookId], name: "shop_webhookId")
   @@index([shop, topic, receivedAt])
 }
@@ -152,11 +170,11 @@ model WebhookError {
 }
 
 model PrivacyEvent {
-  id         String   @id @default(cuid())
-  shop       String
-  topic      String
+  id          String   @id @default(cuid())
+  shop        String
+  topic       String
   payloadJson String
-  createdAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
 
   @@index([shop, createdAt])
 }

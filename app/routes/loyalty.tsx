@@ -32,12 +32,6 @@ function timingSafeEqual(a: Buffer, b: Buffer) {
   return crypto.timingSafeEqual(a, b);
 }
 
-/**
- * Shopify App Proxy HMAC:
- * - Build message from query params sorted by key, excluding `hmac` and `signature`
- * - Join as: key=value&key=value
- * - HMAC-SHA256 with API secret, compare hex digest
- */
 function verifyAppProxyHmac(url: URL, apiSecret: string): boolean {
   const hmac = url.searchParams.get("hmac");
   if (!hmac || !apiSecret) return false;
@@ -48,14 +42,12 @@ function verifyAppProxyHmac(url: URL, apiSecret: string): boolean {
     .sort();
 
   for (const k of keys) {
-    // App Proxy can repeat keys; include each occurrence in order
     const values = url.searchParams.getAll(k);
     for (const v of values) pairs.push(`${k}=${v}`);
   }
 
   const message = pairs.join("&");
   const digest = crypto.createHmac("sha256", apiSecret).update(message).digest("hex");
-
   return timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
 }
 
@@ -104,9 +96,6 @@ async function getShopSettings(shop: string) {
   };
 }
 
-/**
- * Offline token row comes from PrismaSessionStorage with id: offline_{shop}
- */
 async function getOfflineAccessToken(shop: string): Promise<string | null> {
   const id = `offline_${shop}`;
   const s = await db.session.findUnique({ where: { id } }).catch(() => null);
@@ -117,7 +106,6 @@ async function shopifyGraphql(shop: string, query: string, variables: any) {
   const token = await getOfflineAccessToken(shop);
   if (!token) throw new Error("Missing offline access token for shop. Reinstall/re-auth the app.");
 
-  // Your app is configured for ApiVersion.October25 in shopify.server.ts -> 2025-10
   const endpoint = `https://${shop}/admin/api/2025-10/graphql.json`;
 
   const resp = await fetch(endpoint, {
@@ -135,41 +123,30 @@ async function shopifyGraphql(shop: string, query: string, variables: any) {
   }
 
   const json = await resp.json().catch(() => null);
-  if (json?.errors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  }
+  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
   return json?.data;
 }
 
-/**
- * If includeProductTags is configured, restrict discount to products matching those tags.
- * We keep it simple: query products by tag OR tag OR tag (up to first 250).
- * If no include tags are configured, we return null -> discount applies to all items.
- */
 async function getEligibleProductGidsByTags(shop: string, includeTags: string[]): Promise<string[] | null> {
   const tags = includeTags.map((t) => t.trim()).filter(Boolean);
   if (tags.length === 0) return null;
 
-  // Shopify product search syntax: tag:foo OR tag:bar
   const q = tags.map((t) => `tag:${JSON.stringify(t)}`).join(" OR ");
   const query = `
     query ProductsByTag($q: String!) {
-      products(first: 250, query: $q) {
-        nodes { id }
-      }
+      products(first: 250, query: $q) { nodes { id } }
     }
   `;
 
   const data = await shopifyGraphql(shop, query, { q });
   const nodes: any[] = data?.products?.nodes ?? [];
   const ids = nodes.map((n) => String(n.id)).filter(Boolean);
-
-  if (ids.length === 0) return null; // fallback to all items if none found
+  if (ids.length === 0) return null;
   return ids;
 }
 
 function makeDiscountCode(prefix: string) {
-  const suffix = crypto.randomBytes(4).toString("hex").toUpperCase(); // 8 chars
+  const suffix = crypto.randomBytes(4).toString("hex").toUpperCase();
   return `${prefix}-${suffix}`;
 }
 
@@ -190,10 +167,7 @@ async function createShopifyDiscountCode(params: {
         codeDiscountNode {
           id
           codeDiscount {
-            ... on DiscountCodeBasic {
-              title
-              codes(first: 5) { nodes { code } }
-            }
+            ... on DiscountCodeBasic { title codes(first: 5) { nodes { code } } }
           }
         }
         userErrors { field message }
@@ -202,7 +176,6 @@ async function createShopifyDiscountCode(params: {
   `;
 
   const startsAt = new Date().toISOString();
-  // Keep short-lived codes to reduce clutter; can be tuned.
   const endsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const variables: any = {
@@ -218,10 +191,7 @@ async function createShopifyDiscountCode(params: {
       },
       customerGets: {
         value: {
-          discountAmount: {
-            amount: amountOff.toFixed(2),
-            appliesOnEachItem: false,
-          },
+          discountAmount: { amount: amountOff.toFixed(2), appliesOnEachItem: false },
         },
         items:
           eligibleProductIds && eligibleProductIds.length > 0
@@ -230,26 +200,18 @@ async function createShopifyDiscountCode(params: {
       },
       minimumRequirement:
         minSubtotal && minSubtotal > 0
-          ? {
-              subtotal: {
-                greaterThanOrEqualToSubtotal: String(minSubtotal.toFixed(2)),
-              },
-            }
+          ? { subtotal: { greaterThanOrEqualToSubtotal: String(minSubtotal.toFixed(2)) } }
           : null,
     },
   };
 
   const data = await shopifyGraphql(shop, mutation, variables);
   const result = data?.discountCodeBasicCreate;
-
   const userErrors: any[] = result?.userErrors ?? [];
-  if (userErrors.length) {
-    throw new Error(`Discount create userErrors: ${JSON.stringify(userErrors)}`);
-  }
+  if (userErrors.length) throw new Error(`Discount create userErrors: ${JSON.stringify(userErrors)}`);
 
   const nodeId = String(result?.codeDiscountNode?.id ?? "");
   const returnedCode = String(result?.codeDiscountNode?.codeDiscount?.codes?.nodes?.[0]?.code ?? code);
-
   if (!nodeId) throw new Error("Discount create returned no codeDiscountNode.id");
   return { nodeId, code: returnedCode };
 }
@@ -258,21 +220,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
 
-  // App Proxy required params
   const shop = (url.searchParams.get("shop") ?? "").toLowerCase();
   const customerId = url.searchParams.get("logged_in_customer_id") ?? "";
   const ok = verifyAppProxyHmac(url, apiSecret);
 
-  if (!ok) {
+  if (!ok || !shop || !customerId) {
     return data(
       { ok: false, shop, customerId, balance: 0, lastActivityAt: null, ledger: [], issuedCodes: [], redemptionMinOrder: 0 },
       { status: 401 },
-    );
-  }
-  if (!shop || !customerId) {
-    return data(
-      { ok: false, shop, customerId, balance: 0, lastActivityAt: null, ledger: [], issuedCodes: [], redemptionMinOrder: 0 },
-      { status: 400 },
     );
   }
 
@@ -296,7 +251,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     select: { id: true, points: true, value: true, code: true, status: true, createdAt: true },
   });
 
-  const payload: LoaderData = {
+  return data<LoaderData>({
     ok: true,
     shop,
     customerId,
@@ -318,9 +273,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       createdAt: r.createdAt.toISOString(),
     })),
     redemptionMinOrder: Number(settings.redemptionMinOrder ?? 0) || 0,
-  };
-
-  return data(payload);
+  });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -330,22 +283,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const shop = (url.searchParams.get("shop") ?? "").toLowerCase();
   const customerId = url.searchParams.get("logged_in_customer_id") ?? "";
 
-  if (!verifyAppProxyHmac(url, apiSecret)) {
-    return data({ ok: false, error: "Unauthorized (bad HMAC)" }, { status: 401 });
-  }
-  if (!shop || !customerId) {
-    return data({ ok: false, error: "Missing shop or customer" }, { status: 400 });
-  }
+  if (!verifyAppProxyHmac(url, apiSecret)) return data({ ok: false, error: "Unauthorized (bad HMAC)" }, { status: 401 });
+  if (!shop || !customerId) return data({ ok: false, error: "Missing shop or customer" }, { status: 400 });
 
   const form = await request.formData();
   const intent = String(form.get("intent") ?? "");
-  if (intent !== "redeem") {
-    return data({ ok: false, error: "Unknown intent" }, { status: 400 });
-  }
+  if (intent !== "redeem") return data({ ok: false, error: "Unknown intent" }, { status: 400 });
 
   const pointsReq = clampInt(Number(form.get("points") ?? 0) || 0, 0, 1000);
   if (![500, 1000].includes(pointsReq)) {
     return data({ ok: false, error: "Invalid points amount. Choose 500 or 1000." }, { status: 400 });
+  }
+
+  // ✅ NEW GUARD: only one ISSUED code at a time
+  const existingActive = await db.redemption.findFirst({
+    where: { shop, customerId, status: "ISSUED" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (existingActive) {
+    // Return the active code instead of issuing a new one
+    return data({
+      ok: true,
+      code: existingActive.code,
+      value: existingActive.value,
+      points: existingActive.points,
+      note: "You already have an active code. Use it before generating another.",
+    });
   }
 
   const settings = await getShopSettings(shop);
@@ -361,25 +325,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   });
 
   const balance = balanceRow?.balance ?? 0;
-  if (balance < pointsReq) {
-    return data({ ok: false, error: `Insufficient points. You have ${balance}.` }, { status: 400 });
-  }
+  if (balance < pointsReq) return data({ ok: false, error: `Insufficient points. You have ${balance}.` }, { status: 400 });
 
-  // Idempotency: client can pass an idempotency key; if omitted, we generate one per request
+  // Idempotency key support
   const idemKey = String(form.get("idemKey") ?? crypto.randomUUID());
+  const existingIdem = await db.redemption.findFirst({ where: { shop, customerId, idemKey } });
+  if (existingIdem) return data({ ok: true, code: existingIdem.code, value: existingIdem.value, points: existingIdem.points });
 
-  // If already issued for this key, return it (safe retry)
-  const existing = await db.redemption.findFirst({
-    where: { shop, customerId, idemKey },
-  });
-  if (existing) {
-    return data({ ok: true, code: existing.code, value: existing.value, points: existing.points });
-  }
-
-  // Customer GID required by discountCodeBasicCreate customerSelection
   const customerGid = `gid://shopify/Customer/${customerId}`;
-
-  // If includeProductTags configured, restrict discount to those products
   const includeTags: string[] = (settings.includeProductTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
   const eligibleProductIds = await getEligibleProductGidsByTags(shop, includeTags);
 
@@ -388,7 +341,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const code = makeDiscountCode(pointsReq === 500 ? "LC-REW10" : "LC-REW20");
   const title = pointsReq === 500 ? "Lions Creek Rewards - $10" : "Lions Creek Rewards - $20";
 
-  // Create Shopify code discount
   const created = await createShopifyDiscountCode({
     shop,
     customerGid,
@@ -399,7 +351,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     title,
   });
 
-  // Persist redemption + ledger + balance update
   await db.$transaction(async (tx) => {
     await tx.redemption.create({
       data: {
@@ -437,7 +388,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
     });
 
-    // Safety clamp (should not happen, but protects against concurrent updates)
     const b = await tx.customerPointsBalance.findUnique({
       where: { shop_customerId: { shop, customerId } },
     });
@@ -492,15 +442,8 @@ export default function LoyaltyDashboard() {
             <input type="hidden" name="idemKey" value={crypto.randomUUID()} />
             <button
               type="submit"
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #ccc",
-                cursor: "pointer",
-                background: "white",
-              }}
+              style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ccc", cursor: "pointer", background: "white" }}
               disabled={d.balance < 500}
-              title={d.balance < 500 ? "Not enough points" : "Generate a $10 code"}
             >
               Redeem 500 → $10 code
             </button>
@@ -512,15 +455,8 @@ export default function LoyaltyDashboard() {
             <input type="hidden" name="idemKey" value={crypto.randomUUID()} />
             <button
               type="submit"
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #ccc",
-                cursor: "pointer",
-                background: "white",
-              }}
+              style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ccc", cursor: "pointer", background: "white" }}
               disabled={d.balance < 1000}
-              title={d.balance < 1000 ? "Not enough points" : "Generate a $20 code"}
             >
               Redeem 1000 → $20 code
             </button>
@@ -529,6 +465,7 @@ export default function LoyaltyDashboard() {
 
         <p style={{ marginTop: 10, fontSize: 13, opacity: 0.75 }}>
           After you redeem, you’ll receive a one-time discount code. Enter the code at checkout. Codes expire in 7 days.
+          Only one active code is allowed at a time.
         </p>
       </section>
 
