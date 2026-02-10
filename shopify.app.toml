@@ -1,8 +1,8 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "c24e58a5c830c7a3eda14ae5d6f8f6da"
-name = "Basket Booster Discounts"
-application_url = "https://app.basketbooster.ca"
+client_id = "018d1d4d00f8544b759266b72d17c00e"
+name = "Lions Creek Rewards"
+application_url = "https://example.com"
 embedded = true
 
 [build]
@@ -12,23 +12,18 @@ automatically_update_urls_on_dev = false
 api_version = "2026-01"
 
   [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled", "app/scopes_update" ]
-  uri = "/webhooks"
-  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_discounts"
+scopes = ""
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://app.basketbooster.ca/auth/callback" ]
-
-[discount.metafields.app.function-configuration]
-type = "json"
-name = "Function configuration"
-
-  [discount.metafields.app.function-configuration.access]
-  admin = "merchant_read_write"
-  storefront = "none"
+redirect_urls = [ ]

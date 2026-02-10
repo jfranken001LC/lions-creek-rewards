@@ -2,19 +2,16 @@
 set -Eeuo pipefail
 
 # ==============================================================================
-# BasketBooster - Production Deploy (Git + Build + Prisma + Systemd restart)
-# Drop-in replacement for: scripts/Server_Git_Code_Deploy.sh
-#
-# Guarantees repo matches origin/main, keeps secrets outside repo, builds, migrates,
-# restarts systemd, and verifies the app is listening locally.
+# Loyalty - Production Deploy (Git + Build + Prisma + Systemd restart)
+# Based on BasketBooster deploy script, tuned for loyalty.basketbooster.ca
 # ==============================================================================
 
 # -------- Config (override via env vars) --------------------------------------
-REPO_DIR="${REPO_DIR:-/var/www/basketbooster}"
+REPO_DIR="${REPO_DIR:-/var/lions-creek-rewards}"
 BRANCH="${BRANCH:-main}"
 REMOTE="${REMOTE:-origin}"
-SERVICE_NAME="${SERVICE_NAME:-basketbooster}"
-ENV_FILE="${ENV_FILE:-/etc/basketbooster/basketbooster.env}"
+SERVICE_NAME="${SERVICE_NAME:-lions-creek-rewards}"
+ENV_FILE="${ENV_FILE:-/etc/lions-creek-rewards/lions-creek-rewards.env}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/${SERVICE_NAME}.deploy.lock}"
 
 say() { printf "\n==== %s ====\n" "$*"; }
@@ -24,15 +21,13 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $
 
 load_env() {
   [[ -f "$ENV_FILE" ]] || die "Env file not found: $ENV_FILE"
-  # Read with sudo so ENV_FILE can be chmod 600 root:root.
   # shellcheck disable=SC1090
   set -a
   source <(sudo -n cat "$ENV_FILE")
   set +a
 }
 
-# If this script lives inside the repo, re-exec from /tmp so git reset won't
-# clobber the running process.
+# If this script lives inside the repo, re-exec from /tmp so git reset won't clobber it.
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 if [[ "${DEPLOY_REEXEC:-0}" != "1" ]] && [[ "$SELF" == "$REPO_DIR"* ]]; then
   TMP="/tmp/$(basename "$SELF").$$"
@@ -75,7 +70,6 @@ git reset --hard "${REMOTE}/${BRANCH}"
 
 # -------- Clean build artifacts (preserve env + sqlite DB) ---------------------
 say "Clean ignored/untracked build artifacts (preserve env + sqlite DB)"
-# Keep .env (or symlink) if present, and keep prisma/prod.sqlite so sessions persist.
 git clean -ffdx -e ".env" -e ".env.*" -e "prisma/prod.sqlite" || true
 
 # -------- Show current revision ------------------------------------------------
@@ -87,10 +81,9 @@ git log -1 --oneline
 say "Load env (required for prisma/build)"
 load_env
 echo "HOST=${HOST:-127.0.0.1}"
-echo "PORT=${PORT:-3000}"
+echo "PORT=${PORT:-3001}"
 [[ -n "${SHOPIFY_APP_URL:-}" ]] && echo "SHOPIFY_APP_URL=${SHOPIFY_APP_URL}"
 
-# Fail fast if the service will restart-loop because env is missing
 missing=()
 for k in DATABASE_URL SHOPIFY_API_KEY SHOPIFY_API_SECRET SHOPIFY_APP_URL SESSION_SECRET; do
   [[ -n "${!k:-}" ]] || missing+=("$k")
@@ -114,9 +107,13 @@ say "Prisma deploy"
 npx prisma migrate deploy
 npx prisma generate
 
-# -------- Build extensions -----------------------------------------------------
-say "Build function extension(s)"
-npm run -s build:function
+# -------- Build extensions (only if present) ----------------------------------
+say "Build extension(s) if configured"
+if npm run -s | grep -qE '^  build:function$'; then
+  npm run -s build:function
+else
+  echo "No build:function script found; skipping."
+fi
 
 # -------- Build app ------------------------------------------------------------
 say "Build app"
@@ -134,19 +131,17 @@ sudo systemctl restart "$SERVICE_NAME"
 sudo systemctl status "$SERVICE_NAME" -l --no-pager || true
 
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-3000}"
+PORT="${PORT:-3001}"
 
 say "Wait for listen + local health check (bypass nginx)"
 sleep 1
 
-# If it's restart-looping, uptime will be tiny repeatedly; show logs.
 if ! sudo systemctl is-active --quiet "$SERVICE_NAME"; then
   echo "Service is not active."
   sudo journalctl -u "$SERVICE_NAME" -n 200 -l --no-pager || true
   exit 3
 fi
 
-# Wait up to 20s for a listener
 for _ in {1..20}; do
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(:${PORT}$|\[::\]:${PORT}$|0\.0\.0\.0:${PORT}$)"; then
     break
@@ -157,7 +152,6 @@ done
 echo "Listening sockets (filtered):"
 ss -ltnp 2>/dev/null | grep -E ":${PORT}\b" || true
 
-# Try IPv4 then IPv6 loopback
 curl -fsS "http://${HOST}:${PORT}/" >/dev/null 2>&1 || curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1 || curl -fsS "http://[::1]:${PORT}/" >/dev/null 2>&1 || {
   echo "Health check failed (no response on ${PORT}). Dumping recent logs:"
   sudo systemctl status "$SERVICE_NAME" -l --no-pager || true
