@@ -20,6 +20,7 @@ export default function Terms() {
         <li>Points calculations are based on Shopify webhook payloads and configured eligibility rules.</li>
         <li>Reward issuance may require additional Shopify configuration or future enhancements (e.g., true discount codes).</li>
         <li>Service may be interrupted by Shopify platform changes, store configuration changes, or network outages.</li>
+        <li>Points have no monetary value and cannot be exchanged for cash.</li>
       </ul>
 
       <h2>Support</h2>
