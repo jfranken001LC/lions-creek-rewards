@@ -17,3 +17,5 @@ shopify app dev --reset
 
 
 shopify app dev --use-localhost
+
+shopify app dev --store lions-creek-dev-3.myshopify.com --tunnel-url https://loyalty.basketbooster.ca:433

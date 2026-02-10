@@ -1,12 +1,7 @@
 {
-  "name": "basket-booster-discounts",
+  "name": "lions-creek-rewards",
   "private": true,
   "scripts": {
-    "predev": "npm run build:function",
-    "predeploy": "npm run build:function",
-
-    "build:function": "npm -w extensions/be-discount-function run build",
-
     "build": "react-router build",
     "dev": "shopify app dev",
     "deploy": "shopify app deploy",

@@ -7,18 +7,15 @@ embedded = true
 automatically_update_urls_on_dev = false
 dev_store_url = "lions-creek-dev-3.myshopify.com"
 
-[webhooks]
-api_version = "2026-01"
-
-  [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled", "app/scopes_update" ]
-  uri = "/webhooks"
-  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
-
 [access_scopes]
 scopes = "read_orders,read_customers,write_customers,read_products,write_discounts"
-optional_scopes = [ ]
+optional_scopes = []
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://loyalty.basketbooster.ca/auth/callback" ]
+redirect_urls = [
+  "https://loyalty.basketbooster.ca/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-01"
