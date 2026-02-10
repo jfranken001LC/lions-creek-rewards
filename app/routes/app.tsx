@@ -1,5 +1,4 @@
-import { data } from "react-router";
-import { useLoaderData } from "react-router";
+import { data, Outlet, useLoaderData } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
 import { authenticate } from "../shopify.server";
@@ -14,7 +13,7 @@ export default function App() {
 
   return (
     <AppProvider embedded apiKey={apiKey}>
-      {/* your layout / outlet */}
+      <Outlet />
     </AppProvider>
   );
 }
