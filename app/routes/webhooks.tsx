@@ -6,6 +6,10 @@ export const loader = async (_args: LoaderFunctionArgs) => {
   return new Response("ok", { status: 200 });
 };
 
+function isPrismaUniqueViolation(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as any).code === "P2002";
+}
+
 function base64ToBuffer(value: string): Buffer | null {
   try {
     return Buffer.from(value, "base64");
@@ -53,6 +57,30 @@ function toStringListJson(value: any): string[] {
   return [];
 }
 
+function safeJsonStringify(obj: any, maxLen = 3500): string {
+  let s = "";
+  try {
+    s = JSON.stringify(obj);
+  } catch {
+    s = JSON.stringify({ error: "Could not stringify outcome details." });
+  }
+  if (s.length > maxLen) s = s.slice(0, maxLen) + "…";
+  return s;
+}
+
+function extractNumericIdFromGid(gidOrId: string): string {
+  const s = String(gidOrId || "").trim();
+  if (!s) return "";
+  const m = s.match(/\/(\d+)\s*$/);
+  return m ? m[1] : s;
+}
+
+function normalizeTags(tags: any): string[] {
+  if (!tags) return [];
+  if (Array.isArray(tags)) return tags.map((t) => String(t).trim()).filter(Boolean);
+  return [];
+}
+
 async function getShopSettings(shop: string) {
   const defaults = {
     earnRate: 1,
@@ -83,6 +111,28 @@ async function getOfflineAccessToken(shop: string): Promise<string | null> {
   const id = `offline_${shop}`;
   const s = await db.session.findUnique({ where: { id } }).catch(() => null);
   return s?.accessToken ?? null;
+}
+
+async function shopifyGraphql(shop: string, query: string, variables: any) {
+  const token = await getOfflineAccessToken(shop);
+  if (!token) throw new Error(`Missing offline access token for shop ${shop}. Reinstall/re-auth the app.`);
+
+  const endpoint = `https://${shop}/admin/api/2025-10/graphql.json`;
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Shopify GraphQL failed (${resp.status}): ${t}`);
+  }
+
+  const json = await resp.json().catch(() => null);
+  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  return json?.data;
 }
 
 type OrderForPoints = {
@@ -148,7 +198,10 @@ async function fetchOrderForPoints(shop: string, numericOrderId: string): Promis
   if (!order) return null;
 
   const customer = order.customer
-    ? { id: String(order.customer.id), tags: Array.isArray(order.customer.tags) ? order.customer.tags.map((x: any) => String(x)) : [] }
+    ? {
+        id: String(order.customer.id),
+        tags: Array.isArray(order.customer.tags) ? order.customer.tags.map((x: any) => String(x)) : [],
+      }
     : null;
 
   const discountCodes: string[] = Array.isArray(order.discountApplications?.nodes)
@@ -168,12 +221,7 @@ async function fetchOrderForPoints(shop: string, numericOrderId: string): Promis
     const productTags: string[] =
       n?.variant?.product?.tags && Array.isArray(n.variant.product.tags) ? n.variant.product.tags.map((t: any) => String(t)) : [];
 
-    return {
-      quantity: Number(n?.quantity ?? 0) || 0,
-      originalTotal,
-      allocatedDiscountTotal,
-      productTags,
-    };
+    return { quantity: Number(n?.quantity ?? 0) || 0, originalTotal, allocatedDiscountTotal, productTags };
   });
 
   return {
@@ -186,10 +234,23 @@ async function fetchOrderForPoints(shop: string, numericOrderId: string): Promis
   };
 }
 
-function computeEligibleFromOrder(order: OrderForPoints, settings: any): { eligibleNet: number; customerId: string | null; skipReason?: { code: string; message: string } } {
-  const excludedCustomerTags: string[] = (settings?.excludedCustomerTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
+function isEligibleByProductTags(productTags: string[], settings: any): boolean {
   const includeProductTags: string[] = (settings?.includeProductTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
   const excludeProductTags: string[] = (settings?.excludeProductTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
+
+  const tags = (productTags ?? []).map((t) => String(t).trim()).filter(Boolean);
+
+  const includedByTags = includeProductTags.length === 0 || tags.some((t) => includeProductTags.includes(t));
+  const excludedByTags = excludeProductTags.length > 0 && tags.some((t) => excludeProductTags.includes(t));
+
+  return includedByTags && !excludedByTags;
+}
+
+function computeEligibleFromOrder(
+  order: OrderForPoints,
+  settings: any,
+): { eligibleNet: number; customerId: string | null; skipReason?: { code: string; message: string } } {
+  const excludedCustomerTags: string[] = (settings?.excludedCustomerTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
 
   if (!order.customer?.id) {
     return { eligibleNet: 0, customerId: null, skipReason: { code: "GUEST_ORDER", message: "Order has no customer (guest checkout)." } };
@@ -204,12 +265,7 @@ function computeEligibleFromOrder(order: OrderForPoints, settings: any): { eligi
   let eligibleNet = 0;
 
   for (const li of order.lineItems) {
-    const tags = (li.productTags ?? []).map((t) => t.trim()).filter(Boolean);
-
-    const includedByTags = includeProductTags.length === 0 || tags.some((t) => includeProductTags.includes(t));
-    const excludedByTags = excludeProductTags.length > 0 && tags.some((t) => excludeProductTags.includes(t));
-    if (!includedByTags || excludedByTags) continue;
-
+    if (!isEligibleByProductTags(li.productTags ?? [], settings)) continue;
     const net = Math.max(0, li.originalTotal - li.allocatedDiscountTotal);
     eligibleNet += net;
   }
@@ -253,6 +309,130 @@ async function markWebhookOutcome(params: {
     .catch(() => null);
 }
 
+/** DEDUPE: have we already written a refund reversal ledger entry for this refund? */
+async function refundReversalAlreadyApplied(shop: string, refundIdNumeric: string) {
+  if (!refundIdNumeric) return false;
+  const existing = await db.pointsLedger.findFirst({
+    where: {
+      shop,
+      type: "REVERSAL",
+      source: "REFUND",
+      sourceId: refundIdNumeric,
+    },
+    select: { id: true },
+  });
+  return !!existing;
+}
+
+/**
+ * Refund detail:
+ * - refundLineItems subtotals + product tags (tag-accurate eligible subtotal)
+ * - orderAdjustments + transactions for audit
+ */
+async function fetchRefundForReversal(shop: string, refundIdNumericOrGid: string, settings: any) {
+  const numeric = extractNumericIdFromGid(refundIdNumericOrGid);
+  const gid = refundIdNumericOrGid.startsWith("gid://") ? refundIdNumericOrGid : `gid://shopify/Refund/${numeric}`;
+
+  const query = `
+    query RefundForReversal($id: ID!) {
+      refund(id: $id) {
+        id
+        createdAt
+        note
+        order { id currencyCode }
+        refundLineItems(first: 250) {
+          nodes {
+            quantity
+            subtotalSet { shopMoney { amount } }
+            lineItem {
+              id
+              variant { product { tags } }
+            }
+          }
+        }
+        orderAdjustments(first: 50) {
+          nodes {
+            reason
+            amountSet { shopMoney { amount } }
+          }
+        }
+        transactions(first: 50) {
+          nodes {
+            kind
+            status
+            amountSet { shopMoney { amount } }
+          }
+        }
+      }
+    }
+  `;
+
+  const data = await shopifyGraphql(shop, query, { id: gid });
+  const refund = data?.refund;
+  if (!refund) return { ok: false as const, reason: "REFUND_NOT_FOUND" };
+
+  const currency = refund?.order?.currencyCode ? String(refund.order.currencyCode) : "CAD";
+  const lineNodes: any[] = refund?.refundLineItems?.nodes ?? [];
+
+  let eligibleRefundedSubtotal = 0;
+  let totalRefundedMerchSubtotal = 0;
+
+  const breakdown: Array<{ quantity: number; subtotal: number; eligible: boolean; tags: string[] }> = [];
+
+  for (const n of lineNodes) {
+    const subtotal = Math.max(0, parseMoney(n?.subtotalSet?.shopMoney?.amount));
+    const tags = normalizeTags(n?.lineItem?.variant?.product?.tags);
+    const eligible = isEligibleByProductTags(tags, settings);
+
+    totalRefundedMerchSubtotal += subtotal;
+    if (eligible) eligibleRefundedSubtotal += subtotal;
+
+    breakdown.push({
+      quantity: Number(n?.quantity ?? 0) || 0,
+      subtotal,
+      eligible,
+      tags,
+    });
+  }
+
+  const adjNodes: any[] = refund?.orderAdjustments?.nodes ?? [];
+  const adjustments = adjNodes.map((n) => ({
+    reason: n?.reason ? String(n.reason) : null,
+    amount: parseMoney(n?.amountSet?.shopMoney?.amount),
+  }));
+
+  const txnNodes: any[] = refund?.transactions?.nodes ?? [];
+  const transactions = txnNodes.map((n) => ({
+    kind: n?.kind ? String(n.kind) : null,
+    status: n?.status ? String(n.status) : null,
+    amount: parseMoney(n?.amountSet?.shopMoney?.amount),
+  }));
+
+  const adjustmentsTotal = adjustments.reduce((s, a) => s + (a.amount || 0), 0);
+  const transactionsTotal = transactions.reduce((s, t) => s + (t.amount || 0), 0);
+
+  const hasMerchLines = lineNodes.length > 0;
+  const hasNonMerchMoney = Math.abs(adjustmentsTotal) > 0.0001 || Math.abs(transactionsTotal) > 0.0001;
+
+  return {
+    ok: true as const,
+    gid,
+    currency,
+    refundCreatedAt: refund?.createdAt ? String(refund.createdAt) : null,
+    note: refund?.note ? String(refund.note) : null,
+    hasMerchLines,
+    lineCount: lineNodes.length,
+    eligibleRefundedSubtotal,
+    totalRefundedMerchSubtotal,
+    breakdown: breakdown.slice(0, 25),
+    adjustments,
+    adjustmentsTotal,
+    transactions,
+    transactionsTotal,
+    hasNonMerchMoney,
+  };
+}
+
 export const action = async ({ request }: ActionFunctionArgs) => {
   if (request.method !== "POST") return new Response("ok", { status: 200 });
 
@@ -274,7 +454,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     payload = {};
   }
 
-  // Idempotency: record webhookId (unique constraint)
+  // Idempotency at webhook level (Shopify retries with same webhook-id sometimes)
   let eventRow: any;
   try {
     eventRow = await db.webhookEvent.create({
@@ -309,18 +489,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           break;
         }
 
-        // Award idempotency: if we already made a snapshot, treat as SKIPPED (duplicate)
         const existing = await db.orderPointsSnapshot.findUnique({ where: { shop_orderId: { shop, orderId } } });
         if (existing) {
           await markWebhookOutcome({ eventId, outcome: "SKIPPED", code: "DUPLICATE_ORDER_PAID", message: "Order already processed (snapshot exists)." });
           break;
         }
 
-        // Prefer Admin API for accurate eligible net + used discount codes
         const order = await fetchOrderForPoints(shop, orderId);
         if (!order) {
-          // If Admin API fails, you can decide whether to skip or fallback.
-          // Here: SKIP because accurate eligibility is required for audit-grade points.
           await markWebhookOutcome({
             eventId,
             outcome: "SKIPPED",
@@ -338,36 +514,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const customerId = computed.customerId;
 
         if (!customerId) {
-          await markWebhookOutcome({ eventId, outcome: "SKIPPED", code: computed.skipReason?.code ?? "GUEST_ORDER", message: computed.skipReason?.message ?? "Guest order." });
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: computed.skipReason?.code ?? "GUEST_ORDER",
+            message: computed.skipReason?.message ?? "Guest order.",
+          });
           break;
+        }
+
+        if (order.discountCodes?.length) {
+          await consumeRedemptionsIfUsed({ shop, customerId, orderId, usedCodes: order.discountCodes });
         }
 
         if (computed.skipReason) {
-          // Also consume redemption codes if they used one (even if points aren’t awarded)
-          if (order.discountCodes?.length) {
-            await consumeRedemptionsIfUsed({ shop, customerId, orderId, usedCodes: order.discountCodes });
-          }
-
           await markWebhookOutcome({ eventId, outcome: "SKIPPED", code: computed.skipReason.code, message: computed.skipReason.message });
           break;
-        }
-
-        // Mark redemption code consumption if used
-        if (order.discountCodes?.length) {
-          await consumeRedemptionsIfUsed({ shop, customerId, orderId, usedCodes: order.discountCodes });
         }
 
         const earnRate = Number(settings.earnRate ?? 1) || 1;
         const pointsEarned = clampInt(eligibleNet * earnRate, 0, 10_000_000);
 
-        // If pointsEarned ends up 0 for any reason, treat as SKIPPED for audit clarity
         if (pointsEarned <= 0) {
-          await markWebhookOutcome({
-            eventId,
-            outcome: "SKIPPED",
-            code: "ZERO_POINTS",
-            message: "Eligible net computed, but points earned is 0 based on earnRate.",
-          });
+          await markWebhookOutcome({ eventId, outcome: "SKIPPED", code: "ZERO_POINTS", message: "Eligible net computed, but points earned is 0 based on earnRate." });
           break;
         }
 
@@ -400,19 +569,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
           const balanceRow = await tx.customerPointsBalance.upsert({
             where: { shop_customerId: { shop, customerId } },
-            create: {
-              shop,
-              customerId,
-              balance: pointsEarned,
-              lifetimeEarned: pointsEarned,
-              lifetimeRedeemed: 0,
-              lastActivityAt: new Date(),
-            },
-            update: {
-              balance: { increment: pointsEarned },
-              lifetimeEarned: { increment: pointsEarned },
-              lastActivityAt: new Date(),
-            },
+            create: { shop, customerId, balance: pointsEarned, lifetimeEarned: pointsEarned, lifetimeRedeemed: 0, lastActivityAt: new Date() },
+            update: { balance: { increment: pointsEarned }, lifetimeEarned: { increment: pointsEarned }, lastActivityAt: new Date() },
           });
 
           if (balanceRow.balance < 0) {
@@ -424,15 +582,351 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           eventId,
           outcome: "PROCESSED",
           code: "POINTS_AWARDED",
-          message: `Awarded ${pointsEarned} points on eligible net ${eligibleNet.toFixed(2)} ${currency}.`,
+          message: safeJsonStringify({
+            kind: "POINTS_AWARDED",
+            shop,
+            orderId,
+            orderName,
+            customerId,
+            currency,
+            eligibleNet,
+            earnRate,
+            pointsEarned,
+          }),
         });
 
         break;
       }
 
-      // Leave the rest as-is (refunds/cancelled/etc.) — optionally also add outcomes there later
+      case "refunds/create": {
+        const settings = await getShopSettings(shop);
+
+        const orderId = String(payload?.order_id ?? payload?.order?.id ?? "");
+        const refundIdRaw = String(payload?.admin_graphql_api_id ?? payload?.id ?? "");
+        const refundIdNumeric = extractNumericIdFromGid(refundIdRaw);
+
+        if (!orderId) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "MISSING_ORDER_ID",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: "MISSING_ORDER_ID", refundId: refundIdRaw || null }),
+          });
+          break;
+        }
+
+        if (!refundIdNumeric) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "MISSING_REFUND_ID",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: "MISSING_REFUND_ID", shop, orderId }),
+          });
+          break;
+        }
+
+        // ✅ DEDUPE: if a reversal ledger entry already exists for this refund, skip safely
+        if (await refundReversalAlreadyApplied(shop, refundIdNumeric)) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "DUPLICATE_REFUND_REVERSAL",
+            message: safeJsonStringify({
+              kind: "REFUND_SKIP_DUPLICATE",
+              shop,
+              orderId,
+              refundId: refundIdNumeric,
+              notes: "A REVERSAL ledger entry already exists for this refundId (source=REFUND). Webhook skipped to prevent double reversal.",
+            }),
+          });
+          break;
+        }
+
+        const snap = await db.orderPointsSnapshot.findUnique({ where: { shop_orderId: { shop, orderId } } });
+        if (!snap) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "NO_SNAPSHOT",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: "NO_SNAPSHOT", shop, orderId, refundId: refundIdNumeric }),
+          });
+          break;
+        }
+
+        const pointsAwarded = snap.pointsAwarded ?? 0;
+        const pointsReversedToDate = snap.pointsReversedToDate ?? 0;
+        const remainingAwardable = Math.max(0, pointsAwarded - pointsReversedToDate);
+
+        if (pointsAwarded <= 0) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "NO_POINTS_AWARDED",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: "NO_POINTS_AWARDED", shop, orderId, refundId: refundIdNumeric, pointsAwarded }),
+          });
+          break;
+        }
+
+        if (remainingAwardable <= 0) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "ALREADY_REVERSED",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: "ALREADY_REVERSED", shop, orderId, refundId: refundIdNumeric, pointsAwarded, pointsReversedToDate }),
+          });
+          break;
+        }
+
+        const originalEligible = snap.eligibleNetMerchandise ?? 0;
+        if (originalEligible <= 0) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "SNAPSHOT_ELIGIBLE_ZERO",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: "SNAPSHOT_ELIGIBLE_ZERO", shop, orderId, refundId: refundIdNumeric, originalEligible }),
+          });
+          break;
+        }
+
+        let refundDetail: any;
+        try {
+          refundDetail = await fetchRefundForReversal(shop, refundIdRaw, settings);
+        } catch (e: any) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "ADMIN_REFUND_FETCH_FAILED",
+            message: safeJsonStringify({
+              kind: "REFUND_SKIP",
+              reason: "ADMIN_REFUND_FETCH_FAILED",
+              shop,
+              orderId,
+              refundId: refundIdNumeric,
+              error: String(e?.message ?? e),
+            }),
+          });
+          break;
+        }
+
+        if (!refundDetail?.ok) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: refundDetail?.reason ?? "REFUND_NOT_FOUND",
+            message: safeJsonStringify({ kind: "REFUND_SKIP", reason: refundDetail?.reason ?? "REFUND_NOT_FOUND", shop, orderId, refundId: refundIdNumeric }),
+          });
+          break;
+        }
+
+        const currency = snap.currency ?? refundDetail.currency ?? "CAD";
+
+        if (!refundDetail.hasMerchLines) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "NON_MERCH_REFUND",
+            message: safeJsonStringify({
+              kind: "REFUND_SKIP_NON_MERCH",
+              shop,
+              orderId,
+              refundId: refundIdNumeric,
+              currency,
+              pointsAwarded,
+              pointsReversedToDate,
+              remainingAwardable,
+              originalEligible,
+              hasMerchLines: refundDetail.hasMerchLines,
+              hasNonMerchMoney: refundDetail.hasNonMerchMoney,
+              adjustments: refundDetail.adjustments,
+              adjustmentsTotal: refundDetail.adjustmentsTotal,
+              transactions: refundDetail.transactions,
+              transactionsTotal: refundDetail.transactionsTotal,
+              refundCreatedAt: refundDetail.refundCreatedAt,
+              note: refundDetail.note,
+              notes: "Refund contains no refundLineItems; treated as shipping/duty/adjustment-only refund. Points reversal skipped.",
+            }),
+          });
+          break;
+        }
+
+        const eligibleRefundedSubtotal = Number(refundDetail.eligibleRefundedSubtotal ?? 0) || 0;
+        const totalRefundedMerchSubtotal = Number(refundDetail.totalRefundedMerchSubtotal ?? 0) || 0;
+
+        if (eligibleRefundedSubtotal <= 0) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "NO_ELIGIBLE_REFUND_LINES",
+            message: safeJsonStringify({
+              kind: "REFUND_SKIP",
+              reason: "NO_ELIGIBLE_REFUND_LINES",
+              shop,
+              orderId,
+              refundId: refundIdNumeric,
+              currency,
+              pointsAwarded,
+              pointsReversedToDate,
+              remainingAwardable,
+              originalEligible,
+              totalRefundedMerchSubtotal,
+              eligibleRefundedSubtotal,
+              lineCount: refundDetail.lineCount,
+              breakdown: refundDetail.breakdown,
+              adjustments: refundDetail.adjustments,
+              adjustmentsTotal: refundDetail.adjustmentsTotal,
+              transactions: refundDetail.transactions,
+              transactionsTotal: refundDetail.transactionsTotal,
+              refundCreatedAt: refundDetail.refundCreatedAt,
+              note: refundDetail.note,
+              notes: "Refund has merch lines, but none are eligible by tag rules. Points reversal skipped.",
+            }),
+          });
+          break;
+        }
+
+        const proportion = Math.min(1, Math.max(0, eligibleRefundedSubtotal / originalEligible));
+        const pointsToReverse = clampInt(remainingAwardable * proportion, 0, remainingAwardable);
+
+        if (pointsToReverse <= 0) {
+          await markWebhookOutcome({
+            eventId,
+            outcome: "SKIPPED",
+            code: "ZERO_REVERSAL",
+            message: safeJsonStringify({
+              kind: "REFUND_SKIP",
+              reason: "ZERO_REVERSAL",
+              shop,
+              orderId,
+              refundId: refundIdNumeric,
+              currency,
+              eligibleRefundedSubtotal,
+              totalRefundedMerchSubtotal,
+              originalEligible,
+              proportion,
+              remainingAwardable,
+              computed: 0,
+              breakdown: refundDetail.breakdown,
+              adjustments: refundDetail.adjustments,
+              adjustmentsTotal: refundDetail.adjustmentsTotal,
+              transactions: refundDetail.transactions,
+              transactionsTotal: refundDetail.transactionsTotal,
+            }),
+          });
+          break;
+        }
+
+        const customerId = snap.customerId;
+        const description = `Reversal on refund for order ${orderId}`;
+
+        
+
+// ...
+
+const result = await db.$transaction(async (tx) => {
+  // 1) Attempt to create the dedupe-keyed ledger row FIRST.
+  //    If this hits the unique constraint, we abort the reversal safely.
+  try {
+    await tx.pointsLedger.create({
+      data: {
+        shop,
+        customerId,
+        type: "REVERSAL",
+        delta: -pointsToReverse,
+        source: "REFUND",
+        sourceId: refundIdNumeric, // <— critical: this matches your dedupe key
+        description,
+        createdAt: new Date(),
+      },
+    });
+  } catch (e) {
+    if (isPrismaUniqueViolation(e)) {
+      return { duplicate: true as const };
+    }
+    throw e;
+  }
+
+  // 2) Only if ledger row was created, apply the balance/snapshot updates.
+  await tx.customerPointsBalance.update({
+    where: { shop_customerId: { shop, customerId } },
+    data: { balance: { decrement: pointsToReverse }, lastActivityAt: new Date() },
+  });
+
+  await tx.orderPointsSnapshot.update({
+    where: { shop_orderId: { shop, orderId } },
+    data: { pointsReversedToDate: { increment: pointsToReverse } },
+  });
+
+  // clamp negative balance defensively
+  const b = await tx.customerPointsBalance.findUnique({ where: { shop_customerId: { shop, customerId } } });
+  if (b && b.balance < 0) {
+    await tx.customerPointsBalance.update({
+      where: { shop_customerId: { shop, customerId } },
+      data: { balance: 0 },
+    });
+  }
+
+  return { duplicate: false as const };
+});
+
+// If it was a race duplicate, record SKIPPED and exit cleanly.
+if (result.duplicate) {
+  await markWebhookOutcome({
+    eventId,
+    outcome: "SKIPPED",
+    code: "DUPLICATE_REFUND_REVERSAL",
+    message: safeJsonStringify({
+      kind: "REFUND_SKIP_DUPLICATE_RACE",
+      shop,
+      orderId,
+      refundId: refundIdNumeric,
+      notes: "Unique constraint prevented a double refund reversal during concurrent webhook processing.",
+    }),
+  });
+
+  break; // <-- exit the refunds/create handler
+}
+
+        await markWebhookOutcome({
+          eventId,
+          outcome: "PROCESSED",
+          code: "POINTS_REVERSED_REFUND_TAG_ACCURATE",
+          message: safeJsonStringify({
+            kind: "POINTS_REVERSED_REFUND_TAG_ACCURATE",
+            shop,
+            orderId,
+            refundId: refundIdNumeric,
+            customerId,
+            currency,
+            pointsAwarded,
+            pointsReversedToDate,
+            remainingAwardable,
+            originalEligible,
+            eligibleRefundedSubtotal,
+            totalRefundedMerchSubtotal,
+            proportion,
+            pointsToReverse,
+            refundCreatedAt: refundDetail.refundCreatedAt,
+            refundGid: refundDetail.gid,
+            lineCount: refundDetail.lineCount,
+            breakdown: refundDetail.breakdown,
+            adjustments: refundDetail.adjustments,
+            adjustmentsTotal: refundDetail.adjustmentsTotal,
+            transactions: refundDetail.transactions,
+            transactionsTotal: refundDetail.transactionsTotal,
+            notes: "Dedupe via pointsLedger(type=REVERSAL, source=REFUND, sourceId=refundId).",
+          }),
+        });
+
+        break;
+      }
+
       default:
-        await markWebhookOutcome({ eventId, outcome: "PROCESSED", code: "IGNORED_TOPIC", message: `No handler for topic ${topic}.` });
+        await markWebhookOutcome({
+          eventId,
+          outcome: "PROCESSED",
+          code: "IGNORED_TOPIC",
+          message: safeJsonStringify({ kind: "IGNORED_TOPIC", topic, shop }),
+        });
         break;
     }
   } catch (err) {
@@ -455,7 +949,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         eventId,
         outcome: "FAILED",
         code: "EXCEPTION",
-        message: String((err as any)?.message ?? err),
+        message: safeJsonStringify({ kind: "EXCEPTION", topic, shop, error: String((err as any)?.message ?? err) }),
       });
     }
   }

@@ -1,23 +1,19 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// prisma/schema.prisma
 
 generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
   provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
 model Session {
-  id            String   @id
+  id            String    @id
   shop          String
   state         String
-  isOnline      Boolean  @default(false)
+  isOnline      Boolean   @default(false)
   scope         String?
   expires       DateTime?
   accessToken   String
@@ -25,11 +21,10 @@ model Session {
   firstName     String?
   lastName      String?
   email         String?
-  accountOwner  Boolean  @default(false)
+  accountOwner  Boolean   @default(false)
   locale        String?
-  collaborator  Boolean? @default(false)
-  emailVerified Boolean? @default(false)
-
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
@@ -52,9 +47,7 @@ enum RedemptionStatus {
   EXPIRED
 }
 
-/**
- * NEW: webhook processing outcome status (audit/logging)
- */
+/// Webhook processing outcomes (admin-visible logging)
 enum WebhookOutcome {
   RECEIVED
   PROCESSED
@@ -63,18 +56,16 @@ enum WebhookOutcome {
 }
 
 model ShopSettings {
-  shop              String   @id
-  earnRate          Int      @default(1)
-  redemptionMinOrder Int     @default(0)
-
+  shop                String   @id
+  earnRate             Int      @default(1)
+  redemptionMinOrder   Int      @default(0)
   /// Arrays and maps (SQLite): store as Json (TEXT-backed).
   excludedCustomerTags Json?
   includeProductTags   Json?
   excludeProductTags   Json?
   redemptionSteps      Json?
   redemptionValueMap   Json?
-
-  updatedAt DateTime @default(now())
+  updatedAt            DateTime @default(now())
 }
 
 model CustomerPointsBalance {
@@ -103,8 +94,13 @@ model PointsLedger {
   createdAt   DateTime   @default(now())
 
   @@index([shop, customerId, createdAt])
-  /// Extra safety: prevent duplicate processing for the same logical event.
+
+  /// Existing safety (event-level dedupe scoped to customer)
   @@unique([shop, customerId, type, source, sourceId], name: "ledger_dedupe")
+
+  /// NEW: refund/cancel reversal dedupe regardless of customerId
+  /// (matches your runtime check: shop+type+source+sourceId)
+  @@unique([shop, type, source, sourceId], name: "ledger_refund_dedupe")
 }
 
 model OrderPointsSnapshot {
@@ -148,7 +144,7 @@ model WebhookEvent {
   resourceId String
   receivedAt DateTime @default(now())
 
-  // NEW: outcome logging fields
+  /// NEW: outcome tracking fields
   outcome        WebhookOutcome @default(RECEIVED)
   outcomeCode    String?
   outcomeMessage String?
@@ -156,6 +152,7 @@ model WebhookEvent {
 
   @@unique([shop, webhookId], name: "shop_webhookId")
   @@index([shop, topic, receivedAt])
+  @@index([shop, outcome, receivedAt])
 }
 
 model WebhookError {
