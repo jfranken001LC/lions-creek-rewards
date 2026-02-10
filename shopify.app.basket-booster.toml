@@ -1,8 +1,8 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "c24e58a5c830c7a3eda14ae5d6f8f6da"
-name = "Basket Booster Discounts"
-application_url = "https://app.basketbooster.ca"
+name = "Lions Creek Loyalty"
+application_url = "https://loyalty.basketbooster.ca"
 embedded = true
 
 [build]
@@ -18,12 +18,12 @@ api_version = "2026-01"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_discounts"
+scopes = "read_orders,read_customers,write_customers,read_products,write_discounts"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://app.basketbooster.ca/auth/callback" ]
+redirect_urls = [ "https://loyalty.basketbooster.ca/auth/callback" ]
 
 
   [discount.metafields.app.function-configuration.access]

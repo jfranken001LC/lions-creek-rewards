@@ -2,11 +2,12 @@
 
 client_id = "018d1d4d00f8544b759266b72d17c00e"
 name = "Lions Creek Rewards"
-application_url = "https://example.com"
+application_url = "https://loaylty.basketbooster.ca"
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = false
+dev_store_url = "lions-creek-dev-3.myshopify.com"
 
 [webhooks]
 api_version = "2026-01"
@@ -21,9 +22,9 @@ api_version = "2026-01"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = ""
+scopes = "read_customers,write_customers,write_discounts,read_orders,read_products"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ ]
+redirect_urls = [ "https://loaylty.basketbooster.ca" ]
