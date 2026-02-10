@@ -7,11 +7,11 @@ set -Eeuo pipefail
 # ==============================================================================
 
 # -------- Config (override via env vars) --------------------------------------
-REPO_DIR="${REPO_DIR:-/var/www/loyalty}"
+REPO_DIR="${REPO_DIR:-/var/www/lions-creek-rewards}"
 BRANCH="${BRANCH:-main}"
 REMOTE="${REMOTE:-origin}"
 SERVICE_NAME="${SERVICE_NAME:-lions-creek-rewards}"
-ENV_FILE="${ENV_FILE:-/etc/llions-creek-rewardsy/lions-creek-rewards.env}"
+ENV_FILE="${ENV_FILE:-/etc/lions-creek-rewards/lions-creek-rewards.env}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/${SERVICE_NAME}.deploy.lock}"
 
 say() { printf "\n==== %s ====\n" "$*"; }
