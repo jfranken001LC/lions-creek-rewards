@@ -14,7 +14,8 @@ use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://loyalty.basketbooster.ca/auth/callback"
+  "https://loyalty.basketbooster.ca/auth/callback",
+  "https://loyalty.basketbooster.ca/auth/shopify/callback"
 ]
 
 [webhooks]
