@@ -4,7 +4,6 @@ import crypto from "node:crypto";
 import db from "../db.server";
 
 function verifyAppProxyHmac(query: URLSearchParams, apiSecret: string): boolean {
-  // Shopify App Proxy provides `hmac` query param (HMAC-SHA256 of sorted params excluding hmac/signature)
   const hmac = query.get("hmac");
   if (!hmac || !apiSecret) return false;
 
@@ -17,6 +16,8 @@ function verifyAppProxyHmac(query: URLSearchParams, apiSecret: string): boolean 
 
   const message = pairs.join("&");
   const digest = crypto.createHmac("sha256", apiSecret).update(message).digest("hex");
+
+  // NOTE: Shopify sends lowercase hex for app-proxy hmac.
   return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
 }
 
@@ -32,8 +33,21 @@ async function getShopSettings(shop: string) {
     redemptionSteps: [500, 1000],
     redemptionValueMap: { "500": 10, "1000": 20 },
   };
+
   const s = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
-  return s ? { ...defaults, ...s } : defaults;
+
+  // Normalize Json fields into plain JS types
+  const normalized = {
+    ...defaults,
+    ...(s ?? {}),
+    excludedCustomerTags: (s as any)?.excludedCustomerTags ?? [],
+    includeProductTags: (s as any)?.includeProductTags ?? [],
+    excludeProductTags: (s as any)?.excludeProductTags ?? [],
+    redemptionSteps: (s as any)?.redemptionSteps ?? defaults.redemptionSteps,
+    redemptionValueMap: (s as any)?.redemptionValueMap ?? defaults.redemptionValueMap,
+  };
+
+  return normalized;
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -50,10 +64,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const settings = await getShopSettings(shop);
 
-  const balance =
-    (await db.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop, customerId } },
-    })) ?? null;
+  const balanceRow = await db.customerPointsBalance
+    .findUnique({ where: { shop_customerId: { shop, customerId } } })
+    .catch(() => null);
 
   const ledger = await db.pointsLedger.findMany({
     where: { shop, customerId },
@@ -61,16 +74,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     take: 100,
   });
 
-  // Expiry policy: 12 months of inactivity (display only; job enforces)
-  const lastActivityAt = balance?.lastActivityAt ?? null;
-  const expiresOn =
-    lastActivityAt ? new Date(new Date(lastActivityAt).getTime() + 365 * 24 * 60 * 60 * 1000) : null;
+  const balance = balanceRow?.balance ?? 0;
+  const lastActivityAt = balanceRow?.lastActivityAt ?? null;
+  const expiresOn = lastActivityAt
+    ? new Date(new Date(lastActivityAt).getTime() + 365 * 24 * 60 * 60 * 1000)
+    : null;
 
   return data({
     shop,
     customerId,
     settings,
-    balance: balance?.balance ?? 0,
+    balance,
     lastActivityAt,
     expiresOn,
     ledger,
@@ -99,34 +113,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const requested = Number(form.get("points") ?? 0) || 0;
   const points = clampInt(requested, 0, 1000);
 
-  if (points !== 500 && points !== 1000) {
+  if (points != 500 && points != 1000) {
     return data({ ok: false, message: "Redemptions must be 500 or 1000 points." }, { status: 400 });
   }
 
   const settings = await getShopSettings(shop);
 
-  // Enforce single active redemption per customer (default)
   const active = await db.redemption.findFirst({
     where: { shop, customerId, status: { in: ["ISSUED", "APPLIED"] } },
     orderBy: { createdAt: "desc" },
   });
   if (active) {
-    return data({ ok: false, message: `You already have an active reward: ${active.pointsSpent} points.` }, { status: 409 });
+    return data(
+      { ok: false, message: `You already have an active reward: ${active.pointsSpent} points.` },
+      { status: 409 },
+    );
   }
 
-  const balanceRow =
-    (await db.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop, customerId } },
-    })) ?? null;
+  const bal = await db.customerPointsBalance
+    .findUnique({ where: { shop_customerId: { shop, customerId } } })
+    .catch(() => null);
 
-  const currentBalance = balanceRow?.balance ?? 0;
+  const currentBalance = bal?.balance ?? 0;
   if (currentBalance < points) {
     return data({ ok: false, message: "Insufficient points." }, { status: 400 });
   }
 
-  // Create a one-time “code” (v1). The real Shopify discount code issuance is done in the next iteration
-  // (requires Admin API token for the shop). This still satisfies the required lifecycle tracking and prevents double issue.
-  const value = Number((settings.redemptionValueMap as any)?.[String(points)] ?? 0) || (points === 500 ? 10 : 20);
+  const value = Number((settings as any)?.redemptionValueMap?.[String(points)] ?? 0) || (points === 500 ? 10 : 20);
   const code = `LCR-${customerId.slice(-6)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
   await db.$transaction(async (tx) => {
@@ -143,14 +156,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
     });
 
-    await tx.customerPointsBalance.update({
+    await tx.customerPointsBalance.upsert({
       where: { shop_customerId: { shop, customerId } },
-      data: {
+      create: {
+        shop,
+        customerId,
+        balance: Math.max(0, currentBalance - points),
+        lifetimeEarned: 0,
+        lifetimeRedeemed: points,
+        lastActivityAt: new Date(),
+      },
+      update: {
         balance: { decrement: points },
         lifetimeRedeemed: { increment: points },
         lastActivityAt: new Date(),
       },
     });
+
+    // Clamp to >= 0
+    const updated = await tx.customerPointsBalance.findUnique({
+      where: { shop_customerId: { shop, customerId } },
+    });
+    if (updated && updated.balance < 0) {
+      await tx.customerPointsBalance.update({
+        where: { shop_customerId: { shop, customerId } },
+        data: { balance: 0 },
+      });
+    }
 
     await tx.redemption.create({
       data: {
@@ -161,7 +193,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         code,
         status: "ISSUED",
         issuedAt: new Date(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // v1: 7 day code expiry (configurable later)
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       },
     });
   });
@@ -176,7 +208,7 @@ export default function LoyaltyDashboard() {
     <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto", padding: 18, maxWidth: 980 }}>
       <h1 style={{ margin: 0 }}>Lions Creek Rewards</h1>
       <p style={{ marginTop: 6, opacity: 0.8 }}>
-        Earn 1 point per $1 on eligible merchandise. Redeem 500 points for $10 or 1000 points for $20. :contentReference[oaicite:4]{index=4}
+        Earn 1 point per $1 on eligible merchandise. Redeem 500 points for $10 or 1000 points for $20.
       </p>
 
       <section style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 1fr", marginTop: 12 }}>
@@ -204,7 +236,7 @@ export default function LoyaltyDashboard() {
       <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14, marginTop: 12 }}>
         <h2 style={{ marginTop: 0 }}>Redeem</h2>
         <div style={{ opacity: 0.8, marginBottom: 10 }}>
-          Minimum order to redeem: <strong>${settings.redemptionMinOrder}</strong> (enforced at checkout in the next iteration).
+          Minimum order to redeem: <strong>${settings.redemptionMinOrder}</strong>
         </div>
 
         <Form method="post" style={{ display: "flex", gap: 10, alignItems: "end", flexWrap: "wrap" }}>
@@ -220,7 +252,7 @@ export default function LoyaltyDashboard() {
         </Form>
 
         <p style={{ marginTop: 10, fontSize: 13, opacity: 0.75 }}>
-          After generation, the next step is wiring this code to a Shopify one-time discount code (Admin API write_discounts).
+          v1: this issues a one-time code stored in the app. Next iteration wires it to a Shopify discount code via Admin API.
         </p>
       </section>
 

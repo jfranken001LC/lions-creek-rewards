@@ -18,6 +18,19 @@ function parseCsvList(value: string): string[] {
     .filter(Boolean);
 }
 
+function jsonList(value: unknown, fallback: string[]): string[] {
+  if (Array.isArray(value)) return value.map(String);
+  try {
+    if (typeof value === "string") {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    }
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
@@ -31,9 +44,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   };
 
   const settings = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+
   return data({
     shop,
-    settings: settings ? { ...defaults, ...settings } : defaults,
+    settings: settings
+      ? {
+          earnRate: settings.earnRate ?? defaults.earnRate,
+          redemptionMinOrder: settings.redemptionMinOrder ?? defaults.redemptionMinOrder,
+          excludedCustomerTags: jsonList(settings.excludedCustomerTags, defaults.excludedCustomerTags),
+          includeProductTags: jsonList(settings.includeProductTags, defaults.includeProductTags),
+          excludeProductTags: jsonList(settings.excludeProductTags, defaults.excludeProductTags),
+        }
+      : defaults,
   });
 };
 
@@ -99,7 +121,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         },
       });
 
-      // Ensure balance row exists
       const bal = await tx.customerPointsBalance.upsert({
         where: { shop_customerId: { shop, customerId } },
         create: {
@@ -131,8 +152,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const q = String(form.get("q") ?? "").trim();
     if (!q) return data({ ok: false, message: "Enter a customer ID (numeric) or email." }, { status: 400 });
 
-    // v1: we only store Shopify customerId. Email lookup requires Admin API in a later iteration.
-    // For now accept customerId directly.
+    // v1: customerId lookup only.
     const customerId = q;
 
     const balance = await db.customerPointsBalance.findUnique({
@@ -197,8 +217,7 @@ export default function AdminHome() {
         </Form>
 
         <p style={{ marginTop: 12, opacity: 0.8 }}>
-          Points are earned on <code>orders/paid</code>. Refunds/cancellations reverse proportionally. Redemptions are 500=$10
-          and 1000=$20 (v1). :contentReference[oaicite:2]{index=2}
+          Points are earned on <code>orders/paid</code>. Refunds/cancellations reverse proportionally. Redemptions are 500=$10 and 1000=$20 (v1).
         </p>
       </section>
 
@@ -213,7 +232,9 @@ export default function AdminHome() {
           <button type="submit">Lookup</button>
         </Form>
 
-        <LookupResults />
+        <div style={{ marginTop: 12, opacity: 0.75 }}>
+          After lookup, view the JSON response in the Network tab (next iteration will render it in-page).
+        </div>
       </section>
 
       <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14 }}>
@@ -233,7 +254,7 @@ export default function AdminHome() {
 
           <label style={{ gridColumn: "1 / -1" }}>
             Reason (required)
-            <input name="reason" placeholder="e.g. goodwill adjustment for damaged bottle" />
+            <input name="reason" placeholder="e.g. goodwill adjustment" />
           </label>
 
           <button type="submit" style={{ gridColumn: "1 / -1" }}>
@@ -241,16 +262,6 @@ export default function AdminHome() {
           </button>
         </Form>
       </section>
-    </div>
-  );
-}
-
-function LookupResults() {
-  // In RR7, action data is available through navigation APIs; to keep this “drop-in” minimal,
-  // we simply instruct to rely on network response until you add a proper toast/UX.
-  return (
-    <div style={{ marginTop: 12, opacity: 0.75 }}>
-      After lookup, view the JSON response in the Network tab (next iteration will render it nicely).
     </div>
   );
 }

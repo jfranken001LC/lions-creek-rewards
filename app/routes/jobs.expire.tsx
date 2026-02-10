@@ -33,7 +33,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const cutoff = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
 
-  // Find balances with inactivity and non-zero
   const targets = await db.customerPointsBalance.findMany({
     where: {
       balance: { gt: 0 },
