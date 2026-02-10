@@ -33,3 +33,135 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+/// Lions Creek Rewards — v1.1
+/// SQLite note: lists/maps are stored as Json (backed by TEXT).
+
+enum LedgerType {
+  EARN
+  REVERSAL
+  REDEEM
+  ADJUST
+  EXPIRE
+}
+
+enum RedemptionStatus {
+  ISSUED
+  APPLIED
+  VOID
+  EXPIRED
+}
+
+model ShopSettings {
+  shop                String   @id
+  earnRate             Int      @default(1)
+  redemptionMinOrder   Int      @default(0)
+  /// Arrays and maps (SQLite): store as Json (TEXT-backed).
+  excludedCustomerTags Json?
+  includeProductTags   Json?
+  excludeProductTags   Json?
+  redemptionSteps      Json?
+  redemptionValueMap   Json?
+  updatedAt            DateTime @default(now())
+}
+
+model CustomerPointsBalance {
+  id              String   @id @default(cuid())
+  shop            String
+  customerId      String
+  balance         Int      @default(0)
+  lifetimeEarned  Int      @default(0)
+  lifetimeRedeemed Int     @default(0)
+  lastActivityAt  DateTime @default(now())
+  expiredAt       DateTime?
+
+  @@unique([shop, customerId], name: "shop_customerId")
+  @@index([shop, customerId])
+}
+
+model PointsLedger {
+  id          String     @id @default(cuid())
+  shop        String
+  customerId  String
+  type        LedgerType
+  delta       Int
+  source      String
+  sourceId    String
+  description String
+  createdAt   DateTime   @default(now())
+
+  @@index([shop, customerId, createdAt])
+  /// Extra safety: prevent duplicate processing for the same logical event.
+  @@unique([shop, customerId, type, source, sourceId], name: "ledger_dedupe")
+}
+
+model OrderPointsSnapshot {
+  id                   String   @id @default(cuid())
+  shop                 String
+  orderId              String
+  customerId           String
+  eligibleNetMerchandise Float   @default(0)
+  pointsAwarded        Int      @default(0)
+  pointsReversedToDate Int      @default(0)
+  paidAt               DateTime
+  cancelledAt          DateTime?
+  currency             String   @default("CAD")
+
+  @@unique([shop, orderId], name: "shop_orderId")
+  @@index([shop, customerId])
+}
+
+model Redemption {
+  id          String           @id @default(cuid())
+  shop        String
+  customerId  String
+  pointsSpent Int
+  value       Int
+  code        String
+  status      RedemptionStatus @default(ISSUED)
+  createdAt   DateTime         @default(now())
+  issuedAt    DateTime?
+  appliedAt   DateTime?
+  expiresAt   DateTime?
+
+  @@unique([shop, code], name: "shop_code")
+  @@index([shop, customerId, createdAt])
+}
+
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  shop       String
+  webhookId  String
+  topic      String
+  resourceId String
+  receivedAt DateTime @default(now())
+
+  @@unique([shop, webhookId], name: "shop_webhookId")
+  @@index([shop, topic, receivedAt])
+}
+
+model WebhookError {
+  id        String   @id @default(cuid())
+  shop      String
+  topic     String
+  webhookId String
+  error     String
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+model PrivacyEvent {
+  id         String   @id @default(cuid())
+  shop       String
+  topic      String
+  payloadJson String
+  createdAt  DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+model JobLock {
+  key       String   @id
+  createdAt DateTime @default(now())
+}
