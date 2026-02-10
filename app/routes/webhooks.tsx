@@ -24,8 +24,12 @@ function verifyShopifyWebhookHmac(
   const provided = base64ToBuffer(hmacHeader.trim());
   if (!provided) return false;
 
-  const calculated = crypto.createHmac("sha256", apiSecret).update(rawBody).digest();
-  if (calculated.length != provided.length) return false;
+  const calculated = crypto
+    .createHmac("sha256", apiSecret)
+    .update(rawBody)
+    .digest();
+
+  if (calculated.length !== provided.length) return false;
   return crypto.timingSafeEqual(calculated, provided);
 }
 
@@ -41,40 +45,247 @@ function clampInt(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, x));
 }
 
-function toStringArray(maybeJson: any): string[] {
-  if (!maybeJson) return [];
-  if (Array.isArray(maybeJson)) return maybeJson.map(String);
-  try {
-    const parsed = typeof maybeJson === "string" ? JSON.parse(maybeJson) : maybeJson;
-    return Array.isArray(parsed) ? parsed.map(String) : [];
-  } catch {
-    return [];
+function toStringListJson(value: any): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((v) => String(v)).map((s) => s.trim()).filter(Boolean);
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map((v) => String(v)).map((s) => s.trim()).filter(Boolean);
+    } catch { /* ignore */ }
+    return value.split(",").map((t) => t.trim()).filter(Boolean);
   }
+  return [];
 }
 
-function computeEligibleNetMerchandise(payload: any, settings: any): { eligibleNet: number } {
+async function getShopSettings(shop: string) {
+  const defaults = {
+    earnRate: 1,
+    redemptionMinOrder: 0,
+    excludedCustomerTags: ["Wholesale"],
+    includeProductTags: [],
+    excludeProductTags: [],
+    redemptionSteps: [500, 1000],
+    redemptionValueMap: { "500": 10, "1000": 20 },
+  };
+
+  const existing = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+
+  if (!existing) return defaults;
+
+  return {
+    ...defaults,
+    ...existing,
+    excludedCustomerTags: toStringListJson((existing as any).excludedCustomerTags) || defaults.excludedCustomerTags,
+    includeProductTags: toStringListJson((existing as any).includeProductTags) || defaults.includeProductTags,
+    excludeProductTags: toStringListJson((existing as any).excludeProductTags) || defaults.excludeProductTags,
+    redemptionSteps: (existing as any).redemptionSteps ?? defaults.redemptionSteps,
+    redemptionValueMap: (existing as any).redemptionValueMap ?? defaults.redemptionValueMap,
+  };
+}
+
+/**
+ * Offline token is stored by PrismaSessionStorage with id: offline_{shop}
+ */
+async function getOfflineAccessToken(shop: string): Promise<string | null> {
+  const id = `offline_${shop}`;
+  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
+  return s?.accessToken ?? null;
+}
+
+type OrderForPoints = {
+  id: string;
+  name: string | null;
+  currencyCode: string | null;
+  customer: { id: string; tags: string[] } | null;
+  discountCodes: string[]; // <-- NEW
+  lineItems: Array<{
+    quantity: number;
+    originalTotal: number;
+    allocatedDiscountTotal: number;
+    productTags: string[];
+  }>;
+};
+
+async function fetchOrderForPoints(shop: string, numericOrderId: string): Promise<OrderForPoints | null> {
+  const token = await getOfflineAccessToken(shop);
+  if (!token) return null;
+
+  const gid = `gid://shopify/Order/${numericOrderId}`;
+  const endpoint = `https://${shop}/admin/api/2025-10/graphql.json`;
+
+  // NEW: discountApplications for DiscountCodeApplication.code
+  const query = `
+    query OrderForPoints($id: ID!) {
+      order(id: $id) {
+        id
+        name
+        currencyCode
+        customer {
+          id
+          tags
+        }
+        discountApplications(first: 50) {
+          nodes {
+            __typename
+            ... on DiscountCodeApplication {
+              code
+            }
+          }
+        }
+        lineItems(first: 250) {
+          nodes {
+            quantity
+            originalTotalSet {
+              shopMoney { amount }
+            }
+            discountAllocations {
+              allocatedAmountSet { shopMoney { amount } }
+            }
+            variant {
+              product { tags }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+    },
+    body: JSON.stringify({ query, variables: { id: gid } }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    console.error(`[webhooks] Admin API order fetch failed ${resp.status} ${resp.statusText} ${t}`);
+    return null;
+  }
+
+  const json = await resp.json().catch(() => null);
+  const order = json?.data?.order;
+  if (!order) return null;
+
+  const customer = order.customer
+    ? {
+        id: String(order.customer.id),
+        tags: Array.isArray(order.customer.tags) ? order.customer.tags.map((x: any) => String(x)) : [],
+      }
+    : null;
+
+  const discountCodes: string[] = Array.isArray(order.discountApplications?.nodes)
+    ? order.discountApplications.nodes
+        .filter((n: any) => n?.__typename === "DiscountCodeApplication" && n?.code)
+        .map((n: any) => String(n.code).trim())
+        .filter(Boolean)
+    : [];
+
+  const nodes: any[] = order.lineItems?.nodes ?? [];
+  const lineItems = nodes.map((n) => {
+    const originalTotal = parseMoney(n?.originalTotalSet?.shopMoney?.amount);
+    const allocatedDiscountTotal = Array.isArray(n?.discountAllocations)
+      ? n.discountAllocations.reduce((sum: number, da: any) => {
+          return sum + parseMoney(da?.allocatedAmountSet?.shopMoney?.amount);
+        }, 0)
+      : 0;
+
+    const productTags: string[] =
+      n?.variant?.product?.tags && Array.isArray(n.variant.product.tags)
+        ? n.variant.product.tags.map((t: any) => String(t))
+        : [];
+
+    return {
+      quantity: Number(n?.quantity ?? 0) || 0,
+      originalTotal,
+      allocatedDiscountTotal,
+      productTags,
+    };
+  });
+
+  return {
+    id: String(order.id),
+    name: order.name ? String(order.name) : null,
+    currencyCode: order.currencyCode ? String(order.currencyCode) : null,
+    customer,
+    discountCodes,
+    lineItems,
+  };
+}
+
+function computeEligibleFromOrder(order: OrderForPoints, settings: any): { eligibleNet: number; customerId: string | null } {
+  const excludedCustomerTags: string[] = (settings?.excludedCustomerTags ?? [])
+    .map((t: any) => String(t).trim())
+    .filter(Boolean);
+
+  const includeProductTags: string[] = (settings?.includeProductTags ?? [])
+    .map((t: any) => String(t).trim())
+    .filter(Boolean);
+
+  const excludeProductTags: string[] = (settings?.excludeProductTags ?? [])
+    .map((t: any) => String(t).trim())
+    .filter(Boolean);
+
+  if (!order.customer?.id) return { eligibleNet: 0, customerId: null };
+
+  const customerTags = order.customer.tags.map((t) => t.trim()).filter(Boolean);
+  const isExcludedCustomer =
+    excludedCustomerTags.length > 0 &&
+    customerTags.some((t) => excludedCustomerTags.includes(t));
+
+  if (isExcludedCustomer) return { eligibleNet: 0, customerId: order.customer.id };
+
+  let eligibleNet = 0;
+
+  for (const li of order.lineItems) {
+    const tags = (li.productTags ?? []).map((t) => t.trim()).filter(Boolean);
+
+    const includedByTags =
+      includeProductTags.length === 0 || tags.some((t) => includeProductTags.includes(t));
+    const excludedByTags =
+      excludeProductTags.length > 0 && tags.some((t) => excludeProductTags.includes(t));
+
+    if (!includedByTags || excludedByTags) continue;
+
+    // Eligible net merch = originalTotal - allocatedDiscountTotal (never below 0)
+    const net = Math.max(0, li.originalTotal - li.allocatedDiscountTotal);
+    eligibleNet += net;
+  }
+
+  return { eligibleNet, customerId: order.customer.id };
+}
+
+function computeEligibleNetMerchandiseFallback(payload: any, settings: any): { eligibleNet: number } {
   const customer = payload?.customer;
   const customerTags: string[] =
     typeof customer?.tags === "string"
-      ? customer.tags
-          .split(",")
-          .map((t: string) => t.trim())
-          .filter(Boolean)
+      ? customer.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
       : Array.isArray(customer?.tags)
         ? customer.tags
         : [];
 
-  const excludedCustomerTags = toStringArray(settings?.excludedCustomerTags).map((t) => t.trim());
+  const excludedCustomerTags: string[] = (settings?.excludedCustomerTags ?? [])
+    .map((t: string) => String(t).trim())
+    .filter(Boolean);
 
   const isExcludedCustomer =
-    excludedCustomerTags.length > 0 && customerTags.some((t) => excludedCustomerTags.includes(t));
+    excludedCustomerTags.length > 0 &&
+    customerTags.some((t) => excludedCustomerTags.includes(t));
 
   if (!payload?.customer?.id || isExcludedCustomer) {
     return { eligibleNet: 0 };
   }
 
-  const includeProductTags = toStringArray(settings?.includeProductTags).map((t) => t.trim());
-  const excludeProductTags = toStringArray(settings?.excludeProductTags).map((t) => t.trim());
+  // Tag logic is best-effort only in fallback
+  const includeProductTags: string[] = (settings?.includeProductTags ?? [])
+    .map((t: string) => String(t).trim())
+    .filter(Boolean);
+  const excludeProductTags: string[] = (settings?.excludeProductTags ?? [])
+    .map((t: string) => String(t).trim())
+    .filter(Boolean);
 
   const lines: any[] = Array.isArray(payload?.line_items) ? payload.line_items : [];
   let eligibleNet = 0;
@@ -88,7 +299,9 @@ function computeEligibleNetMerchandise(payload: any, settings: any): { eligibleN
     if (Array.isArray(li?.discount_allocations)) {
       discount = li.discount_allocations.reduce((sum: number, da: any) => {
         const v =
-          parseMoney(da?.amount) || parseMoney(da?.amount_set?.shop_money?.amount) || 0;
+          parseMoney(da?.amount) ||
+          parseMoney(da?.amount_set?.shop_money?.amount) ||
+          0;
         return sum + v;
       }, 0);
     } else {
@@ -97,10 +310,7 @@ function computeEligibleNetMerchandise(payload: any, settings: any): { eligibleN
 
     const lineTags: string[] =
       typeof li?.tags === "string"
-        ? li.tags
-            .split(",")
-            .map((t: string) => t.trim())
-            .filter(Boolean)
+        ? li.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
         : Array.isArray(li?.tags)
           ? li.tags
           : [];
@@ -119,19 +329,34 @@ function computeEligibleNetMerchandise(payload: any, settings: any): { eligibleN
   return { eligibleNet };
 }
 
-async function getShopSettings(shop: string) {
-  const defaults = {
-    earnRate: 1,
-    redemptionMinOrder: 0,
-    excludedCustomerTags: ["Wholesale"],
-    includeProductTags: [],
-    excludeProductTags: [],
-    redemptionSteps: [500, 1000],
-    redemptionValueMap: { "500": 10, "1000": 20 },
-  };
+/**
+ * NEW: Mark any matching issued redemption codes as CONSUMED when used on a paid order.
+ * - We tie to customerId (required) + shop + code + status=ISSUED.
+ * - We store consumedAt + consumedOrderId for auditability.
+ */
+async function consumeRedemptionsIfUsed(args: {
+  shop: string;
+  customerId: string;
+  orderId: string;
+  usedCodes: string[];
+}) {
+  const { shop, customerId, orderId } = args;
+  const usedCodes = (args.usedCodes ?? []).map((c) => String(c).trim()).filter(Boolean);
+  if (usedCodes.length === 0) return;
 
-  const existing = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
-  return existing ? { ...defaults, ...existing } : defaults;
+  await db.redemption.updateMany({
+    where: {
+      shop,
+      customerId,
+      status: "ISSUED",
+      code: { in: usedCodes },
+    },
+    data: {
+      status: "CONSUMED",
+      consumedAt: new Date(),
+      consumedOrderId: orderId,
+    },
+  }).catch(() => null);
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -145,7 +370,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const topic = (request.headers.get("X-Shopify-Topic") ?? "").trim().toLowerCase();
   const shop = (request.headers.get("X-Shopify-Shop-Domain") ?? "").trim().toLowerCase();
 
-  const webhookId = request.headers.get("X-Shopify-Webhook-Id") ?? crypto.randomUUID();
+  const webhookId =
+    request.headers.get("X-Shopify-Webhook-Id") ??
+    crypto.randomUUID();
 
   const rawBodyBuffer = Buffer.from(await request.arrayBuffer());
 
@@ -160,6 +387,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     payload = {};
   }
 
+  // Idempotency: record webhookId (unique)
   try {
     await db.webhookEvent.create({
       data: {
@@ -188,18 +416,47 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const settings = await getShopSettings(shop);
 
         const orderId = String(payload?.id ?? "");
-        const customerId = payload?.customer?.id ? String(payload.customer.id) : null;
+        if (!orderId) break;
 
-        if (!orderId || !customerId) break;
-
+        // If already processed, stop (awards idempotency)
         const existing = await db.orderPointsSnapshot.findUnique({
           where: { shop_orderId: { shop, orderId } },
         });
         if (existing) break;
 
-        const { eligibleNet } = computeEligibleNetMerchandise(payload, settings);
+        // Preferred: fetch order and compute eligible net via final discount allocations
+        let eligibleNet = 0;
+        let customerId: string | null = payload?.customer?.id ? String(payload.customer.id) : null;
+        let currency = String(payload?.currency ?? "CAD");
+        let orderName = payload?.name ? String(payload.name) : orderId;
 
-        const pointsEarned = clampInt(eligibleNet * (settings.earnRate ?? 1), 0, 10_000_000);
+        const order = await fetchOrderForPoints(shop, orderId);
+        if (order) {
+          const computed = computeEligibleFromOrder(order, settings);
+          eligibleNet = computed.eligibleNet;
+          customerId = computed.customerId;
+          currency = order.currencyCode ?? currency;
+          orderName = order.name ?? orderName;
+
+          // NEW: if the order used a loyalty code, mark it consumed
+          if (customerId && order.discountCodes?.length) {
+            await consumeRedemptionsIfUsed({
+              shop,
+              customerId,
+              orderId,
+              usedCodes: order.discountCodes,
+            });
+          }
+        } else {
+          // Fallback if Admin API fails (no consumption marking here)
+          const fallback = computeEligibleNetMerchandiseFallback(payload, settings);
+          eligibleNet = fallback.eligibleNet;
+        }
+
+        if (!customerId) break; // guest orders
+
+        const earnRate = Number(settings.earnRate ?? 1) || 1;
+        const pointsEarned = clampInt(eligibleNet * earnRate, 0, 10_000_000);
 
         await db.$transaction(async (tx) => {
           await tx.orderPointsSnapshot.create({
@@ -211,7 +468,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
               pointsAwarded: pointsEarned,
               pointsReversedToDate: 0,
               paidAt: payload?.paid_at ? new Date(payload.paid_at) : new Date(),
-              currency: String(payload?.currency ?? "CAD"),
+              currency,
             },
           });
 
@@ -224,7 +481,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 delta: pointsEarned,
                 source: "ORDER",
                 sourceId: orderId,
-                description: `Earned on order ${payload?.name ?? orderId}`,
+                description: `Earned on order ${orderName}`,
                 createdAt: new Date(),
               },
             });
@@ -233,7 +490,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           const balanceRow = await tx.customerPointsBalance.upsert({
             where: { shop_customerId: { shop, customerId } },
             create: {
-              id: crypto.randomUUID(),
               shop,
               customerId,
               balance: pointsEarned,
@@ -270,9 +526,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
         const customerId = snap.customerId;
 
-        const refundLineItems: any[] = Array.isArray(payload?.refund_line_items)
-          ? payload.refund_line_items
-          : [];
+        const refundLineItems: any[] = Array.isArray(payload?.refund_line_items) ? payload.refund_line_items : [];
         let refundedEligibleNet = 0;
 
         for (const rli of refundLineItems) {
@@ -292,7 +546,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
         const proportion = Math.min(1, Math.max(0, refundedEligibleNet / originalEligible));
         const pointsToReverse = clampInt(remainingAwardable * proportion, 0, remainingAwardable);
-
         if (pointsToReverse <= 0) break;
 
         await db.$transaction(async (tx) => {
@@ -397,16 +650,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       }
 
       case "customers/data_request": {
-        await db.privacyEvent
-          .create({
-            data: {
-              shop,
-              topic,
-              payloadJson: JSON.stringify(payload ?? {}),
-              createdAt: new Date(),
-            },
-          })
-          .catch(() => null);
+        await db.privacyEvent.create({
+          data: {
+            shop,
+            topic,
+            payloadJson: JSON.stringify(payload ?? {}),
+            createdAt: new Date(),
+          },
+        }).catch(() => null);
         break;
       }
 
@@ -426,6 +677,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         await db.orderPointsSnapshot.deleteMany({ where: { shop } });
         await db.redemption.deleteMany({ where: { shop } });
         await db.webhookEvent.deleteMany({ where: { shop } });
+        await db.webhookError.deleteMany({ where: { shop } });
+        await db.privacyEvent.deleteMany({ where: { shop } });
         break;
       }
 
@@ -434,17 +687,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   } catch (err) {
     console.error(`[webhooks] error topic=${topic} shop=${shop}`, err);
-    await db.webhookError
-      .create({
-        data: {
-          shop,
-          topic,
-          webhookId: String(webhookId),
-          error: String((err as any)?.message ?? err),
-          createdAt: new Date(),
-        },
-      })
-      .catch(() => null);
+    await db.webhookError.create({
+      data: {
+        shop,
+        topic,
+        webhookId: String(webhookId),
+        error: String((err as any)?.message ?? err),
+        createdAt: new Date(),
+      },
+    }).catch(() => null);
   }
 
   return new Response(null, { status: 200 });

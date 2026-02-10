@@ -3,22 +3,60 @@ import { data, Form, useLoaderData } from "react-router";
 import crypto from "node:crypto";
 import db from "../db.server";
 
-function verifyAppProxyHmac(query: URLSearchParams, apiSecret: string): boolean {
-  const hmac = query.get("hmac");
+type LoaderData = {
+  ok: boolean;
+  shop: string;
+  customerId: string;
+  balance: number;
+  lastActivityAt: string | null;
+  ledger: Array<{
+    id: string;
+    type: string;
+    delta: number;
+    description: string | null;
+    createdAt: string;
+  }>;
+  issuedCodes: Array<{
+    id: string;
+    points: number;
+    value: number;
+    code: string;
+    status: string;
+    createdAt: string;
+  }>;
+  redemptionMinOrder: number;
+};
+
+function timingSafeEqual(a: Buffer, b: Buffer) {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Shopify App Proxy HMAC:
+ * - Build message from query params sorted by key, excluding `hmac` and `signature`
+ * - Join as: key=value&key=value
+ * - HMAC-SHA256 with API secret, compare hex digest
+ */
+function verifyAppProxyHmac(url: URL, apiSecret: string): boolean {
+  const hmac = url.searchParams.get("hmac");
   if (!hmac || !apiSecret) return false;
 
   const pairs: string[] = [];
-  for (const [k, v] of Array.from(query.entries())) {
-    if (k === "hmac" || k === "signature") continue;
-    pairs.push(`${k}=${v}`);
+  const keys = Array.from(url.searchParams.keys())
+    .filter((k) => k !== "hmac" && k !== "signature")
+    .sort();
+
+  for (const k of keys) {
+    // App Proxy can repeat keys; include each occurrence in order
+    const values = url.searchParams.getAll(k);
+    for (const v of values) pairs.push(`${k}=${v}`);
   }
-  pairs.sort();
 
   const message = pairs.join("&");
   const digest = crypto.createHmac("sha256", apiSecret).update(message).digest("hex");
 
-  // NOTE: Shopify sends lowercase hex for app-proxy hmac.
-  return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
+  return timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
 }
 
 function clampInt(n: number, min: number, max: number): number {
@@ -26,269 +64,515 @@ function clampInt(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, x));
 }
 
+function toStringListJson(value: any): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map((v) => String(v)).map((s) => s.trim()).filter(Boolean);
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map((v) => String(v)).map((s) => s.trim()).filter(Boolean);
+    } catch {
+      // ignore
+    }
+    return value.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  return [];
+}
+
 async function getShopSettings(shop: string) {
   const defaults = {
     earnRate: 1,
     redemptionMinOrder: 0,
+    excludedCustomerTags: ["Wholesale"],
+    includeProductTags: [],
+    excludeProductTags: [],
     redemptionSteps: [500, 1000],
     redemptionValueMap: { "500": 10, "1000": 20 },
   };
 
-  const s = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+  const existing = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+  if (!existing) return defaults;
 
-  // Normalize Json fields into plain JS types
-  const normalized = {
+  return {
     ...defaults,
-    ...(s ?? {}),
-    excludedCustomerTags: (s as any)?.excludedCustomerTags ?? [],
-    includeProductTags: (s as any)?.includeProductTags ?? [],
-    excludeProductTags: (s as any)?.excludeProductTags ?? [],
-    redemptionSteps: (s as any)?.redemptionSteps ?? defaults.redemptionSteps,
-    redemptionValueMap: (s as any)?.redemptionValueMap ?? defaults.redemptionValueMap,
+    ...existing,
+    excludedCustomerTags: toStringListJson((existing as any).excludedCustomerTags) || defaults.excludedCustomerTags,
+    includeProductTags: toStringListJson((existing as any).includeProductTags) || defaults.includeProductTags,
+    excludeProductTags: toStringListJson((existing as any).excludeProductTags) || defaults.excludeProductTags,
+    redemptionSteps: (existing as any).redemptionSteps ?? defaults.redemptionSteps,
+    redemptionValueMap: (existing as any).redemptionValueMap ?? defaults.redemptionValueMap,
+  };
+}
+
+/**
+ * Offline token row comes from PrismaSessionStorage with id: offline_{shop}
+ */
+async function getOfflineAccessToken(shop: string): Promise<string | null> {
+  const id = `offline_${shop}`;
+  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
+  return s?.accessToken ?? null;
+}
+
+async function shopifyGraphql(shop: string, query: string, variables: any) {
+  const token = await getOfflineAccessToken(shop);
+  if (!token) throw new Error("Missing offline access token for shop. Reinstall/re-auth the app.");
+
+  // Your app is configured for ApiVersion.October25 in shopify.server.ts -> 2025-10
+  const endpoint = `https://${shop}/admin/api/2025-10/graphql.json`;
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": token,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Shopify GraphQL failed: ${resp.status} ${resp.statusText} ${t}`);
+  }
+
+  const json = await resp.json().catch(() => null);
+  if (json?.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json?.data;
+}
+
+/**
+ * If includeProductTags is configured, restrict discount to products matching those tags.
+ * We keep it simple: query products by tag OR tag OR tag (up to first 250).
+ * If no include tags are configured, we return null -> discount applies to all items.
+ */
+async function getEligibleProductGidsByTags(shop: string, includeTags: string[]): Promise<string[] | null> {
+  const tags = includeTags.map((t) => t.trim()).filter(Boolean);
+  if (tags.length === 0) return null;
+
+  // Shopify product search syntax: tag:foo OR tag:bar
+  const q = tags.map((t) => `tag:${JSON.stringify(t)}`).join(" OR ");
+  const query = `
+    query ProductsByTag($q: String!) {
+      products(first: 250, query: $q) {
+        nodes { id }
+      }
+    }
+  `;
+
+  const data = await shopifyGraphql(shop, query, { q });
+  const nodes: any[] = data?.products?.nodes ?? [];
+  const ids = nodes.map((n) => String(n.id)).filter(Boolean);
+
+  if (ids.length === 0) return null; // fallback to all items if none found
+  return ids;
+}
+
+function makeDiscountCode(prefix: string) {
+  const suffix = crypto.randomBytes(4).toString("hex").toUpperCase(); // 8 chars
+  return `${prefix}-${suffix}`;
+}
+
+async function createShopifyDiscountCode(params: {
+  shop: string;
+  customerGid: string;
+  amountOff: number;
+  minSubtotal: number;
+  eligibleProductIds: string[] | null;
+  code: string;
+  title: string;
+}) {
+  const { shop, customerGid, amountOff, minSubtotal, eligibleProductIds, code, title } = params;
+
+  const mutation = `
+    mutation CreateCode($basicCodeDiscount: DiscountCodeBasicInput!) {
+      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+        codeDiscountNode {
+          id
+          codeDiscount {
+            ... on DiscountCodeBasic {
+              title
+              codes(first: 5) { nodes { code } }
+            }
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const startsAt = new Date().toISOString();
+  // Keep short-lived codes to reduce clutter; can be tuned.
+  const endsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const variables: any = {
+    basicCodeDiscount: {
+      title,
+      code,
+      startsAt,
+      endsAt,
+      appliesOncePerCustomer: true,
+      usageLimit: 1,
+      customerSelection: {
+        customers: { add: [customerGid] },
+      },
+      customerGets: {
+        value: {
+          discountAmount: {
+            amount: amountOff.toFixed(2),
+            appliesOnEachItem: false,
+          },
+        },
+        items:
+          eligibleProductIds && eligibleProductIds.length > 0
+            ? { products: { add: eligibleProductIds } }
+            : { all: true },
+      },
+      minimumRequirement:
+        minSubtotal && minSubtotal > 0
+          ? {
+              subtotal: {
+                greaterThanOrEqualToSubtotal: String(minSubtotal.toFixed(2)),
+              },
+            }
+          : null,
+    },
   };
 
-  return normalized;
+  const data = await shopifyGraphql(shop, mutation, variables);
+  const result = data?.discountCodeBasicCreate;
+
+  const userErrors: any[] = result?.userErrors ?? [];
+  if (userErrors.length) {
+    throw new Error(`Discount create userErrors: ${JSON.stringify(userErrors)}`);
+  }
+
+  const nodeId = String(result?.codeDiscountNode?.id ?? "");
+  const returnedCode = String(result?.codeDiscountNode?.codeDiscount?.codes?.nodes?.[0]?.code ?? code);
+
+  if (!nodeId) throw new Error("Discount create returned no codeDiscountNode.id");
+  return { nodeId, code: returnedCode };
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
-  const q = url.searchParams;
+  const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
 
-  const shop = (q.get("shop") ?? "").toLowerCase();
-  const customerId = q.get("logged_in_customer_id") ?? q.get("customer_id") ?? "";
+  // App Proxy required params
+  const shop = (url.searchParams.get("shop") ?? "").toLowerCase();
+  const customerId = url.searchParams.get("logged_in_customer_id") ?? "";
+  const ok = verifyAppProxyHmac(url, apiSecret);
 
-  const ok = verifyAppProxyHmac(q, process.env.SHOPIFY_API_SECRET ?? "");
-  if (!ok || !shop || !customerId) {
-    return new Response("Unauthorized", { status: 401 });
+  if (!ok) {
+    return data(
+      { ok: false, shop, customerId, balance: 0, lastActivityAt: null, ledger: [], issuedCodes: [], redemptionMinOrder: 0 },
+      { status: 401 },
+    );
+  }
+  if (!shop || !customerId) {
+    return data(
+      { ok: false, shop, customerId, balance: 0, lastActivityAt: null, ledger: [], issuedCodes: [], redemptionMinOrder: 0 },
+      { status: 400 },
+    );
   }
 
   const settings = await getShopSettings(shop);
 
-  const balanceRow = await db.customerPointsBalance
-    .findUnique({ where: { shop_customerId: { shop, customerId } } })
-    .catch(() => null);
+  const bal = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop, customerId } },
+  });
 
   const ledger = await db.pointsLedger.findMany({
     where: { shop, customerId },
     orderBy: { createdAt: "desc" },
-    take: 100,
+    take: 25,
+    select: { id: true, type: true, delta: true, description: true, createdAt: true },
   });
 
-  const balance = balanceRow?.balance ?? 0;
-  const lastActivityAt = balanceRow?.lastActivityAt ?? null;
-  const expiresOn = lastActivityAt
-    ? new Date(new Date(lastActivityAt).getTime() + 365 * 24 * 60 * 60 * 1000)
-    : null;
+  const issuedCodes = await db.redemption.findMany({
+    where: { shop, customerId, status: { in: ["ISSUED"] } },
+    orderBy: { createdAt: "desc" },
+    take: 10,
+    select: { id: true, points: true, value: true, code: true, status: true, createdAt: true },
+  });
 
-  return data({
+  const payload: LoaderData = {
+    ok: true,
     shop,
     customerId,
-    settings,
-    balance,
-    lastActivityAt,
-    expiresOn,
-    ledger,
-  });
+    balance: bal?.balance ?? 0,
+    lastActivityAt: bal?.lastActivityAt ? bal.lastActivityAt.toISOString() : null,
+    ledger: ledger.map((l) => ({
+      id: l.id,
+      type: l.type,
+      delta: l.delta,
+      description: l.description,
+      createdAt: l.createdAt.toISOString(),
+    })),
+    issuedCodes: issuedCodes.map((r) => ({
+      id: r.id,
+      points: r.points,
+      value: r.value,
+      code: r.code,
+      status: r.status,
+      createdAt: r.createdAt.toISOString(),
+    })),
+    redemptionMinOrder: Number(settings.redemptionMinOrder ?? 0) || 0,
+  };
+
+  return data(payload);
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const url = new URL(request.url);
-  const q = url.searchParams;
+  const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
 
-  const shop = (q.get("shop") ?? "").toLowerCase();
-  const customerId = q.get("logged_in_customer_id") ?? q.get("customer_id") ?? "";
+  const shop = (url.searchParams.get("shop") ?? "").toLowerCase();
+  const customerId = url.searchParams.get("logged_in_customer_id") ?? "";
 
-  const ok = verifyAppProxyHmac(q, process.env.SHOPIFY_API_SECRET ?? "");
-  if (!ok || !shop || !customerId) {
-    return new Response("Unauthorized", { status: 401 });
+  if (!verifyAppProxyHmac(url, apiSecret)) {
+    return data({ ok: false, error: "Unauthorized (bad HMAC)" }, { status: 401 });
+  }
+  if (!shop || !customerId) {
+    return data({ ok: false, error: "Missing shop or customer" }, { status: 400 });
   }
 
   const form = await request.formData();
-  const intent = String(form.get("_intent") ?? "");
-
+  const intent = String(form.get("intent") ?? "");
   if (intent !== "redeem") {
-    return data({ ok: false, message: "Unknown action." }, { status: 400 });
+    return data({ ok: false, error: "Unknown intent" }, { status: 400 });
   }
 
-  const requested = Number(form.get("points") ?? 0) || 0;
-  const points = clampInt(requested, 0, 1000);
-
-  if (points != 500 && points != 1000) {
-    return data({ ok: false, message: "Redemptions must be 500 or 1000 points." }, { status: 400 });
+  const pointsReq = clampInt(Number(form.get("points") ?? 0) || 0, 0, 1000);
+  if (![500, 1000].includes(pointsReq)) {
+    return data({ ok: false, error: "Invalid points amount. Choose 500 or 1000." }, { status: 400 });
   }
 
   const settings = await getShopSettings(shop);
+  const valueMap = settings.redemptionValueMap ?? { "500": 10, "1000": 20 };
+  const amountOff = Number(valueMap[String(pointsReq)] ?? 0) || 0;
 
-  const active = await db.redemption.findFirst({
-    where: { shop, customerId, status: { in: ["ISSUED", "APPLIED"] } },
-    orderBy: { createdAt: "desc" },
+  if (amountOff <= 0) {
+    return data({ ok: false, error: "Redemption value map not configured for this points amount." }, { status: 400 });
+  }
+
+  const balanceRow = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop, customerId } },
   });
-  if (active) {
-    return data(
-      { ok: false, message: `You already have an active reward: ${active.pointsSpent} points.` },
-      { status: 409 },
-    );
+
+  const balance = balanceRow?.balance ?? 0;
+  if (balance < pointsReq) {
+    return data({ ok: false, error: `Insufficient points. You have ${balance}.` }, { status: 400 });
   }
 
-  const bal = await db.customerPointsBalance
-    .findUnique({ where: { shop_customerId: { shop, customerId } } })
-    .catch(() => null);
+  // Idempotency: client can pass an idempotency key; if omitted, we generate one per request
+  const idemKey = String(form.get("idemKey") ?? crypto.randomUUID());
 
-  const currentBalance = bal?.balance ?? 0;
-  if (currentBalance < points) {
-    return data({ ok: false, message: "Insufficient points." }, { status: 400 });
+  // If already issued for this key, return it (safe retry)
+  const existing = await db.redemption.findFirst({
+    where: { shop, customerId, idemKey },
+  });
+  if (existing) {
+    return data({ ok: true, code: existing.code, value: existing.value, points: existing.points });
   }
 
-  const value = Number((settings as any)?.redemptionValueMap?.[String(points)] ?? 0) || (points === 500 ? 10 : 20);
-  const code = `LCR-${customerId.slice(-6)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  // Customer GID required by discountCodeBasicCreate customerSelection
+  const customerGid = `gid://shopify/Customer/${customerId}`;
 
+  // If includeProductTags configured, restrict discount to those products
+  const includeTags: string[] = (settings.includeProductTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
+  const eligibleProductIds = await getEligibleProductGidsByTags(shop, includeTags);
+
+  const minSubtotal = Number(settings.redemptionMinOrder ?? 0) || 0;
+
+  const code = makeDiscountCode(pointsReq === 500 ? "LC-REW10" : "LC-REW20");
+  const title = pointsReq === 500 ? "Lions Creek Rewards - $10" : "Lions Creek Rewards - $20";
+
+  // Create Shopify code discount
+  const created = await createShopifyDiscountCode({
+    shop,
+    customerGid,
+    amountOff,
+    minSubtotal,
+    eligibleProductIds,
+    code,
+    title,
+  });
+
+  // Persist redemption + ledger + balance update
   await db.$transaction(async (tx) => {
+    await tx.redemption.create({
+      data: {
+        shop,
+        customerId,
+        points: pointsReq,
+        value: amountOff,
+        code: created.code,
+        discountNodeId: created.nodeId,
+        status: "ISSUED",
+        idemKey,
+        createdAt: new Date(),
+      },
+    });
+
     await tx.pointsLedger.create({
       data: {
         shop,
         customerId,
         type: "REDEEM",
-        delta: -points,
+        delta: -pointsReq,
         source: "REDEMPTION",
-        sourceId: code,
-        description: `Redeemed ${points} points for $${value} reward code`,
+        sourceId: created.nodeId,
+        description: `Redeemed ${pointsReq} points for $${amountOff.toFixed(0)} off`,
         createdAt: new Date(),
       },
     });
 
-    await tx.customerPointsBalance.upsert({
+    await tx.customerPointsBalance.update({
       where: { shop_customerId: { shop, customerId } },
-      create: {
-        shop,
-        customerId,
-        balance: Math.max(0, currentBalance - points),
-        lifetimeEarned: 0,
-        lifetimeRedeemed: points,
-        lastActivityAt: new Date(),
-      },
-      update: {
-        balance: { decrement: points },
-        lifetimeRedeemed: { increment: points },
+      data: {
+        balance: { decrement: pointsReq },
+        lifetimeRedeemed: { increment: pointsReq },
         lastActivityAt: new Date(),
       },
     });
 
-    // Clamp to >= 0
-    const updated = await tx.customerPointsBalance.findUnique({
+    // Safety clamp (should not happen, but protects against concurrent updates)
+    const b = await tx.customerPointsBalance.findUnique({
       where: { shop_customerId: { shop, customerId } },
     });
-    if (updated && updated.balance < 0) {
+    if (b && b.balance < 0) {
       await tx.customerPointsBalance.update({
         where: { shop_customerId: { shop, customerId } },
         data: { balance: 0 },
       });
     }
-
-    await tx.redemption.create({
-      data: {
-        shop,
-        customerId,
-        pointsSpent: points,
-        value,
-        code,
-        status: "ISSUED",
-        issuedAt: new Date(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      },
-    });
   });
 
-  return data({ ok: true, message: "Reward issued.", code, value });
+  return data({ ok: true, code: created.code, value: amountOff, points: pointsReq });
 };
 
 export default function LoyaltyDashboard() {
-  const { balance, ledger, expiresOn, lastActivityAt, settings } = useLoaderData<typeof loader>();
+  const d = useLoaderData<LoaderData>();
+
+  if (!d.ok) {
+    return (
+      <main style={{ fontFamily: "system-ui", padding: 18 }}>
+        <h2>Lions Creek Rewards</h2>
+        <p>Unauthorized or missing parameters.</p>
+      </main>
+    );
+  }
 
   return (
-    <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto", padding: 18, maxWidth: 980 }}>
-      <h1 style={{ margin: 0 }}>Lions Creek Rewards</h1>
-      <p style={{ marginTop: 6, opacity: 0.8 }}>
-        Earn 1 point per $1 on eligible merchandise. Redeem 500 points for $10 or 1000 points for $20.
-      </p>
+    <main style={{ fontFamily: "system-ui", padding: 18, maxWidth: 980, margin: "0 auto" }}>
+      <h2 style={{ marginTop: 0 }}>Lions Creek Rewards</h2>
 
-      <section style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 1fr", marginTop: 12 }}>
-        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14 }}>
-          <div style={{ fontSize: 14, opacity: 0.7 }}>Current balance</div>
-          <div style={{ fontSize: 34, fontWeight: 700 }}>{balance}</div>
-        </div>
-
-        <div style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14 }}>
-          <div style={{ fontSize: 14, opacity: 0.7 }}>Expiry policy</div>
-          <div style={{ fontSize: 14, marginTop: 6 }}>
-            {lastActivityAt ? (
-              <>
-                Last activity: <strong>{new Date(lastActivityAt).toLocaleDateString()}</strong>
-                <br />
-                Estimated expiry (if no activity): <strong>{expiresOn ? new Date(expiresOn).toLocaleDateString() : "—"}</strong>
-              </>
-            ) : (
-              <>No activity yet. Points expire after 12 months of inactivity.</>
-            )}
+      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+        <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "baseline" }}>
+          <div>
+            <div style={{ fontSize: 13, opacity: 0.7 }}>Points balance</div>
+            <div style={{ fontSize: 28, fontWeight: 700 }}>{d.balance}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 13, opacity: 0.7 }}>Rewards</div>
+            <div style={{ fontSize: 16 }}>
+              500 pts = $10 • 1000 pts = $20
+              {d.redemptionMinOrder > 0 ? (
+                <span style={{ opacity: 0.75 }}> • Min order ${d.redemptionMinOrder.toFixed(2)}</span>
+              ) : null}
+            </div>
           </div>
         </div>
-      </section>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14, marginTop: 12 }}>
-        <h2 style={{ marginTop: 0 }}>Redeem</h2>
-        <div style={{ opacity: 0.8, marginBottom: 10 }}>
-          Minimum order to redeem: <strong>${settings.redemptionMinOrder}</strong>
+        <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <Form method="post">
+            <input type="hidden" name="intent" value="redeem" />
+            <input type="hidden" name="points" value="500" />
+            <input type="hidden" name="idemKey" value={crypto.randomUUID()} />
+            <button
+              type="submit"
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #ccc",
+                cursor: "pointer",
+                background: "white",
+              }}
+              disabled={d.balance < 500}
+              title={d.balance < 500 ? "Not enough points" : "Generate a $10 code"}
+            >
+              Redeem 500 → $10 code
+            </button>
+          </Form>
+
+          <Form method="post">
+            <input type="hidden" name="intent" value="redeem" />
+            <input type="hidden" name="points" value="1000" />
+            <input type="hidden" name="idemKey" value={crypto.randomUUID()} />
+            <button
+              type="submit"
+              style={{
+                padding: "10px 14px",
+                borderRadius: 10,
+                border: "1px solid #ccc",
+                cursor: "pointer",
+                background: "white",
+              }}
+              disabled={d.balance < 1000}
+              title={d.balance < 1000 ? "Not enough points" : "Generate a $20 code"}
+            >
+              Redeem 1000 → $20 code
+            </button>
+          </Form>
         </div>
 
-        <Form method="post" style={{ display: "flex", gap: 10, alignItems: "end", flexWrap: "wrap" }}>
-          <input type="hidden" name="_intent" value="redeem" />
-          <label>
-            Choose reward
-            <select name="points" defaultValue="500">
-              <option value="500">500 points → $10</option>
-              <option value="1000">1000 points → $20</option>
-            </select>
-          </label>
-          <button type="submit">Generate reward</button>
-        </Form>
-
         <p style={{ marginTop: 10, fontSize: 13, opacity: 0.75 }}>
-          v1: this issues a one-time code stored in the app. Next iteration wires it to a Shopify discount code via Admin API.
+          After you redeem, you’ll receive a one-time discount code. Enter the code at checkout. Codes expire in 7 days.
         </p>
       </section>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 14, marginTop: 12 }}>
-        <h2 style={{ marginTop: 0 }}>Points history</h2>
-        <div style={{ overflowX: "auto" }}>
-          <table cellPadding={8} style={{ borderCollapse: "collapse", width: "100%" }}>
+      {d.issuedCodes.length > 0 && (
+        <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+          <h3 style={{ marginTop: 0 }}>Your active codes</h3>
+          <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
+            {d.issuedCodes.map((r) => (
+              <li key={r.id}>
+                <strong>{r.code}</strong> — ${r.value.toFixed(0)} off ({r.points} pts) • issued{" "}
+                {new Date(r.createdAt).toLocaleString()}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
+        <h3 style={{ marginTop: 0 }}>Recent activity</h3>
+        {d.ledger.length === 0 ? (
+          <p style={{ margin: 0, opacity: 0.8 }}>No activity yet.</p>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead>
-              <tr style={{ textAlign: "left", borderBottom: "1px solid #eee" }}>
-                <th>Date</th>
-                <th>Type</th>
-                <th>Delta</th>
-                <th>Description</th>
+              <tr>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", paddingBottom: 8 }}>Date</th>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", paddingBottom: 8 }}>Type</th>
+                <th style={{ textAlign: "right", borderBottom: "1px solid #eee", paddingBottom: 8 }}>Points</th>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", paddingBottom: 8 }}>Description</th>
               </tr>
             </thead>
             <tbody>
-              {ledger.length === 0 ? (
-                <tr>
-                  <td colSpan={4} style={{ opacity: 0.7 }}>
-                    No points activity yet.
-                  </td>
+              {d.ledger.map((l) => (
+                <tr key={l.id}>
+                  <td style={{ padding: "8px 0", whiteSpace: "nowrap" }}>{new Date(l.createdAt).toLocaleString()}</td>
+                  <td style={{ padding: "8px 0" }}>{l.type}</td>
+                  <td style={{ padding: "8px 0", textAlign: "right" }}>{l.delta}</td>
+                  <td style={{ padding: "8px 0", opacity: 0.85 }}>{l.description ?? ""}</td>
                 </tr>
-              ) : (
-                ledger.map((e: any) => (
-                  <tr key={e.id} style={{ borderBottom: "1px solid #f3f3f3" }}>
-                    <td>{new Date(e.createdAt).toLocaleDateString()}</td>
-                    <td>{e.type}</td>
-                    <td style={{ fontWeight: 600 }}>{e.delta}</td>
-                    <td style={{ opacity: 0.85 }}>{e.description}</td>
-                  </tr>
-                ))
-              )}
+              ))}
             </tbody>
           </table>
-        </div>
+        )}
       </section>
-    </div>
+    </main>
   );
 }
