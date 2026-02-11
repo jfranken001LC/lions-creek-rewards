@@ -159,7 +159,7 @@ async function shopifyGraphql(shop: string, query: string, variables: any) {
   const token = await getOfflineAccessToken(shop);
   if (!token) throw new Error("Missing offline access token for shop. Reinstall/re-auth the app.");
 
-  const endpoint = `https://${shop}/admin/api/2025-10/graphql.json`;
+  const endpoint = `https://${shop}/admin/api/2026-01/graphql.json`;
 
   const resp = await fetch(endpoint, {
     method: "POST",
@@ -266,7 +266,10 @@ async function createShopifyDiscountCode(params: {
   return { nodeId, code: returnedCode };
 }
 
-function computeLedgerWithRunningBalance(currentBalance: number, descRows: Array<{ id: string; type: any; delta: number; description: string | null; createdAt: Date }>) {
+function computeLedgerWithRunningBalance(
+  currentBalance: number,
+  descRows: Array<{ id: string; type: any; delta: number; description: string | null; createdAt: Date }>,
+) {
   let running = currentBalance;
 
   // rows are in DESC order; running balance shown is the balance AFTER that event
@@ -318,27 +321,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const expiryMonths = 12;
   const settings = await getShopSettings(shop);
 
-  const bal = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
+  const bal = await db.customerPointsBalance
+    .findUnique({ where: { shop_customerId: { shop, customerId } } })
+    .catch(() => null);
 
   const balance = bal?.balance ?? 0;
-  const lastActivityAt = bal?.lastActivityAt ? bal.lastActivityAt : null;
-  const estimatedExpiryAt = lastActivityAt ? addMonths(lastActivityAt, expiryMonths) : null;
+  const lifetimeEarned = bal?.lifetimeEarned ?? 0;
+  const lifetimeRedeemed = bal?.lifetimeRedeemed ?? 0;
 
-  const ledgerRaw = await db.pointsLedger.findMany({
+  const lastActivityAt = bal?.lastActivityAt ? bal.lastActivityAt.toISOString() : null;
+  const estimatedExpiryAt =
+    bal?.lastActivityAt ? addMonths(new Date(bal.lastActivityAt), expiryMonths).toISOString() : null;
+
+  const ledgerDesc = await db.pointsLedger.findMany({
     where: { shop, customerId },
     orderBy: { createdAt: "desc" },
     take: 50,
     select: { id: true, type: true, delta: true, description: true, createdAt: true },
   });
 
-  const ledger = computeLedgerWithRunningBalance(balance, ledgerRaw);
+  const ledger = computeLedgerWithRunningBalance(balance, ledgerDesc);
 
-  const redemptionsRaw = await db.redemption.findMany({
+  const redemptionsDesc = await db.redemption.findMany({
     where: { shop, customerId },
     orderBy: { createdAt: "desc" },
-    take: 20,
+    take: 25,
     select: {
       id: true,
       points: true,
@@ -352,38 +359,47 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     },
   });
 
-  const redemptions: RedemptionRow[] = redemptionsRaw.map((r) => ({
+  const redemptions: RedemptionRow[] = redemptionsDesc.map((r) => ({
     id: r.id,
-    points: r.points,
+    points: (r as any).points ?? (r as any).pointsSpent ?? 0,
     value: r.value,
     code: r.code,
-    status: r.status,
+    status: String(r.status),
     createdAt: r.createdAt.toISOString(),
     expiresAt: r.expiresAt ? r.expiresAt.toISOString() : null,
     appliedAt: (r as any).appliedAt ? (r as any).appliedAt.toISOString() : null,
     consumedAt: (r as any).consumedAt ? (r as any).consumedAt.toISOString() : null,
   }));
 
-  const activeRedemption = redemptions.find((r) => r.status === "ISSUED") ?? null;
+  const activeRedemption =
+    redemptions.find((r) => r.status === "ISSUED" || r.status === "APPLIED") ?? null;
 
   return data<LoaderData>({
     ok: true,
     shop,
     customerId,
     balance,
-    lifetimeEarned: bal?.lifetimeEarned ?? 0,
-    lifetimeRedeemed: bal?.lifetimeRedeemed ?? 0,
-    lastActivityAt: lastActivityAt ? lastActivityAt.toISOString() : null,
-    estimatedExpiryAt: estimatedExpiryAt ? estimatedExpiryAt.toISOString() : null,
+    lifetimeEarned,
+    lifetimeRedeemed,
+    lastActivityAt,
+    estimatedExpiryAt,
     ledger,
     redemptions,
     activeRedemption,
     redemptionMinOrder: Number(settings.redemptionMinOrder ?? 0) || 0,
-    redemptionSteps: (settings.redemptionSteps ?? []).map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n)),
-    redemptionValueMap: settings.redemptionValueMap ?? {},
+    redemptionSteps: (settings.redemptionSteps as any) ?? [],
+    redemptionValueMap: (settings.redemptionValueMap as any) ?? {},
     expiryMonths,
   });
 };
+
+async function getCustomerGid(shop: string, customerId: string): Promise<string> {
+  // customerId from app proxy is numeric; build GID.
+  const numeric = String(customerId).trim();
+  if (!numeric) throw new Error("Missing customerId.");
+  // Shopify Admin GraphQL GID for Customer:
+  return `gid://shopify/Customer/${numeric}`;
+}
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const url = new URL(request.url);
@@ -391,93 +407,105 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const shop = (url.searchParams.get("shop") ?? "").toLowerCase();
   const customerId = url.searchParams.get("logged_in_customer_id") ?? "";
+  const ok = verifyAppProxyHmac(url, apiSecret);
 
-  if (!verifyAppProxyHmac(url, apiSecret)) return data<ActionData>({ ok: false, error: "Unauthorized (bad HMAC)" }, { status: 401 });
-  if (!shop || !customerId) return data<ActionData>({ ok: false, error: "Missing shop or customer" }, { status: 400 });
+  if (!ok || !shop || !customerId) {
+    return data<ActionData>({ ok: false, error: "Unauthorized or missing proxy params." }, { status: 401 });
+  }
 
   const form = await request.formData();
   const intent = String(form.get("intent") ?? "");
-  if (intent !== "redeem") return data<ActionData>({ ok: false, error: "Unknown intent" }, { status: 400 });
-
-  const settings = await getShopSettings(shop);
-  const steps = (settings.redemptionSteps ?? []).map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n));
-  const valueMap = settings.redemptionValueMap ?? {};
-
-  const pointsReq = clampInt(Number(form.get("points") ?? 0) || 0, 0, 1_000_000);
-  if (!steps.includes(pointsReq)) {
-    return data<ActionData>({ ok: false, error: `Invalid points amount. Choose: ${steps.join(", ")}.` }, { status: 400 });
+  if (intent !== "redeem") {
+    return data<ActionData>({ ok: false, error: "Unknown action." }, { status: 400 });
   }
 
-  // ✅ only one ISSUED code at a time
+  const settings = await getShopSettings(shop);
+
+  const pointsReqRaw = Number(form.get("points") ?? 0) || 0;
+  const pointsReq = clampInt(pointsReqRaw, 1, 1_000_000);
+
+  const redemptionValueMap = (settings.redemptionValueMap as any) ?? {};
+  const amountOff = Number(redemptionValueMap[String(pointsReq)] ?? 0) || 0;
+
+  if (amountOff <= 0) {
+    return data<ActionData>({ ok: false, error: "This reward tier is not configured." }, { status: 400 });
+  }
+
   const existingActive = await db.redemption.findFirst({
-    where: { shop, customerId, status: "ISSUED" },
+    where: { shop, customerId, status: { in: ["ISSUED", "APPLIED"] } as any },
     orderBy: { createdAt: "desc" },
   });
+
   if (existingActive) {
     return data<ActionData>({
       ok: true,
       code: existingActive.code,
       value: existingActive.value,
-      points: existingActive.points,
-      note: "You already have an active code. Use it before generating another.",
+      points: (existingActive as any).points ?? (existingActive as any).pointsSpent ?? pointsReq,
+      note: "You already have an active code. Use it at checkout (or wait for it to expire).",
     });
   }
 
-  const amountOff = Number(valueMap[String(pointsReq)] ?? 0) || 0;
-  if (amountOff <= 0) {
-    return data<ActionData>({ ok: false, error: "Redemption value map not configured for this points amount." }, { status: 400 });
+  const bal = await db.customerPointsBalance.findUnique({ where: { shop_customerId: { shop, customerId } } });
+  const currentBalance = bal?.balance ?? 0;
+
+  if (currentBalance < pointsReq) {
+    return data<ActionData>({ ok: false, error: "Not enough points for that reward." }, { status: 400 });
   }
 
-  const balanceRow = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
-
-  const balance = balanceRow?.balance ?? 0;
-  if (balance < pointsReq) return data<ActionData>({ ok: false, error: `Insufficient points. You have ${balance}.` }, { status: 400 });
-
-  // idempotency key support
+  // Browser provides idempotency key (hidden field) so repeated clicks don't issue twice
   const idemKey = String(form.get("idemKey") ?? crypto.randomUUID());
   const existingIdem = await db.redemption.findFirst({ where: { shop, customerId, idemKey } });
-  if (existingIdem) return data<ActionData>({ ok: true, code: existingIdem.code, value: existingIdem.value, points: existingIdem.points });
+  if (existingIdem) {
+    return data<ActionData>({
+      ok: true,
+      code: existingIdem.code,
+      value: existingIdem.value,
+      points: (existingIdem as any).points ?? (existingIdem as any).pointsSpent ?? pointsReq,
+      note: "Request already processed (idempotent).",
+    });
+  }
 
-  const customerGid = `gid://shopify/Customer/${customerId}`;
-  const includeTags: string[] = (settings.includeProductTags ?? []).map((t: any) => String(t).trim()).filter(Boolean);
-  const eligibleProductIds = await getEligibleProductGidsByTags(shop, includeTags);
+  const code = makeDiscountCode("REWARDS");
+  const title = `Lions Creek Rewards - $${Math.round(amountOff)} off`;
 
+  const customerGid = await getCustomerGid(shop, customerId);
+
+  const eligibleProducts = await getEligibleProductGidsByTags(shop, toStringListJson(settings.includeProductTags));
   const minSubtotal = Number(settings.redemptionMinOrder ?? 0) || 0;
 
-  // code prefix is deterministic by value amount (keeps it readable for staff)
-  const dollars = Math.round(amountOff);
-  const codePrefix = `LC-REW${String(dollars).padStart(2, "0")}`;
-  const code = makeDiscountCode(codePrefix);
-  const title = `Lions Creek Rewards - $${dollars}`;
-
+  // Create discount code in Shopify + issue redemption atomically with ledger/balance updates
   const created = await createShopifyDiscountCode({
     shop,
     customerGid,
     amountOff,
     minSubtotal,
-    eligibleProductIds,
+    eligibleProductIds: eligibleProducts,
     code,
     title,
   });
 
+  const now = new Date();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
   await db.$transaction(async (tx) => {
+    // write redemption
     await tx.redemption.create({
       data: {
         shop,
         customerId,
         points: pointsReq,
-        value: amountOff,
+        value: Math.round(amountOff),
         code: created.code,
         discountNodeId: created.nodeId,
         status: "ISSUED",
+        issuedAt: now,
+        expiresAt,
         idemKey,
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-      },
+      } as any,
     });
 
+    // write ledger
     await tx.pointsLedger.create({
       data: {
         shop,
@@ -485,29 +513,34 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         type: "REDEEM",
         delta: -pointsReq,
         source: "REDEMPTION",
-        sourceId: created.nodeId,
+        sourceId: created.code,
         description: `Redeemed ${pointsReq} points for $${Math.round(amountOff)} off`,
-        createdAt: new Date(),
+        createdAt: now,
       },
     });
 
-    await tx.customerPointsBalance.update({
+    // decrement points balance
+    await tx.customerPointsBalance.upsert({
       where: { shop_customerId: { shop, customerId } },
-      data: {
+      create: {
+        shop,
+        customerId,
+        balance: Math.max(0, currentBalance - pointsReq),
+        lifetimeEarned: 0,
+        lifetimeRedeemed: pointsReq,
+        lastActivityAt: now,
+      },
+      update: {
         balance: { decrement: pointsReq },
         lifetimeRedeemed: { increment: pointsReq },
-        lastActivityAt: new Date(),
+        lastActivityAt: now,
       },
     });
 
-    const b = await tx.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop, customerId } },
-    });
+    // floor at 0
+    const b = await tx.customerPointsBalance.findUnique({ where: { shop_customerId: { shop, customerId } } });
     if (b && b.balance < 0) {
-      await tx.customerPointsBalance.update({
-        where: { shop_customerId: { shop, customerId } },
-        data: { balance: 0 },
-      });
+      await tx.customerPointsBalance.update({ where: { shop_customerId: { shop, customerId } }, data: { balance: 0 } });
     }
   });
 

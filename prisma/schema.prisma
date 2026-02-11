@@ -43,8 +43,10 @@ enum LedgerType {
 enum RedemptionStatus {
   ISSUED
   APPLIED
+  CONSUMED
   VOID
   EXPIRED
+  CANCELLED
 }
 
 /// Webhook processing outcomes (admin-visible logging)
@@ -107,6 +109,7 @@ model OrderPointsSnapshot {
   id                     String   @id @default(cuid())
   shop                   String
   orderId                String
+  orderName              String?
   customerId             String
   eligibleNetMerchandise Float    @default(0)
   pointsAwarded          Int      @default(0)
@@ -114,6 +117,9 @@ model OrderPointsSnapshot {
   paidAt                 DateTime
   cancelledAt            DateTime?
   currency               String   @default("CAD")
+
+  // For audit/debug: discount codes present on the order at the time points were captured.
+  discountCodesJson Json?
 
   @@unique([shop, orderId], name: "shop_orderId")
   @@index([shop, customerId])
@@ -123,17 +129,37 @@ model Redemption {
   id          String           @id @default(cuid())
   shop        String
   customerId  String
-  pointsSpent Int
+  // Points consumed to issue this redemption.
+  points      Int
   value       Int
   code        String
+
+  // GraphQL ID for the created CodeDiscountNode (used for deactivate/delete).
+  discountNodeId String?
+
+  // Client-provided idempotency key (prevents duplicate issuance).
+  idemKey String?
+
   status      RedemptionStatus @default(ISSUED)
   createdAt   DateTime         @default(now())
   issuedAt    DateTime?
   appliedAt   DateTime?
   expiresAt   DateTime?
 
+  // When this redemption was actually expired by a job.
+  expiredAt DateTime?
+
+  // When this redemption was consumed by an order.
+  consumedAt      DateTime?
+  consumedOrderId String?
+
+  voidedAt    DateTime?
+  cancelledAt DateTime?
+
   @@unique([shop, code], name: "shop_code")
+  @@unique([shop, customerId, idemKey], name: "shop_customer_idemKey")
   @@index([shop, customerId, createdAt])
+  @@index([shop, status, createdAt])
 }
 
 model WebhookEvent {
