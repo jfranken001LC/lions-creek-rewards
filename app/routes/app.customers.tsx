@@ -1,670 +1,311 @@
-import { data, Form, useActionData, useLoaderData, Link } from "react-router";
+// app/routes/app.customers.tsx
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data, Form, useActionData, useLoaderData } from "react-router";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
+import { formatProtectedCustomerDataError } from "../lib/protectedCustomerData";
 
-const ADMIN_API_VERSION = "2026-01";
-
-type SettingsShape = {
-  earnRate: number;
-  redemptionMinOrder: number;
-  excludedCustomerTags: string[];
-  includeProductTags: string[];
-  excludeProductTags: string[];
-  redemptionSteps: number[];
-  redemptionValueMap: Record<string, number>;
-};
+/**
+ * NOTE:
+ * - "Search by name/email" requires Shopify Protected Customer Data approval for a Public/AppStore app.
+ * - Without approval, Shopify returns HTTP 200 with GraphQL errors like:
+ *   "This app is not approved to access the Customer object..."
+ */
 
 type CustomerHit = {
-  id: string; // numeric Shopify customer id
-  gid: string;
-  displayName: string | null;
-  email: string | null;
-};
-
-type LedgerRow = {
   id: string;
-  type: string;
-  delta: number;
-  description: string | null;
-  createdAt: string;
-  runningBalance: number;
+  email?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  tags?: string[] | null;
 };
 
 type ActionData =
-  | {
-      ok: true;
-      message?: string;
-      settings?: SettingsShape;
+  | { ok: true; mode: "id" | "query"; q: string; hits: CustomerHit[]; warnings?: string[] }
+  | { ok: false; mode: "id" | "query"; q: string; error: string; help?: string; debug?: string };
 
-      hits?: CustomerHit[];
-      selected?: CustomerHit;
-
-      balance?: {
-        balance: number;
-        lifetimeEarned: number;
-        lifetimeRedeemed: number;
-        lastActivityAt: string | null;
-      };
-      ledger?: LedgerRow[];
-      redemptions?: Array<{
-        id: string;
-        points: number;
-        value: number;
-        code: string;
-        status: string;
-        createdAt: string;
-        expiresAt: string | null;
-        appliedAt: string | null;
-        consumedAt: string | null;
-        consumedOrderId: string | null;
-        expiredAt: string | null;
-      }>;
-    }
-  | { ok: false; error: string };
-
-function parseCsvList(value: string): string[] {
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+function isNumeric(s: string) {
+  return /^[0-9]+$/.test(s);
 }
 
-function jsonList(value: unknown, fallback: string[]): string[] {
-  if (Array.isArray(value)) return value.map(String);
-  try {
-    if (typeof value === "string") {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed.map(String);
-    }
-  } catch {
-    // ignore
+function toCustomerGid(q: string) {
+  if (q.startsWith("gid://shopify/Customer/")) return q;
+  if (isNumeric(q)) return `gid://shopify/Customer/${q}`;
+  return null;
+}
+
+async function getOfflineAccessToken(shop: string): Promise<string | null> {
+  const id = `offline_${shop}`;
+  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
+  return s?.accessToken ?? null;
+}
+
+async function shopifyGraphqlRaw(shop: string, query: string, variables: any) {
+  const token = await getOfflineAccessToken(shop);
+  if (!token) {
+    return {
+      data: null,
+      errors: [{ message: "Missing offline access token for shop. Reinstall/re-auth the app." }],
+    };
   }
-  return fallback;
-}
 
-function jsonNumberList(value: unknown, fallback: number[]): number[] {
-  if (Array.isArray(value)) {
-    const nums = value.map((x) => Number(x)).filter((n) => Number.isFinite(n));
-    return nums.length ? nums : fallback;
-  }
-  try {
-    if (typeof value === "string") {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) {
-        const nums = parsed.map((x) => Number(x)).filter((n) => Number.isFinite(n));
-        return nums.length ? nums : fallback;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-function jsonMap(value: unknown, fallback: Record<string, number>): Record<string, number> {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const out: Record<string, number> = {};
-    for (const [k, v] of Object.entries(value as any)) {
-      const n = Number(v);
-      if (Number.isFinite(n)) out[String(k)] = n;
-    }
-    return Object.keys(out).length ? out : fallback;
-  }
-  try {
-    if (typeof value === "string") {
-      const parsed = JSON.parse(value);
-      return jsonMap(parsed, fallback);
-    }
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
-
-async function getShopSettings(shop: string): Promise<SettingsShape> {
-  const defaults: SettingsShape = {
-    earnRate: 1,
-    redemptionMinOrder: 0,
-    excludedCustomerTags: ["Wholesale"],
-    includeProductTags: [],
-    excludeProductTags: [],
-    redemptionSteps: [500, 1000],
-    redemptionValueMap: { "500": 10, "1000": 20 },
-  };
-
-  const settings = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
-  if (!settings) return defaults;
-
-  return {
-    earnRate: settings.earnRate ?? defaults.earnRate,
-    redemptionMinOrder: settings.redemptionMinOrder ?? defaults.redemptionMinOrder,
-    excludedCustomerTags: jsonList(settings.excludedCustomerTags, defaults.excludedCustomerTags),
-    includeProductTags: jsonList(settings.includeProductTags, defaults.includeProductTags),
-    excludeProductTags: jsonList(settings.excludeProductTags, defaults.excludeProductTags),
-    redemptionSteps: jsonNumberList((settings as any).redemptionSteps, defaults.redemptionSteps),
-    redemptionValueMap: jsonMap((settings as any).redemptionValueMap, defaults.redemptionValueMap),
-  };
-}
-
-/**
- * Shopify search syntax rules:
- * - default query can be plain terms (e.g. "Bob Norman")
- * - special chars : \( ) should be escaped unless user is intentionally using advanced syntax
- */
-function buildCustomerQuery(raw: string): string {
-  const q = raw.trim();
-
-  // Power-user mode: if they typed a field query, don't mangle it.
-  if (q.includes(":")) return q;
-
-  // Email: exact phrase query (best practice)
-  if (q.includes("@")) return `email:"${q.replaceAll(`"`, "")}"`;
-
-  // Multi-word: keep as plain terms (Shopify default multi-field search)
-  // BUT escape special chars that break the grammar.
-  const escape = (s: string) =>
-    s.replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("(", "\\(").replaceAll(")", "\\)");
-
-  // Also normalize commas to spaces; users sometimes type "Last, First"
-  const normalized = q.replaceAll(",", " ").replace(/\s+/g, " ").trim();
-
-  return escape(normalized);
-}
-
-async function shopifyGraphql<T>(shop: string, accessToken: string, query: string, variables: any): Promise<T> {
-  const res = await fetch(`https://${shop}/admin/api/${ADMIN_API_VERSION}/graphql.json`, {
+  const endpoint = `https://${shop}/admin/api/2026-01/graphql.json`;
+  const resp = await fetch(endpoint, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": accessToken,
-    },
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
     body: JSON.stringify({ query, variables }),
   });
 
-  const text = await res.text();
+  const text = await resp.text().catch(() => "");
   let json: any = null;
   try {
     json = JSON.parse(text);
   } catch {
-    // Non-JSON typically means auth/proxy/network
-    throw new Error(`Shopify returned non-JSON (${res.status}).`);
+    // keep null
   }
 
-  if (!res.ok || json.errors) {
-    const msg =
-      json?.errors?.[0]?.message ??
-      json?.error ??
-      `Shopify GraphQL failed (${res.status})`;
-    throw new Error(msg);
-  }
-  return json.data as T;
-}
-
-async function searchCustomers(shop: string, accessToken: string, q: string): Promise<CustomerHit[]> {
-  const query = `
-    query Customers($first: Int!, $query: String!) {
-      customers(first: $first, query: $query) {
-        edges {
-          node {
-            id
-            displayName
-            email
-          }
-        }
-      }
-    }
-  `;
-
-  const shopifyQuery = buildCustomerQuery(q);
-
-  const data = await shopifyGraphql<{
-    customers: { edges: Array<{ node: { id: string; displayName: string | null; email: string | null } }> };
-  }>(shop, accessToken, query, { first: 10, query: shopifyQuery });
-
-  return (data.customers.edges ?? []).map((e) => {
-    const gid = e.node.id;
-    const id = String(gid.split("/").pop() ?? "").trim();
-    return { id, gid, displayName: e.node.displayName ?? null, email: e.node.email ?? null };
-  }).filter(h => h.id);
-}
-
-async function loadCustomerState(shop: string, customerId: string) {
-  const balanceRow = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
-
-  const balance = {
-    balance: balanceRow?.balance ?? 0,
-    lifetimeEarned: balanceRow?.lifetimeEarned ?? 0,
-    lifetimeRedeemed: balanceRow?.lifetimeRedeemed ?? 0,
-    lastActivityAt: balanceRow?.lastActivityAt ? balanceRow.lastActivityAt.toISOString() : null,
-  };
-
-  const ledgerRaw = await db.pointsLedger.findMany({
-    where: { shop, customerId },
-    orderBy: { createdAt: "desc" },
-    take: 100,
-  });
-
-  // compute running balance backwards from current balance
-  let running = balance.balance;
-  const ledger: LedgerRow[] = ledgerRaw.map((r) => {
-    const row: LedgerRow = {
-      id: r.id,
-      type: String(r.type),
-      delta: r.delta,
-      description: r.description ?? null,
-      createdAt: r.createdAt.toISOString(),
-      runningBalance: running,
+  if (!resp.ok) {
+    return {
+      data: null,
+      errors: [
+        {
+          message: `Shopify GraphQL failed: ${resp.status} ${resp.statusText}${text ? ` ${text}` : ""}`,
+        },
+      ],
     };
-    running = running - r.delta;
-    return row;
-  });
+  }
 
-  const redemptionsRaw = await db.redemption.findMany({
-    where: { shop, customerId },
-    orderBy: { createdAt: "desc" },
-    take: 20,
-  });
+  return { data: json?.data ?? null, errors: json?.errors ?? [] };
+}
 
-  const redemptions = redemptionsRaw.map((r: any) => ({
-    id: r.id,
-    points: Number(r.points ?? r.pointsSpent ?? 0),
-    value: Number(r.value ?? 0),
-    code: String(r.code ?? ""),
-    status: String(r.status ?? ""),
-    createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
-    expiresAt: r.expiresAt ? new Date(r.expiresAt).toISOString() : null,
-    appliedAt: r.appliedAt ? new Date(r.appliedAt).toISOString() : null,
-    consumedAt: r.consumedAt ? new Date(r.consumedAt).toISOString() : null,
-    consumedOrderId: r.consumedOrderId ? String(r.consumedOrderId) : null,
-    expiredAt: r.expiredAt ? new Date(r.expiredAt).toISOString() : null,
-  }));
+function buildCustomerSearchQuery(userQ: string) {
+  const q = userQ.trim();
 
-  return { balance, ledger, redemptions };
+  // If it looks like an email, use email filter (still Level 2 field).
+  if (q.includes("@")) return `email:${JSON.stringify(q)}`;
+
+  // Otherwise, treat as name-ish input. Shopify customer search syntax supports "name:".
+  // This still requires Protected Customer Data access for name fields in most public app contexts.
+  return `name:${JSON.stringify(q)}`;
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const shop = session.shop;
-
-  const settings = await getShopSettings(shop);
-  return data({ shop, settings });
+  return data({ shop: session.shop });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const settings = await getShopSettings(shop);
-
   const form = await request.formData();
   const intent = String(form.get("_intent") ?? "");
+  const q = String(form.get("q") ?? "").trim();
 
-  if (intent === "saveSettings") {
-    const earnRate = Math.max(0, Math.trunc(Number(form.get("earnRate") ?? 1) || 1));
-    const redemptionMinOrder = Math.max(0, Math.trunc(Number(form.get("redemptionMinOrder") ?? 0) || 0));
-
-    const excludedCustomerTags = parseCsvList(String(form.get("excludedCustomerTags") ?? ""));
-    const includeProductTags = parseCsvList(String(form.get("includeProductTags") ?? ""));
-    const excludeProductTags = parseCsvList(String(form.get("excludeProductTags") ?? ""));
-
-    const redemptionSteps = parseCsvList(String(form.get("redemptionSteps") ?? ""))
-      .map((x) => Number(x))
-      .filter((n) => Number.isFinite(n) && n > 0);
-
-    let redemptionValueMap: Record<string, number> = settings.redemptionValueMap;
-    const rawMap = String(form.get("redemptionValueMap") ?? "").trim();
-    if (rawMap) {
-      try {
-        redemptionValueMap = jsonMap(JSON.parse(rawMap), settings.redemptionValueMap);
-      } catch {
-        // keep prior
-      }
-    }
-
-    await db.shopSettings.upsert({
-      where: { shop },
-      create: {
-        shop,
-        earnRate,
-        redemptionMinOrder,
-        excludedCustomerTags,
-        includeProductTags,
-        excludeProductTags,
-        redemptionSteps: redemptionSteps.length ? redemptionSteps : settings.redemptionSteps,
-        redemptionValueMap,
-        updatedAt: new Date(),
-      } as any,
-      update: {
-        earnRate,
-        redemptionMinOrder,
-        excludedCustomerTags,
-        includeProductTags,
-        excludeProductTags,
-        redemptionSteps: redemptionSteps.length ? redemptionSteps : settings.redemptionSteps,
-        redemptionValueMap,
-        updatedAt: new Date(),
-      } as any,
-    });
-
-    return data<ActionData>({ ok: true, message: "Settings saved.", settings: await getShopSettings(shop) });
+  if (intent !== "search") {
+    return data<ActionData>({ ok: false, mode: "query", q, error: "Unknown intent." }, { status: 400 });
+  }
+  if (!q) {
+    return data<ActionData>({ ok: false, mode: "query", q, error: "Enter a customer ID, GID, name, or email." }, { status: 400 });
   }
 
-  if (intent === "searchCustomer") {
-    const q = String(form.get("q") ?? "").trim();
-    if (!q) return data<ActionData>({ ok: false, error: "Enter a customer ID, email, or name." }, { status: 400 });
-
-    // If numeric, treat as Shopify customer id directly (no Shopify API call)
-    if (/^\d+$/.test(q)) {
-      const selected: CustomerHit = { id: q, gid: `gid://shopify/Customer/${q}`, displayName: null, email: null };
-      const state = await loadCustomerState(shop, q);
-      return data<ActionData>({ ok: true, settings, selected, ...state });
-    }
-
-    // Use the *current embedded admin session token* (works even if offline session row is missing after DB reset)
-    const accessToken = (session as any).accessToken as string | undefined;
-    if (!accessToken) {
-      return data<ActionData>(
-        { ok: false, error: "Missing admin session access token. Re-open the app from Shopify Admin and try again." },
-        { status: 401 },
-      );
-    }
-
-    try {
-      const hits = await searchCustomers(shop, accessToken, q);
-
-      if (!hits.length) {
-        return data<ActionData>(
-          { ok: false, error: "No customers found in Shopify for that query." },
-          { status: 404 },
-        );
+  // Mode 1: ID/GID lookup (best-effort fallback)
+  const gid = toCustomerGid(q);
+  if (gid) {
+    const query = `
+      query CustomerById($id: ID!) {
+        customer(id: $id) {
+          id
+          tags
+          # These are Level 2 fields; if unapproved they may be redacted/null and/or emit errors.
+          email
+          firstName
+          lastName
+        }
       }
+    `;
 
-      if (hits.length === 1) {
-        const selected = hits[0];
-        const state = await loadCustomerState(shop, selected.id);
-        return data<ActionData>({ ok: true, settings, hits, selected, ...state });
-      }
+    const res = await shopifyGraphqlRaw(shop, query, { id: gid });
+    const errors = (res.errors ?? []).map((e: any) => String(e?.message ?? "")).filter(Boolean);
 
-      return data<ActionData>({ ok: true, settings, hits, message: "Multiple matches found — select one." });
-    } catch (err: any) {
-      console.error("[customers.search] failed", { shop, q, error: err?.message ?? String(err) });
+    if (!res.data?.customer) {
+      const formatted = formatProtectedCustomerDataError(errors);
       return data<ActionData>(
         {
           ok: false,
-          error:
-            `Customer search failed: ${err?.message ?? "Unknown error"}. ` +
-            `Most common causes: missing read_customers scope, invalid search syntax, or token/session issues.`,
+          mode: "id",
+          q,
+          error: formatted.title ?? "Customer lookup failed.",
+          help: formatted.help,
+          debug: errors.length ? JSON.stringify(errors) : undefined,
         },
         { status: 400 },
       );
     }
+
+    const c = res.data.customer;
+    const warnings: string[] = [];
+    const formatted = formatProtectedCustomerDataError(errors);
+    if (formatted.isProtectedCustomerDataIssue) warnings.push(formatted.short ?? "Some customer fields may be redacted.");
+
+    return data<ActionData>({
+      ok: true,
+      mode: "id",
+      q,
+      hits: [
+        {
+          id: String(c.id),
+          tags: Array.isArray(c.tags) ? c.tags.map((t: any) => String(t)) : [],
+          email: c.email ?? null,
+          firstName: c.firstName ?? null,
+          lastName: c.lastName ?? null,
+        },
+      ],
+      warnings: warnings.length ? warnings : undefined,
+    });
   }
 
-  if (intent === "selectCustomer") {
-    const customerId = String(form.get("customerId") ?? "").trim();
-    if (!customerId) return data<ActionData>({ ok: false, error: "Missing customerId." }, { status: 400 });
+  // Mode 2: name/email query search
+  const searchQ = buildCustomerSearchQuery(q);
+  const query = `
+    query CustomersSearch($q: String!) {
+      customers(first: 10, query: $q) {
+        nodes {
+          id
+          tags
+          # Level 2 fields (name/email). If unapproved, these can be null and may emit GraphQL errors.
+          email
+          firstName
+          lastName
+        }
+      }
+    }
+  `;
 
-    const selected: CustomerHit = { id: customerId, gid: `gid://shopify/Customer/${customerId}`, displayName: null, email: null };
-    const state = await loadCustomerState(shop, customerId);
-    return data<ActionData>({ ok: true, settings, selected, ...state });
-  }
+  const res = await shopifyGraphqlRaw(shop, query, { q: searchQ });
+  const errors = (res.errors ?? []).map((e: any) => String(e?.message ?? "")).filter(Boolean);
+  const formatted = formatProtectedCustomerDataError(errors);
 
-  if (intent === "adjustPoints") {
-    const customerId = String(form.get("customerId") ?? "").trim();
-    const delta = Math.trunc(Number(form.get("delta") ?? 0) || 0);
-    const reason = String(form.get("reason") ?? "").trim();
-
-    if (!customerId || !delta || !reason) {
-      return data<ActionData>({ ok: false, error: "CustomerId, delta, and reason are required." }, { status: 400 });
+  const nodes: any[] = res.data?.customers?.nodes ?? [];
+  if (!nodes.length) {
+    // If protected customer data is blocking, show that explicitly.
+    if (formatted.isProtectedCustomerDataIssue) {
+      return data<ActionData>(
+        {
+          ok: false,
+          mode: "query",
+          q,
+          error: formatted.title ?? "Customer search blocked by Shopify Protected Customer Data policy.",
+          help: formatted.help,
+          debug: errors.length ? JSON.stringify(errors) : undefined,
+        },
+        { status: 403 },
+      );
     }
 
-    await db.$transaction(async (tx) => {
-      await tx.pointsLedger.create({
-        data: {
-          shop,
-          customerId,
-          type: "ADJUST",
-          delta,
-          source: "ADMIN",
-          sourceId: String((session as any).id ?? "admin"),
-          description: `Admin adjust: ${reason}`,
-          createdAt: new Date(),
-        },
-      });
-
-      const bal = await tx.customerPointsBalance.upsert({
-        where: { shop_customerId: { shop, customerId } },
-        create: {
-          shop,
-          customerId,
-          balance: delta,
-          lifetimeEarned: Math.max(0, delta),
-          lifetimeRedeemed: 0,
-          lastActivityAt: new Date(),
-        },
-        update: {
-          balance: { increment: delta },
-          lastActivityAt: new Date(),
-        },
-      });
-
-      if (bal.balance < 0) {
-        await tx.customerPointsBalance.update({
-          where: { shop_customerId: { shop, customerId } },
-          data: { balance: 0 },
-        });
-      }
-    });
-
-    const selected: CustomerHit = { id: customerId, gid: `gid://shopify/Customer/${customerId}`, displayName: null, email: null };
-    const state = await loadCustomerState(shop, customerId);
-    return data<ActionData>({ ok: true, message: "Adjustment applied.", settings, selected, ...state });
+    return data<ActionData>({ ok: false, mode: "query", q, error: "No customers found (or data was redacted)." }, { status: 404 });
   }
 
-  return data<ActionData>({ ok: false, error: "Unknown action." }, { status: 400 });
+  const hits: CustomerHit[] = nodes.map((c) => ({
+    id: String(c.id),
+    tags: Array.isArray(c.tags) ? c.tags.map((t: any) => String(t)) : [],
+    email: c.email ?? null,
+    firstName: c.firstName ?? null,
+    lastName: c.lastName ?? null,
+  }));
+
+  const warnings: string[] = [];
+  if (formatted.isProtectedCustomerDataIssue) warnings.push(formatted.short ?? "Some customer fields may be redacted.");
+
+  return data<ActionData>({
+    ok: true,
+    mode: "query",
+    q,
+    hits,
+    warnings: warnings.length ? warnings : undefined,
+  });
 };
 
-export default function CustomersAdmin() {
-  const { shop, settings } = useLoaderData<typeof loader>();
+export default function CustomersRoute() {
+  const { shop } = useLoaderData<typeof loader>();
   const a = useActionData<ActionData>();
 
-  const currentSettings = a?.ok && a.settings ? a.settings : settings;
-
   return (
-    <div style={{ padding: 18, maxWidth: 980 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-        <h1 style={{ margin: 0 }}>Customer Ops</h1>
-        <Link to="/app" style={{ opacity: 0.8 }}>
-          ← Back
-        </Link>
-      </div>
-      <div style={{ opacity: 0.7, marginTop: 6, marginBottom: 14 }}>Shop: {shop}</div>
+    <div style={{ padding: 16, maxWidth: 980 }}>
+      <h1 style={{ marginBottom: 6 }}>Customer Search</h1>
+      <div style={{ opacity: 0.7, marginBottom: 18 }}>Shop: {shop}</div>
 
-      {/* Settings */}
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Program Settings</h2>
+      <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+        <h2 style={{ marginTop: 0 }}>Search</h2>
 
-        <Form method="post">
-          <input type="hidden" name="_intent" value="saveSettings" />
-
-          <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-            <label>
-              Earn rate (points per $1 eligible net)
-              <input name="earnRate" defaultValue={currentSettings.earnRate} type="number" step="1" min="0" />
-            </label>
-
-            <label>
-              Minimum order subtotal to redeem (CAD)
-              <input name="redemptionMinOrder" defaultValue={currentSettings.redemptionMinOrder} type="number" step="1" min="0" />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Excluded customer tags (CSV)
-              <input name="excludedCustomerTags" defaultValue={(currentSettings.excludedCustomerTags ?? []).join(", ")} />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Include product tags (CSV) — blank means “all eligible”
-              <input name="includeProductTags" defaultValue={(currentSettings.includeProductTags ?? []).join(", ")} />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Exclude product tags (CSV)
-              <input name="excludeProductTags" defaultValue={(currentSettings.excludeProductTags ?? []).join(", ")} />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Redemption steps (CSV) — v1 default: 500, 1000
-              <input name="redemptionSteps" defaultValue={(currentSettings.redemptionSteps ?? []).join(", ")} />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Redemption value map (JSON) — v1 default: {"{"}"500":10,"1000":20{"}"}
-              <textarea name="redemptionValueMap" defaultValue={JSON.stringify(currentSettings.redemptionValueMap ?? {}, null, 0)} rows={2} />
-            </label>
-          </div>
-
-          <button style={{ marginTop: 12 }} type="submit">
-            Save settings
-          </button>
-        </Form>
-
-        {a && "ok" in a && a.ok && a.message ? <div style={{ marginTop: 10 }}>✅ {a.message}</div> : null}
-        {a && "ok" in a && !a.ok ? <div style={{ marginTop: 10, color: "crimson" }}>⚠️ {a.error}</div> : null}
-      </section>
-
-      {/* Customer search */}
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Customer lookup</h2>
-
-        <Form method="post" style={{ display: "flex", gap: 10, alignItems: "end" }}>
-          <input type="hidden" name="_intent" value="searchCustomer" />
+        <Form method="post" style={{ display: "flex", gap: 8, alignItems: "end" }}>
+          <input type="hidden" name="_intent" value="search" />
           <label style={{ flex: 1 }}>
-            Search by customer ID, email, or name
-            <input name="q" placeholder="e.g. 1234567890 or jane@email.com or Jane Smith" />
+            Customer ID / GID / Name / Email
+            <input name="q" placeholder="1234567890 • gid://shopify/Customer/... • Jane Doe • jane@domain.com" />
           </label>
           <button type="submit">Search</button>
         </Form>
 
-        {a && a.ok && a.hits && a.hits.length > 1 && !a.selected ? (
-          <div style={{ marginTop: 12 }}>
-            <div style={{ marginBottom: 8, opacity: 0.8 }}>Multiple Shopify matches:</div>
-            <ul style={{ margin: 0, paddingLeft: 18 }}>
-              {a.hits.map((h) => (
-                <li key={h.gid} style={{ marginBottom: 6 }}>
-                  <Form method="post" style={{ display: "inline" }}>
-                    <input type="hidden" name="_intent" value="selectCustomer" />
-                    <input type="hidden" name="customerId" value={h.id} />
-                    <button type="submit">Select</button>
-                  </Form>{" "}
-                  <span style={{ marginLeft: 8 }}>
-                    <strong>{h.displayName ?? "(no name)"}</strong> — {h.email ?? "(no email)"} — ID {h.id}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
-        {a && a.ok && a.selected && a.balance ? (
-          <div style={{ marginTop: 14 }}>
-            <h3 style={{ margin: "10px 0" }}>Customer {a.selected.id}</h3>
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
-                <div style={{ fontSize: 12, opacity: 0.7 }}>Balance</div>
-                <div style={{ fontSize: 24, fontWeight: 700 }}>{a.balance.balance}</div>
-                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                  Lifetime earned: {a.balance.lifetimeEarned} • Lifetime redeemed: {a.balance.lifetimeRedeemed}
-                </div>
-                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-                  Last activity: {a.balance.lastActivityAt ? new Date(a.balance.lastActivityAt).toLocaleString() : "(none)"}
-                </div>
-              </div>
-
-              <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
-                <div style={{ fontSize: 12, opacity: 0.7 }}>Manual adjustment</div>
-                <Form method="post" style={{ display: "grid", gap: 8, marginTop: 6 }}>
-                  <input type="hidden" name="_intent" value="adjustPoints" />
-                  <input type="hidden" name="customerId" value={a.selected.id} />
-                  <label>
-                    Delta (positive or negative)
-                    <input name="delta" type="number" step="1" />
-                  </label>
-                  <label>
-                    Reason
-                    <input name="reason" placeholder="e.g. Customer service goodwill" />
-                  </label>
-                  <button type="submit">Apply adjustment</button>
-                </Form>
-              </div>
-            </div>
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
-              <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>Recent ledger (latest 100)</div>
-                <div style={{ maxHeight: 320, overflow: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr>
-                        <th style={{ textAlign: "left", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>When</th>
-                        <th style={{ textAlign: "left", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>Type</th>
-                        <th style={{ textAlign: "right", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>Δ</th>
-                        <th style={{ textAlign: "right", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>Running</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(a.ledger ?? []).map((r) => (
-                        <tr key={r.id} style={{ borderTop: "1px solid #f2f2f2" }}>
-                          <td style={{ padding: "6px 0", fontSize: 12 }}>{new Date(r.createdAt).toLocaleString()}</td>
-                          <td style={{ padding: "6px 0", fontSize: 12 }}>{r.type}</td>
-                          <td style={{ padding: "6px 0", fontSize: 12, textAlign: "right" }}>{r.delta}</td>
-                          <td style={{ padding: "6px 0", fontSize: 12, textAlign: "right" }}>{r.runningBalance}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>Redemptions (latest 20)</div>
-                <div style={{ maxHeight: 320, overflow: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                    <thead>
-                      <tr>
-                        <th style={{ textAlign: "left", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>When</th>
-                        <th style={{ textAlign: "left", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>Code</th>
-                        <th style={{ textAlign: "right", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>Pts</th>
-                        <th style={{ textAlign: "right", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>$</th>
-                        <th style={{ textAlign: "left", fontSize: 12, opacity: 0.7, paddingBottom: 6 }}>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(a.redemptions ?? []).map((r) => (
-                        <tr key={r.id} style={{ borderTop: "1px solid #f2f2f2" }}>
-                          <td style={{ padding: "6px 0", fontSize: 12 }}>{new Date(r.createdAt).toLocaleString()}</td>
-                          <td style={{ padding: "6px 0", fontSize: 12 }}>
-                            <code>{r.code}</code>
-                          </td>
-                          <td style={{ padding: "6px 0", fontSize: 12, textAlign: "right" }}>{r.points}</td>
-                          <td style={{ padding: "6px 0", fontSize: 12, textAlign: "right" }}>{r.value}</td>
-                          <td style={{ padding: "6px 0", fontSize: 12 }}>{r.status}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : null}
-
-        {a && "ok" in a && !a.ok ? <div style={{ marginTop: 10, color: "crimson" }}>⚠️ {a.error}</div> : null}
+        <div style={{ marginTop: 10, opacity: 0.75 }}>
+          <strong>Important:</strong> Name/email search can be blocked unless your public app is approved for Protected Customer Data.
+          If blocked, use numeric Customer ID (from Shopify Admin URL) as a workaround.
+        </div>
       </section>
+
+      {a && !a.ok && (
+        <section style={{ border: "1px solid #f2caca", background: "#fff5f5", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+          <div style={{ fontWeight: 700 }}>⚠️ {a.error}</div>
+          {a.help && <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{a.help}</div>}
+          {a.debug && (
+            <details style={{ marginTop: 10 }}>
+              <summary>Debug</summary>
+              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{a.debug}</pre>
+            </details>
+          )}
+        </section>
+      )}
+
+      {a && a.ok && (
+        <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14 }}>
+          <h2 style={{ marginTop: 0 }}>Results</h2>
+          {a.warnings?.length ? (
+            <div style={{ marginBottom: 10, opacity: 0.8 }}>
+              {a.warnings.map((w, i) => (
+                <div key={i}>⚠️ {w}</div>
+              ))}
+            </div>
+          ) : null}
+
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "8px 6px" }}>Customer</th>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "8px 6px" }}>Email</th>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "8px 6px" }}>Tags</th>
+              </tr>
+            </thead>
+            <tbody>
+              {a.hits.map((h) => (
+                <tr key={h.id}>
+                  <td style={{ borderBottom: "1px solid #f4f4f4", padding: "8px 6px" }}>
+                    <div style={{ fontFamily: "monospace", fontSize: 12 }}>{h.id}</div>
+                    <div style={{ opacity: 0.8 }}>
+                      {(h.firstName || h.lastName) ? `${h.firstName ?? ""} ${h.lastName ?? ""}`.trim() : <em>name redacted / unavailable</em>}
+                    </div>
+                  </td>
+                  <td style={{ borderBottom: "1px solid #f4f4f4", padding: "8px 6px" }}>
+                    {h.email ? h.email : <em>redacted / unavailable</em>}
+                  </td>
+                  <td style={{ borderBottom: "1px solid #f4f4f4", padding: "8px 6px" }}>
+                    {h.tags?.length ? h.tags.join(", ") : <em>—</em>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
     </div>
   );
 }
