@@ -1,47 +1,95 @@
-// app/lib/protectedCustomerData.ts
-type ProtectedCustomerDataFormat = {
-  isProtectedCustomerDataIssue: boolean;
-  title?: string;
-  short?: string;
-  help?: string;
+/**
+ * Shopify Protected Customer Data helper
+ *
+ * Purpose:
+ * - Detect the “not approved to access Customer object/fields” GraphQL errors
+ * - Return a consistent, merchant-friendly error payload that UI/routes can show
+ *
+ * NOTE:
+ * This is NOT fixable in code alone. The app must be granted Protected Customer Data access
+ * in Partner/Dev Dashboard for the relevant resources/fields.
+ */
+export const PROTECTED_CUSTOMER_DATA_DOC_URL =
+  "https://shopify.dev/docs/apps/launch/protected-customer-data";
+
+export type ProtectedCustomerDataFailure = {
+  ok: false;
+  code: "PROTECTED_CUSTOMER_DATA";
+  error: string;
+  docsUrl: string;
 };
 
-export function formatProtectedCustomerDataError(messages: string[]): ProtectedCustomerDataFormat {
-  const m = (messages || []).join("\n");
+function stringify(x: unknown): string {
+  try {
+    return typeof x === "string" ? x : JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
+}
 
-  const isCustomerObjectBlocked =
-    /not approved to access the Customer object/i.test(m) ||
-    /protected customer data/i.test(m);
+function collectMessages(err: any): string[] {
+  const msgs: string[] = [];
 
-  const isFieldBlocked =
-    /not approved to use the .* field/i.test(m) ||
-    /not approved to use the .* field/i.test(m);
+  if (!err) return msgs;
 
-  const isProtected = isCustomerObjectBlocked || isFieldBlocked;
+  if (typeof err.message === "string") msgs.push(err.message);
 
-  if (!isProtected) return { isProtectedCustomerDataIssue: false };
+  // Common Shopify GraphQL error shapes:
+  // - err.response?.errors
+  // - err.response?.body?.errors
+  // - err.body?.errors
+  const candidates = [
+    err?.response?.errors,
+    err?.response?.body?.errors,
+    err?.body?.errors,
+    err?.errors,
+  ];
 
-  // Make the guidance explicit and actionable.
-  const help =
-    [
-      "Shopify is blocking Customer data for this app (Protected Customer Data policy).",
-      "",
-      "To enable customer search by name/email for a PUBLIC (App Store) app:",
-      "1) Partner Dashboard → Apps → (this app) → API access requests",
-      "2) Request access under “Protected customer data access”",
-      "   - Select Protected customer data (Level 1)",
-      "   - For name/email search, also request Name and Email fields (Level 2)",
-      "3) Complete data protection details and (for live stores) submit for review",
-      "4) Reinstall / re-auth the app so the token reflects the approval",
-      "",
-      "Workaround while blocked:",
-      "- Use numeric Customer ID (or Customer GID) from Shopify Admin URL to look up balances/ledger.",
-    ].join("\n");
+  for (const c of candidates) {
+    if (Array.isArray(c)) {
+      for (const e of c) {
+        const m = (e && (e.message || e?.extensions?.message)) ?? null;
+        if (typeof m === "string") msgs.push(m);
+        else if (m) msgs.push(stringify(m));
+      }
+    }
+  }
+
+  return msgs.filter(Boolean);
+}
+
+export function isProtectedCustomerDataError(err: unknown): boolean {
+  const messages = collectMessages(err as any);
+  const haystack = messages.join(" | ").toLowerCase();
+
+  // Shopify’s canonical phrasing for this family of failures:
+  // “This app is not approved to access the Customer object…”
+  // “This app is not approved to use the <field> field…”
+  // Sometimes also mentions “protected customer data”.
+  return (
+    haystack.includes("not approved to access the customer object") ||
+    haystack.includes("not approved to use") ||
+    haystack.includes("protected customer data") ||
+    haystack.includes("/customer_data")
+  );
+}
+
+export function toProtectedCustomerDataFailure(
+  err: unknown,
+  context?: { operation?: string }
+): ProtectedCustomerDataFailure | null {
+  if (!isProtectedCustomerDataError(err)) return null;
+
+  const operation = context?.operation ? `${context.operation}: ` : "";
+  const raw = collectMessages(err as any)[0] ?? "Protected customer data access denied.";
 
   return {
-    isProtectedCustomerDataIssue: true,
-    title: "Customer search blocked: app not approved for Protected Customer Data",
-    short: "Customer name/email fields may be redacted until Protected Customer Data access is approved.",
-    help,
+    ok: false,
+    code: "PROTECTED_CUSTOMER_DATA",
+    error:
+      `⚠️ ${operation}Customer search failed: ${raw}\n\n` +
+      `This usually means the app is missing Protected Customer Data access approval (even if scopes like read_customers are present).\n` +
+      `See: ${PROTECTED_CUSTOMER_DATA_DOC_URL}`,
+    docsUrl: PROTECTED_CUSTOMER_DATA_DOC_URL,
   };
 }
