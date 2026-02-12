@@ -37,11 +37,9 @@ type ActionData =
       message?: string;
       settings?: SettingsShape;
 
-      // customer search
       hits?: CustomerHit[];
       selected?: CustomerHit;
 
-      // customer state
       balance?: {
         balance: number;
         lifetimeEarned: number;
@@ -149,10 +147,29 @@ async function getShopSettings(shop: string): Promise<SettingsShape> {
   };
 }
 
-async function getOfflineAccessToken(shop: string): Promise<string | null> {
-  const offlineId = `offline_${shop}`;
-  const session = await db.session.findUnique({ where: { id: offlineId } }).catch(() => null);
-  return session?.accessToken ?? null;
+/**
+ * Shopify search syntax rules:
+ * - default query can be plain terms (e.g. "Bob Norman")
+ * - special chars : \( ) should be escaped unless user is intentionally using advanced syntax
+ */
+function buildCustomerQuery(raw: string): string {
+  const q = raw.trim();
+
+  // Power-user mode: if they typed a field query, don't mangle it.
+  if (q.includes(":")) return q;
+
+  // Email: exact phrase query (best practice)
+  if (q.includes("@")) return `email:"${q.replaceAll(`"`, "")}"`;
+
+  // Multi-word: keep as plain terms (Shopify default multi-field search)
+  // BUT escape special chars that break the grammar.
+  const escape = (s: string) =>
+    s.replaceAll("\\", "\\\\").replaceAll(":", "\\:").replaceAll("(", "\\(").replaceAll(")", "\\)");
+
+  // Also normalize commas to spaces; users sometimes type "Last, First"
+  const normalized = q.replaceAll(",", " ").replace(/\s+/g, " ").trim();
+
+  return escape(normalized);
 }
 
 async function shopifyGraphql<T>(shop: string, accessToken: string, query: string, variables: any): Promise<T> {
@@ -165,18 +182,26 @@ async function shopifyGraphql<T>(shop: string, accessToken: string, query: strin
     body: JSON.stringify({ query, variables }),
   });
 
-  const json = await res.json();
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // Non-JSON typically means auth/proxy/network
+    throw new Error(`Shopify returned non-JSON (${res.status}).`);
+  }
+
   if (!res.ok || json.errors) {
-    const msg = json?.errors?.[0]?.message ?? `Shopify GraphQL failed (${res.status})`;
+    const msg =
+      json?.errors?.[0]?.message ??
+      json?.error ??
+      `Shopify GraphQL failed (${res.status})`;
     throw new Error(msg);
   }
   return json.data as T;
 }
 
-async function searchCustomers(shop: string, q: string): Promise<CustomerHit[]> {
-  const token = await getOfflineAccessToken(shop);
-  if (!token) throw new Error("Missing offline token for this shop.");
-
+async function searchCustomers(shop: string, accessToken: string, q: string): Promise<CustomerHit[]> {
   const query = `
     query Customers($first: Int!, $query: String!) {
       customers(first: $first, query: $query) {
@@ -191,18 +216,17 @@ async function searchCustomers(shop: string, q: string): Promise<CustomerHit[]> 
     }
   `;
 
-  // Shopify customer search syntax: email:<email> is best for email.
-  const shopifyQuery = q.includes("@") ? `email:${q}` : q;
+  const shopifyQuery = buildCustomerQuery(q);
 
   const data = await shopifyGraphql<{
     customers: { edges: Array<{ node: { id: string; displayName: string | null; email: string | null } }> };
-  }>(shop, token, query, { first: 10, query: shopifyQuery });
+  }>(shop, accessToken, query, { first: 10, query: shopifyQuery });
 
   return (data.customers.edges ?? []).map((e) => {
     const gid = e.node.id;
     const id = String(gid.split("/").pop() ?? "").trim();
     return { id, gid, displayName: e.node.displayName ?? null, email: e.node.email ?? null };
-  });
+  }).filter(h => h.id);
 }
 
 async function loadCustomerState(shop: string, customerId: string) {
@@ -266,7 +290,6 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shop = session.shop;
 
   const settings = await getShopSettings(shop);
-
   return data({ shop, settings });
 };
 
@@ -291,7 +314,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       .map((x) => Number(x))
       .filter((n) => Number.isFinite(n) && n > 0);
 
-    // redemptionValueMap as JSON (recommended)
     let redemptionValueMap: Record<string, number> = settings.redemptionValueMap;
     const rawMap = String(form.get("redemptionValueMap") ?? "").trim();
     if (rawMap) {
@@ -334,23 +356,51 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const q = String(form.get("q") ?? "").trim();
     if (!q) return data<ActionData>({ ok: false, error: "Enter a customer ID, email, or name." }, { status: 400 });
 
-    // If numeric, treat as Shopify customer id directly.
+    // If numeric, treat as Shopify customer id directly (no Shopify API call)
     if (/^\d+$/.test(q)) {
       const selected: CustomerHit = { id: q, gid: `gid://shopify/Customer/${q}`, displayName: null, email: null };
       const state = await loadCustomerState(shop, q);
       return data<ActionData>({ ok: true, settings, selected, ...state });
     }
 
-    const hits = await searchCustomers(shop, q);
-    if (!hits.length) return data<ActionData>({ ok: false, error: "No customers found in Shopify for that query." }, { status: 404 });
-
-    if (hits.length === 1) {
-      const selected = hits[0];
-      const state = await loadCustomerState(shop, selected.id);
-      return data<ActionData>({ ok: true, settings, hits, selected, ...state });
+    // Use the *current embedded admin session token* (works even if offline session row is missing after DB reset)
+    const accessToken = (session as any).accessToken as string | undefined;
+    if (!accessToken) {
+      return data<ActionData>(
+        { ok: false, error: "Missing admin session access token. Re-open the app from Shopify Admin and try again." },
+        { status: 401 },
+      );
     }
 
-    return data<ActionData>({ ok: true, settings, hits, message: "Multiple matches found — select one." });
+    try {
+      const hits = await searchCustomers(shop, accessToken, q);
+
+      if (!hits.length) {
+        return data<ActionData>(
+          { ok: false, error: "No customers found in Shopify for that query." },
+          { status: 404 },
+        );
+      }
+
+      if (hits.length === 1) {
+        const selected = hits[0];
+        const state = await loadCustomerState(shop, selected.id);
+        return data<ActionData>({ ok: true, settings, hits, selected, ...state });
+      }
+
+      return data<ActionData>({ ok: true, settings, hits, message: "Multiple matches found — select one." });
+    } catch (err: any) {
+      console.error("[customers.search] failed", { shop, q, error: err?.message ?? String(err) });
+      return data<ActionData>(
+        {
+          ok: false,
+          error:
+            `Customer search failed: ${err?.message ?? "Unknown error"}. ` +
+            `Most common causes: missing read_customers scope, invalid search syntax, or token/session issues.`,
+        },
+        { status: 400 },
+      );
+    }
   }
 
   if (intent === "selectCustomer") {
@@ -379,7 +429,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           type: "ADJUST",
           delta,
           source: "ADMIN",
-          sourceId: String(session.id),
+          sourceId: String((session as any).id ?? "admin"),
           description: `Admin adjust: ${reason}`,
           createdAt: new Date(),
         },
@@ -482,10 +532,6 @@ export default function CustomersAdmin() {
           </button>
         </Form>
 
-        <div style={{ marginTop: 10, opacity: 0.8 }}>
-          Redemptions remain single-active per customer by default; expiry job will expire unused codes.
-        </div>
-
         {a && "ok" in a && a.ok && a.message ? <div style={{ marginTop: 10 }}>✅ {a.message}</div> : null}
         {a && "ok" in a && !a.ok ? <div style={{ marginTop: 10, color: "crimson" }}>⚠️ {a.error}</div> : null}
       </section>
@@ -498,7 +544,7 @@ export default function CustomersAdmin() {
           <input type="hidden" name="_intent" value="searchCustomer" />
           <label style={{ flex: 1 }}>
             Search by customer ID, email, or name
-            <input name="q" placeholder="e.g. 1234567890 or jane@email.com" />
+            <input name="q" placeholder="e.g. 1234567890 or jane@email.com or Jane Smith" />
           </label>
           <button type="submit">Search</button>
         </Form>
@@ -612,13 +658,12 @@ export default function CustomersAdmin() {
                     </tbody>
                   </table>
                 </div>
-                <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-                  Tip: If a customer claims a code “doesn’t work”, check it’s not EXPIRED/VOID and confirm min order subtotal + eligible products rules.
-                </div>
               </div>
             </div>
           </div>
         ) : null}
+
+        {a && "ok" in a && !a.ok ? <div style={{ marginTop: 10, color: "crimson" }}>⚠️ {a.error}</div> : null}
       </section>
     </div>
   );
