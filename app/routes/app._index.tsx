@@ -61,6 +61,9 @@ export default function AdminIndex() {
         <h2 style={{ marginTop: 0 }}>Admin tools</h2>
         <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
           <li>
+            <Link to="/app/settings">Program settings</Link>
+          </li>
+          <li>
             <Link to="/app/customers">Customer lookup + manual adjustments</Link>
           </li>
           <li>
@@ -71,8 +74,8 @@ export default function AdminIndex() {
           </li>
         </ul>
         <div style={{ marginTop: 10, opacity: 0.75 }}>
-          Note: Program Settings remain on the Customers page (same fields you already had), but now the required “Ops” surfaces
-          (lookup/adjust/report/logs) are fully usable.
+          Start with <Link to="/app/settings">Program settings</Link> to configure eligibility tags and the minimum order
+          subtotal for redemption.
         </div>
       </section>
     </div>

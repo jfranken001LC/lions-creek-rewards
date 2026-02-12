@@ -1,53 +1,37 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import db from "../db.server";
+import { getShopSettings } from "../lib/shopSettings.server";
 
 /**
  * POST /webhooks
- * Shopify webhooks endpoint.
+ * Shopify webhooks receiver endpoint.
  *
- * Handles:
- * - orders/paid
- * - refunds/create
- * - orders/cancelled
- * - app/uninstalled
- * - app/scopes_update
- * - customers/data_request
- * - customers/redact
- * - shop/redact
+ * Webhooks are HMAC-verified using SHOPIFY_API_SECRET.
+ * We log webhook processing outcome to WebhookEvent for debug/auditing.
  *
- * Notes:
- * - Uses Shopify HMAC verification (X-Shopify-Hmac-Sha256).
- * - Dedupes by (shop, webhookId) in WebhookEvent.
- * - Refund reversals dedupe by refund id (sourceId = refundId).
- * - Refund/cancel reversals do NOT update lastActivityAt (expiry timer safety).
+ * Points ledger model:
+ * - On PAID orders: compute eligible net merchandise, multiply by earnRate, add EARN ledger, update balance.
+ * - On REFUNDS/CANCELLED: compute reversal points (tag-accurate), write REVERSAL ledger, update balance.
+ *
+ * NOTE:
+ * - Product eligibility is based on include/exclude product tags from ShopSettings.
+ * - Customer exclusion is based on excludedCustomerTags from ShopSettings and customer tags from webhook payload.
  */
 
-type Outcome = "RECEIVED" | "PROCESSED" | "SKIPPED" | "FAILED";
+const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024; // 1MB safety
+const MAX_LOG_JSON_CHARS = 10_000;
 
-function safeJsonStringify(obj: any, maxLen = 3500): string {
+type Outcome = "SUCCESS" | "IGNORED" | "FAILED";
+
+function safeJsonStringify(obj: any, maxLen = MAX_LOG_JSON_CHARS) {
   let s = "";
   try {
     s = JSON.stringify(obj);
   } catch {
-    s = JSON.stringify({ error: "Could not stringify." });
+    s = JSON.stringify({ stringifyError: "Could not stringify." });
   }
   if (s.length > maxLen) s = s.slice(0, maxLen) + "…";
   return s;
-}
-
-function toStringListJson(value: any): string[] {
-  if (!value) return [];
-  if (Array.isArray(value)) return value.map((v) => String(v)).map((s) => s.trim()).filter(Boolean);
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed.map((v) => String(v)).map((s) => s.trim()).filter(Boolean);
-    } catch {
-      // ignore
-    }
-    return value.split(",").map((t) => t.trim()).filter(Boolean);
-  }
-  return [];
 }
 
 function moneyToNumber(v: any): number {
@@ -62,48 +46,18 @@ function moneyToNumber(v: any): number {
   return 0;
 }
 
-async function getShopSettings(shop: string) {
-  const defaults = {
-    earnRate: 1,
-    redemptionMinOrder: 0,
-    excludedCustomerTags: ["Wholesale"],
-    includeProductTags: [] as string[],
-    excludeProductTags: [] as string[],
-    redemptionSteps: [500, 1000],
-    redemptionValueMap: { "500": 10, "1000": 20 } as Record<string, number>,
-  };
-
-  const existing = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
-  if (!existing) return defaults;
-
-  const stepsRaw = (existing as any).redemptionSteps ?? defaults.redemptionSteps;
-  const steps =
-    Array.isArray(stepsRaw) && stepsRaw.length
-      ? stepsRaw.map((x: any) => Number(x)).filter((n: any) => Number.isFinite(n))
-      : defaults.redemptionSteps;
-
-  return {
-    ...defaults,
-    ...existing,
-    excludedCustomerTags: toStringListJson((existing as any).excludedCustomerTags) || defaults.excludedCustomerTags,
-    includeProductTags: toStringListJson((existing as any).includeProductTags) || defaults.includeProductTags,
-    excludeProductTags: toStringListJson((existing as any).excludeProductTags) || defaults.excludeProductTags,
-    redemptionSteps: steps.length ? steps : defaults.redemptionSteps,
-    redemptionValueMap: (existing as any).redemptionValueMap ?? defaults.redemptionValueMap,
-  };
-}
-
 async function getOfflineAccessToken(shop: string): Promise<string | null> {
   const id = `offline_${shop}`;
-  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
-  return s?.accessToken ?? null;
+  const session = await db.session.findUnique({ where: { id } }).catch(() => null);
+  return session?.accessToken ?? null;
 }
 
 async function shopifyGraphql(shop: string, query: string, variables: any) {
   const token = await getOfflineAccessToken(shop);
-  if (!token) throw new Error(`Missing offline access token for shop ${shop}. Reinstall/re-auth the app.`);
+  if (!token) throw new Error("Missing offline access token. Reinstall/re-auth the app.");
 
-  const endpoint = `https://${shop}/admin/api/2026-01/graphql.json`;
+  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
+  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
 
   const resp = await fetch(endpoint, {
     method: "POST",
@@ -114,711 +68,488 @@ async function shopifyGraphql(shop: string, query: string, variables: any) {
     body: JSON.stringify({ query, variables }),
   });
 
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    throw new Error(`Shopify GraphQL failed (${resp.status}): ${t}`);
-  }
+  const json = await resp.json().catch(() => ({} as any));
 
-  const json = await resp.json().catch(() => null);
-  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  return json?.data;
+  if (!resp.ok) {
+    throw new Error(`Shopify GraphQL HTTP ${resp.status}: ${safeJsonStringify(json)}`);
+  }
+  if (json.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${safeJsonStringify(json.errors)}`);
+  }
+  return json.data;
 }
 
-async function getProductTags(shop: string, productIdNumeric: any): Promise<string[]> {
-  const pid = String(productIdNumeric ?? "").trim();
-  if (!pid) return [];
-  const gid = `gid://shopify/Product/${pid}`;
+function verifyShopifyWebhookHmac(rawBody: string, hmacHeader: string | null, apiSecret: string): boolean {
+  if (!hmacHeader) return false;
+  const digest = require("node:crypto").createHmac("sha256", apiSecret).update(rawBody, "utf8").digest("base64");
+  // timing safe compare
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(hmacHeader, "utf8");
+  if (a.length !== b.length) return false;
+  return require("node:crypto").timingSafeEqual(a, b);
+}
 
+async function logWebhookEvent({
+  shop,
+  topic,
+  webhookId,
+  outcome,
+  message,
+  payloadJson,
+}: {
+  shop: string;
+  topic: string;
+  webhookId: string | null;
+  outcome: Outcome;
+  message: string | null;
+  payloadJson: string | null;
+}) {
+  await db.webhookEvent
+    .create({
+      data: {
+        shop,
+        topic,
+        webhookId,
+        outcome,
+        message,
+        payloadJson,
+      },
+    })
+    .catch(() => null);
+}
+
+type OrderPayload = {
+  id: number;
+  name: string;
+  financial_status?: string;
+  cancelled_at?: string | null;
+
+  customer?: {
+    id: number;
+    email?: string | null;
+    tags?: string | null; // comma-separated string in REST payload
+  } | null;
+
+  line_items?: Array<{
+    id: number;
+    product_id?: number | null;
+    variant_id?: number | null;
+    title?: string;
+    quantity: number;
+    price?: string; // string
+    total_discount?: string; // string
+    // (rest has more)
+  }>;
+
+  subtotal_price?: string;
+  total_discounts?: string;
+  total_price?: string;
+  total_tax?: string;
+
+  currency?: string;
+
+  refunds?: Array<{
+    id: number;
+    created_at?: string;
+    refund_line_items?: Array<{
+      line_item_id: number;
+      quantity: number;
+      subtotal?: number | string | { amount: string };
+      total_tax?: number | string | { amount: string };
+    }>;
+    // transactions etc omitted
+  }>;
+};
+
+function parseCustomerTagsString(tags: string | null | undefined): string[] {
+  if (!tags) return [];
+  return tags
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+async function getProductTagsById(shop: string, productGid: string): Promise<string[]> {
   const query = `
     query ProductTags($id: ID!) {
       product(id: $id) { tags }
     }
   `;
-
-  const data = await shopifyGraphql(shop, query, { id: gid });
+  const data = await shopifyGraphql(shop, query, { id: productGid });
   const tags: any[] = data?.product?.tags ?? [];
   return Array.isArray(tags) ? tags.map((t) => String(t)) : [];
 }
 
-function isEligibleByTags(productTags: string[], includeTags: string[], excludeTags: string[]) {
-  const tags = new Set(productTags.map((t) => t.trim()).filter(Boolean));
+function isEligibleByTags(productTags: string[], includeTags: string[], excludeTags: string[]): boolean {
+  // Exclude always wins
+  if (excludeTags.length && productTags.some((t) => excludeTags.includes(t))) return false;
 
-  const includes = includeTags.map((t) => t.trim()).filter(Boolean);
-  const excludes = excludeTags.map((t) => t.trim()).filter(Boolean);
+  // If includes is empty -> everything eligible (unless excluded)
+  if (!includeTags.length) return true;
 
-  if (excludes.some((t) => tags.has(t))) return false;
-
-  if (includes.length === 0) return true;
-  return includes.some((t) => tags.has(t));
+  return productTags.some((t) => includeTags.includes(t));
 }
 
-async function verifyShopifyWebhookHmac(bodyText: string, hmacHeader: string): Promise<boolean> {
-  const secret = process.env.SHOPIFY_API_SECRET ?? "";
-  if (!secret || !hmacHeader) return false;
-
-  const crypto = await import("node:crypto");
-  const computed = crypto.createHmac("sha256", secret).update(bodyText, "utf8").digest("base64");
-
-  const a = Buffer.from(computed, "utf8");
-  const b = Buffer.from(hmacHeader, "utf8");
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+function clampInt(n: any, min: number, max: number): number {
+  const x = Math.floor(Number(n));
+  if (!Number.isFinite(x)) return min;
+  return Math.max(min, Math.min(max, x));
 }
 
-export const loader = async (_args: LoaderFunctionArgs) => {
-  return new Response("Method Not Allowed", { status: 405 });
-};
+async function ensureCustomerBalanceRow(shop: string, customerId: string) {
+  const existing = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop, customerId } },
+  });
+  if (existing) return existing;
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  return db.customerPointsBalance.create({
+    data: {
+      shop,
+      customerId,
+      balance: 0,
+      lifetimeEarned: 0,
+      lifetimeRedeemed: 0,
+      lastActivityAt: new Date(),
+    },
+  });
+}
 
-  // Headers
-  const topic = (request.headers.get("X-Shopify-Topic") ?? "unknown").toLowerCase();
-  const shop = (request.headers.get("X-Shopify-Shop-Domain") ?? "").toLowerCase();
-  const webhookId = request.headers.get("X-Shopify-Webhook-Id") ?? "";
-  const hmacHeader = request.headers.get("X-Shopify-Hmac-Sha256") ?? "";
-
-  const bodyText = await request.text();
-
-  // Basic validation
-  if (!shop || !webhookId) return new Response("Bad Request", { status: 400 });
-
-  // HMAC verify
-  const ok = await verifyShopifyWebhookHmac(bodyText, hmacHeader);
-  if (!ok) return new Response("Unauthorized", { status: 401 });
-
-  // Parse payload
-  let payload: any = {};
-  try {
-    payload = bodyText ? JSON.parse(bodyText) : {};
-  } catch {
-    payload = {};
-  }
-
-  // Dedupe by webhookId
-  const resourceId = String(payload?.id ?? payload?.order_id ?? payload?.customer?.id ?? "");
-  try {
-    await db.webhookEvent.create({
-      data: {
-        shop,
-        webhookId,
-        topic,
-        resourceId,
-        receivedAt: new Date(),
-        outcome: "RECEIVED" as any,
-      } as any,
-    });
-  } catch {
-    // Already processed
-    return new Response(JSON.stringify({ ok: true, deduped: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  let outcome: Outcome = "PROCESSED";
-  let outcomeCode: string | null = null;
-  let outcomeMessage: string | null = null;
-
-  try {
-    // Privacy topics
-    if (
-      topic === "customers/data_request" ||
-      topic === "customers/redact" ||
-      topic === "shop/redact"
-    ) {
-      const counts = await handlePrivacy(topic, shop, payload);
-      outcome = "PROCESSED";
-      outcomeCode = "privacy";
-      outcomeMessage = safeJsonStringify({ counts });
-    }
-    // App lifecycle
-    else if (topic === "app/uninstalled") {
-      const counts = await handleUninstalled(shop);
-      outcome = "PROCESSED";
-      outcomeCode = "uninstalled";
-      outcomeMessage = safeJsonStringify({ counts });
-    } else if (topic === "app/scopes_update") {
-      outcome = "PROCESSED";
-      outcomeCode = "scopes_update";
-      outcomeMessage = "ack";
-    }
-    // Loyalty topics
-    else if (topic === "orders/paid") {
-      const res = await handleOrdersPaid(shop, payload);
-      outcome = res.outcome;
-      outcomeCode = res.code;
-      outcomeMessage = res.message;
-    } else if (topic === "refunds/create") {
-      const res = await handleRefundCreate(shop, payload);
-      outcome = res.outcome;
-      outcomeCode = res.code;
-      outcomeMessage = res.message;
-    } else if (topic === "orders/cancelled") {
-      const res = await handleOrderCancelled(shop, payload);
-      outcome = res.outcome;
-      outcomeCode = res.code;
-      outcomeMessage = res.message;
-    } else {
-      outcome = "SKIPPED";
-      outcomeCode = "unhandled_topic";
-      outcomeMessage = topic;
-    }
-
-    await db.webhookEvent.update({
-      where: { shop_webhookId: { shop, webhookId } as any },
-      data: {
-        outcome: outcome as any,
-        outcomeCode,
-        outcomeMessage,
-        processedAt: new Date(),
-      } as any,
-    });
-
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  } catch (e: any) {
-    const errText = String(e?.message ?? e ?? "Unknown error");
-
-    await db.webhookError
-      .create({
-        data: {
-          shop,
-          topic,
-          webhookId,
-          error: errText,
-          createdAt: new Date(),
-        },
-      })
-      .catch(() => null);
-
-    await db.webhookEvent
-      .update({
-        where: { shop_webhookId: { shop, webhookId } as any },
-        data: {
-          outcome: "FAILED" as any,
-          outcomeCode: "exception",
-          outcomeMessage: errText,
-          processedAt: new Date(),
-        } as any,
-      })
-      .catch(() => null);
-
-    // Shopify expects 200 to stop retry storms if you’ve persisted the error.
-    return new Response(JSON.stringify({ ok: false, error: errText }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-};
-
-async function handleOrdersPaid(shop: string, order: any): Promise<{ outcome: Outcome; code: string; message: string }> {
-  const settings = await getShopSettings(shop);
-
-  const customerId = String(order?.customer?.id ?? "").trim();
-  if (!customerId) {
-    return { outcome: "SKIPPED", code: "no_customer", message: "Order has no customer." };
-  }
-
-  // Excluded customer tags
-  const excludedCustomerTags = settings.excludedCustomerTags ?? [];
-  const customerTagsRaw = order?.customer?.tags ?? "";
-  const customerTags = String(customerTagsRaw)
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-
-  if (excludedCustomerTags.some((t: string) => customerTags.includes(t))) {
-    return { outcome: "SKIPPED", code: "excluded_customer_tag", message: safeJsonStringify({ customerTags }) };
-  }
-
-  const orderId = String(order?.id ?? "").trim();
-  if (!orderId) return { outcome: "SKIPPED", code: "no_order_id", message: "Missing order.id" };
-
-  // Idempotency: if snapshot already exists, treat as processed
-  const existing = await db.orderPointsSnapshot.findUnique({ where: { shop_orderId: { shop, orderId } as any } });
-  if (existing) {
-    // Still update redemption status (in case snapshot existed but consumption hadn’t been marked)
-    await markConsumedRedemptionsFromOrder(shop, customerId, order).catch(() => null);
-    return { outcome: "SKIPPED", code: "already_snapshot", message: "Snapshot exists." };
-  }
-
-  const includeTags = settings.includeProductTags ?? [];
-  const excludeTags = settings.excludeProductTags ?? [];
-  const earnRate = Number(settings.earnRate ?? 1) || 1;
-
-  const lineItems: any[] = Array.isArray(order?.line_items) ? order.line_items : [];
-  const productIds = Array.from(
-    new Set(lineItems.map((li) => String(li?.product_id ?? "").trim()).filter(Boolean)),
-  );
-
-  const tagCache = new Map<string, string[]>();
-  for (const pid of productIds) {
-    // best effort: if product tag fetch fails, treat as ineligible when includeTags is set, else eligible
-    try {
-      const tags = await getProductTags(shop, pid);
-      tagCache.set(pid, tags);
-    } catch {
-      tagCache.set(pid, []);
-    }
-  }
-
-  let eligibleNet = 0;
-
-  for (const li of lineItems) {
-    const pid = String(li?.product_id ?? "").trim();
-    const qty = Number(li?.quantity ?? 0) || 0;
-    const price = moneyToNumber(li?.price ?? 0);
-    const totalDiscount = moneyToNumber(li?.total_discount ?? 0);
-
-    if (qty <= 0 || price <= 0) continue;
-
-    let eligible = true;
-    if (pid) {
-      const tags = tagCache.get(pid) ?? [];
-      eligible = isEligibleByTags(tags, includeTags, excludeTags);
-    } else {
-      eligible = includeTags.length === 0; // if includeTags is set, we can’t verify -> treat as ineligible
-    }
-
-    if (!eligible) continue;
-
-    const gross = price * qty;
-    const net = Math.max(0, gross - totalDiscount);
-    eligibleNet += net;
-  }
-
-  // Points: floor(net * earnRate)
-  const points = Math.max(0, Math.floor(eligibleNet * earnRate));
-  const paidAt = new Date(order?.processed_at ?? order?.created_at ?? Date.now());
-  const currency = String(order?.currency ?? "CAD");
-
-  // Discount code audit
-  const discountCodesJson = Array.isArray(order?.discount_codes) ? order.discount_codes : [];
-
-  // Persist snapshot + ledger + balance
+async function applyLedgerDelta({
+  shop,
+  customerId,
+  type,
+  delta,
+  description,
+  orderName,
+  orderId,
+}: {
+  shop: string;
+  customerId: string;
+  type: string;
+  delta: number;
+  description: string;
+  orderName: string | null;
+  orderId: string | null;
+}) {
+  // Transaction: write ledger + update balance row
   await db.$transaction(async (tx) => {
-    await tx.orderPointsSnapshot.create({
+    await tx.pointsLedger.create({
       data: {
         shop,
-        orderId,
-        orderName: String(order?.name ?? ""),
         customerId,
-        eligibleNetMerchandise: eligibleNet,
-        pointsAwarded: points,
-        pointsReversedToDate: 0,
-        paidAt,
-        cancelledAt: null,
-        currency,
-        discountCodesJson: discountCodesJson as any,
+        type,
+        delta,
+        description,
+        orderId,
+        orderName,
+      },
+    });
+
+    const bal = await tx.customerPointsBalance.upsert({
+      where: { shop_customerId: { shop, customerId } },
+      create: {
+        shop,
+        customerId,
+        balance: delta,
+        lifetimeEarned: delta > 0 ? delta : 0,
+        lifetimeRedeemed: 0,
+        lastActivityAt: new Date(),
+      },
+      update: {
+        balance: { increment: delta },
+        lifetimeEarned: delta > 0 ? { increment: delta } : undefined,
+        lastActivityAt: new Date(),
       } as any,
     });
 
-    if (points > 0) {
-      await tx.pointsLedger.create({
-        data: {
-          shop,
-          customerId,
-          type: "EARN",
-          delta: points,
-          source: "ORDER_PAID",
-          sourceId: orderId,
-          description: `Earned ${points} points on eligible net merchandise ${eligibleNet.toFixed(2)} ${currency}`,
-          createdAt: new Date(),
-        },
-      });
-
-      await tx.customerPointsBalance.upsert({
-        where: { shop_customerId: { shop, customerId } as any },
-        create: {
-          shop,
-          customerId,
-          balance: points,
-          lifetimeEarned: points,
-          lifetimeRedeemed: 0,
-          lastActivityAt: new Date(),
-        },
-        update: {
-          balance: { increment: points },
-          lifetimeEarned: { increment: points },
-          lastActivityAt: new Date(),
-        },
+    // prevent negative balances from going too negative (optional clamp)
+    if (bal.balance < 0) {
+      await tx.customerPointsBalance.update({
+        where: { shop_customerId: { shop, customerId } },
+        data: { balance: 0 },
       });
     }
   });
-
-  // Mark consumed redemption codes if order used them
-  await markConsumedRedemptionsFromOrder(shop, customerId, order).catch(() => null);
-
-  return {
-    outcome: "PROCESSED",
-    code: "orders_paid",
-    message: safeJsonStringify({ orderId, customerId, eligibleNet, points }),
-  };
 }
 
-async function markConsumedRedemptionsFromOrder(shop: string, customerId: string, order: any) {
-  const discountCodes: any[] = Array.isArray(order?.discount_codes) ? order.discount_codes : [];
-  const codes = discountCodes
-    .map((d) => String(d?.code ?? d?.discount_code ?? "").trim())
-    .filter(Boolean);
-
-  if (codes.length === 0) return;
-
-  const now = new Date();
-  const orderId = String(order?.id ?? "").trim();
-
-  for (const code of codes) {
-    await db.redemption.updateMany({
-      where: {
-        shop,
-        customerId,
-        code,
-        status: { in: ["ISSUED", "APPLIED"] } as any,
-      } as any,
-      data: {
-        status: "CONSUMED",
-        consumedAt: now,
-        consumedOrderId: orderId || null,
-      } as any,
-    });
-  }
+function getNetLineMerchandise(line: any): number {
+  // price is per-unit, total_discount is line-level total discount
+  const qty = clampInt(line?.quantity ?? 0, 0, 1_000_000);
+  const priceEach = moneyToNumber(line?.price);
+  const gross = qty * priceEach;
+  const discount = moneyToNumber(line?.total_discount);
+  const net = gross - discount;
+  return Math.max(0, net);
 }
 
-async function handleRefundCreate(shop: string, payload: any): Promise<{ outcome: Outcome; code: string; message: string }> {
-  const refundId = String(payload?.id ?? "").trim();
-  const orderId = String(payload?.order_id ?? "").trim();
-  if (!refundId || !orderId) {
-    return { outcome: "SKIPPED", code: "missing_ids", message: safeJsonStringify({ refundId, orderId }) };
+async function computeEligibleNetMerchandise(shop: string, payload: OrderPayload, includeTags: string[], excludeTags: string[]) {
+  const lines = payload.line_items ?? [];
+  // We compute line by line and query product tags as needed.
+  // Cache product tags to avoid duplicate GraphQL calls.
+  const productTagsCache = new Map<string, string[]>();
+
+  let eligibleNet = 0;
+
+  for (const line of lines) {
+    const productId = line.product_id;
+    if (!productId) continue;
+
+    const productGid = `gid://shopify/Product/${productId}`;
+    let tags = productTagsCache.get(productGid);
+    if (!tags) {
+      try {
+        tags = await getProductTagsById(shop, productGid);
+      } catch {
+        tags = [];
+      }
+      productTagsCache.set(productGid, tags);
+    }
+
+    if (!isEligibleByTags(tags, includeTags, excludeTags)) continue;
+
+    eligibleNet += getNetLineMerchandise(line);
   }
 
-  const snapshot = await db.orderPointsSnapshot.findUnique({ where: { shop_orderId: { shop, orderId } as any } });
-  if (!snapshot) {
-    return { outcome: "SKIPPED", code: "no_snapshot", message: safeJsonStringify({ refundId, orderId }) };
+  return eligibleNet;
+}
+
+function computeRefundReversalNet(payload: OrderPayload): number {
+  // Attempt to compute net merch refunded using refund_line_items.subtotal
+  // Note: subtotal typically excludes tax. We use subtotal for reversal basis.
+  const refunds = payload.refunds ?? [];
+  let total = 0;
+  for (const r of refunds) {
+    for (const li of r.refund_line_items ?? []) {
+      total += moneyToNumber(li.subtotal);
+    }
   }
+  return Math.max(0, total);
+}
+
+async function handlePaid(shop: string, payload: OrderPayload) {
+  const customerId = payload.customer?.id ? String(payload.customer.id) : "";
+  if (!customerId) return { outcome: "IGNORED" as Outcome, message: "No customer on order." };
 
   const settings = await getShopSettings(shop);
-  const includeTags = settings.includeProductTags ?? [];
-  const excludeTags = settings.excludeProductTags ?? [];
 
-  const refundLineItems: any[] = Array.isArray(payload?.refund_line_items) ? payload.refund_line_items : [];
-  if (refundLineItems.length === 0) {
-    return { outcome: "SKIPPED", code: "no_refund_lines", message: safeJsonStringify({ refundId, orderId }) };
+  // Excluded customer tags enforcement
+  const customerTags = parseCustomerTagsString(payload.customer?.tags);
+  const isExcludedCustomer = settings.excludedCustomerTags.some((t) => customerTags.includes(t));
+  if (isExcludedCustomer) {
+    return { outcome: "IGNORED" as Outcome, message: `Excluded customer tags: ${payload.customer?.tags ?? ""}` };
   }
 
-  // Determine eligible refunded net merchandise using tag checks
-  const productIds = Array.from(
-    new Set(
-      refundLineItems
-        .map((rli) => String(rli?.line_item?.product_id ?? rli?.line_item?.product?.id ?? "").trim())
-        .filter(Boolean),
-    ),
+  await ensureCustomerBalanceRow(shop, customerId);
+
+  const eligibleNet = await computeEligibleNetMerchandise(
+    shop,
+    payload,
+    settings.includeProductTags,
+    settings.excludeProductTags,
   );
 
-  const tagCache = new Map<string, string[]>();
-  for (const pid of productIds) {
-    try {
-      const tags = await getProductTags(shop, pid);
-      tagCache.set(pid, tags);
-    } catch {
-      tagCache.set(pid, []);
-    }
+  const earnRate = clampInt(settings.earnRate, 1, 100);
+  const points = Math.floor(eligibleNet * earnRate);
+
+  if (points <= 0) {
+    return { outcome: "IGNORED" as Outcome, message: "No eligible net merchandise to earn points." };
   }
 
-  let eligibleRefundNet = 0;
+  // Idempotency: do not re-earn if we already logged an EARN for this orderId.
+  const orderId = String(payload.id);
+  const existing = await db.pointsLedger.findFirst({
+    where: { shop, customerId, type: "EARN", orderId },
+    select: { id: true },
+  });
+  if (existing) {
+    return { outcome: "IGNORED" as Outcome, message: "Already processed EARN for this order." };
+  }
 
-  for (const rli of refundLineItems) {
-    const li = rli?.line_item ?? {};
-    const pid = String(li?.product_id ?? "").trim();
-    const refundedQty = Number(rli?.quantity ?? 0) || 0;
-    const originalQty = Number(li?.quantity ?? 0) || refundedQty;
+  await applyLedgerDelta({
+    shop,
+    customerId,
+    type: "EARN",
+    delta: points,
+    description: `Earned ${points} points on eligible net merchandise $${eligibleNet.toFixed(2)} (rate ${earnRate}/$)`,
+    orderId,
+    orderName: payload.name ?? null,
+  });
 
-    const price = moneyToNumber(li?.price ?? 0);
-    const totalDiscount = moneyToNumber(li?.total_discount ?? 0);
+  return { outcome: "SUCCESS" as Outcome, message: `Earned ${points} points.` };
+}
 
-    if (refundedQty <= 0 || price <= 0) continue;
+async function handleRefundOrCancel(shop: string, payload: OrderPayload, reason: "REFUND" | "CANCELLED") {
+  const customerId = payload.customer?.id ? String(payload.customer.id) : "";
+  if (!customerId) return { outcome: "IGNORED" as Outcome, message: "No customer on order." };
 
-    let eligible = true;
-    if (pid) {
-      const tags = tagCache.get(pid) ?? [];
-      eligible = isEligibleByTags(tags, includeTags, excludeTags);
+  const settings = await getShopSettings(shop);
+
+  // Excluded customers: ignore (they shouldn't have earned, but safe)
+  const customerTags = parseCustomerTagsString(payload.customer?.tags);
+  const isExcludedCustomer = settings.excludedCustomerTags.some((t) => customerTags.includes(t));
+  if (isExcludedCustomer) {
+    return { outcome: "IGNORED" as Outcome, message: `Excluded customer tags: ${payload.customer?.tags ?? ""}` };
+  }
+
+  await ensureCustomerBalanceRow(shop, customerId);
+
+  const orderId = String(payload.id);
+
+  // Find original earned points for this order (if any)
+  const earned = await db.pointsLedger.findFirst({
+    where: { shop, customerId, type: "EARN", orderId },
+    select: { id: true, delta: true },
+  });
+  if (!earned) {
+    return { outcome: "IGNORED" as Outcome, message: "No prior EARN found for this order." };
+  }
+
+  // Idempotency: don't double reverse for same reason/order
+  const existing = await db.pointsLedger.findFirst({
+    where: { shop, customerId, type: `REVERSAL_${reason}`, orderId },
+    select: { id: true },
+  });
+  if (existing) {
+    return { outcome: "IGNORED" as Outcome, message: `Already processed ${reason} reversal for this order.` };
+  }
+
+  const earnRate = clampInt(settings.earnRate, 1, 100);
+
+  // Compute reversal basis (refund net subtotal if present; else reverse full earned)
+  // For cancellations, we reverse full earned.
+  let reversalPoints = 0;
+  if (reason === "CANCELLED") {
+    reversalPoints = -Math.abs(earned.delta);
+  } else {
+    const refundedNet = computeRefundReversalNet(payload);
+    reversalPoints = -Math.floor(refundedNet * earnRate);
+
+    // Clamp reversal so we don't exceed original earned magnitude
+    reversalPoints = -Math.min(Math.abs(reversalPoints), Math.abs(earned.delta));
+  }
+
+  if (reversalPoints === 0) {
+    return { outcome: "IGNORED" as Outcome, message: "No reversal points computed." };
+  }
+
+  await applyLedgerDelta({
+    shop,
+    customerId,
+    type: `REVERSAL_${reason}`,
+    delta: reversalPoints,
+    description:
+      reason === "CANCELLED"
+        ? `Reversed ${Math.abs(reversalPoints)} points due to order cancellation.`
+        : `Reversed ${Math.abs(reversalPoints)} points due to refund (rate ${earnRate}/$).`,
+    orderId,
+    orderName: payload.name ?? null,
+  });
+
+  return { outcome: "SUCCESS" as Outcome, message: `Reversed ${Math.abs(reversalPoints)} points (${reason}).` };
+}
+
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
+
+  const topic = request.headers.get("X-Shopify-Topic") ?? "unknown";
+  const shop = (request.headers.get("X-Shopify-Shop-Domain") ?? "").toLowerCase();
+  const webhookId = request.headers.get("X-Shopify-Webhook-Id");
+  const hmac = request.headers.get("X-Shopify-Hmac-Sha256");
+
+  // Read raw body (and cap size)
+  const raw = await request.text();
+  if (raw.length > MAX_WEBHOOK_BODY_BYTES) {
+    await logWebhookEvent({
+      shop: shop || "unknown",
+      topic,
+      webhookId,
+      outcome: "FAILED",
+      message: "Webhook body too large.",
+      payloadJson: null,
+    });
+    return new Response("Payload too large", { status: 413 });
+  }
+
+  if (!shop) {
+    await logWebhookEvent({
+      shop: "unknown",
+      topic,
+      webhookId,
+      outcome: "FAILED",
+      message: "Missing shop domain header.",
+      payloadJson: safeJsonStringify({ topic }),
+    });
+    return new Response("Missing shop", { status: 400 });
+  }
+
+  const okHmac = verifyShopifyWebhookHmac(raw, hmac, apiSecret);
+  if (!okHmac) {
+    await logWebhookEvent({
+      shop,
+      topic,
+      webhookId,
+      outcome: "FAILED",
+      message: "HMAC verification failed.",
+      payloadJson: safeJsonStringify({ topic }),
+    });
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let payload: OrderPayload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    await logWebhookEvent({
+      shop,
+      topic,
+      webhookId,
+      outcome: "FAILED",
+      message: "Invalid JSON.",
+      payloadJson: raw.slice(0, MAX_LOG_JSON_CHARS),
+    });
+    return new Response("Bad JSON", { status: 400 });
+  }
+
+  try {
+    let res: { outcome: Outcome; message: string };
+
+    // Topics differ by webhook configuration
+    const normalized = topic.toLowerCase();
+
+    if (normalized.includes("orders/paid")) {
+      res = await handlePaid(shop, payload);
+    } else if (normalized.includes("orders/cancelled")) {
+      res = await handleRefundOrCancel(shop, payload, "CANCELLED");
+    } else if (normalized.includes("refunds/create") || normalized.includes("orders/refunded")) {
+      res = await handleRefundOrCancel(shop, payload, "REFUND");
     } else {
-      eligible = includeTags.length === 0;
+      res = { outcome: "IGNORED", message: `Unhandled topic: ${topic}` };
     }
-    if (!eligible) continue;
 
-    const gross = price * refundedQty;
-
-    // Allocate discount proportionally by quantity
-    const discountPerUnit = originalQty > 0 ? totalDiscount / originalQty : 0;
-    const allocatedDiscount = Math.max(0, discountPerUnit * refundedQty);
-
-    const net = Math.max(0, gross - allocatedDiscount);
-    eligibleRefundNet += net;
-  }
-
-  const eligibleOriginalNet = Number(snapshot.eligibleNetMerchandise ?? 0) || 0;
-  const awarded = Number(snapshot.pointsAwarded ?? 0) || 0;
-  const reversedToDate = Number(snapshot.pointsReversedToDate ?? 0) || 0;
-  const remaining = Math.max(0, awarded - reversedToDate);
-
-  if (remaining <= 0 || eligibleOriginalNet <= 0 || eligibleRefundNet <= 0) {
-    return {
-      outcome: "SKIPPED",
-      code: "nothing_to_reverse",
-      message: safeJsonStringify({ refundId, orderId, eligibleRefundNet, eligibleOriginalNet, awarded, reversedToDate }),
-    };
-  }
-
-  const fraction = Math.min(1, eligibleRefundNet / eligibleOriginalNet);
-  const proposed = Math.max(0, Math.round(awarded * fraction));
-  const pointsToReverse = Math.min(remaining, proposed);
-
-  if (pointsToReverse <= 0) {
-    return {
-      outcome: "SKIPPED",
-      code: "zero_points",
-      message: safeJsonStringify({ refundId, orderId, fraction, proposed, remaining }),
-    };
-  }
-
-  const customerId = String(snapshot.customerId);
-
-  // Apply reversal (dedupe by refund id)
-  try {
-    await db.$transaction(async (tx) => {
-      await tx.pointsLedger.create({
-        data: {
-          shop,
-          customerId,
-          type: "REVERSAL",
-          delta: -pointsToReverse,
-          source: "REFUND",
-          sourceId: refundId,
-          description: `Refund reversal: -${pointsToReverse} points (refund ${refundId}, order ${orderId})`,
-          createdAt: new Date(),
-        },
-      });
-
-      await tx.orderPointsSnapshot.update({
-        where: { shop_orderId: { shop, orderId } as any },
-        data: {
-          pointsReversedToDate: { increment: pointsToReverse },
-        },
-      });
-
-      // decrement balance but do NOT update lastActivityAt
-      const bal = await tx.customerPointsBalance.findUnique({ where: { shop_customerId: { shop, customerId } as any } });
-      const currentBal = bal?.balance ?? 0;
-      const newBal = Math.max(0, currentBal - pointsToReverse);
-
-      if (bal) {
-        await tx.customerPointsBalance.update({
-          where: { shop_customerId: { shop, customerId } as any },
-          data: { balance: newBal },
-        });
-      } else {
-        await tx.customerPointsBalance.create({
-          data: {
-            shop,
-            customerId,
-            balance: 0,
-            lifetimeEarned: 0,
-            lifetimeRedeemed: 0,
-            lastActivityAt: new Date(),
-          },
-        });
-      }
+    await logWebhookEvent({
+      shop,
+      topic,
+      webhookId,
+      outcome: res.outcome,
+      message: res.message,
+      payloadJson: safeJsonStringify(payload),
     });
+
+    return new Response("OK", { status: 200 });
   } catch (e: any) {
-    // Likely deduped via unique constraint
-    return {
-      outcome: "SKIPPED",
-      code: "deduped_or_conflict",
-      message: safeJsonStringify({ refundId, orderId, error: String(e?.message ?? e) }),
-    };
-  }
-
-  return {
-    outcome: "PROCESSED",
-    code: "refund_reversal",
-    message: safeJsonStringify({
-      refundId,
-      orderId,
-      eligibleRefundNet,
-      eligibleOriginalNet,
-      fraction,
-      pointsToReverse,
-      remainingBefore: remaining,
-    }),
-  };
-}
-
-async function handleOrderCancelled(shop: string, order: any): Promise<{ outcome: Outcome; code: string; message: string }> {
-  const orderId = String(order?.id ?? "").trim();
-  if (!orderId) return { outcome: "SKIPPED", code: "no_order_id", message: "Missing order.id" };
-
-  const snapshot = await db.orderPointsSnapshot.findUnique({ where: { shop_orderId: { shop, orderId } as any } });
-  if (!snapshot) {
-    return { outcome: "SKIPPED", code: "no_snapshot", message: safeJsonStringify({ orderId }) };
-  }
-
-  const awarded = Number(snapshot.pointsAwarded ?? 0) || 0;
-  const reversedToDate = Number(snapshot.pointsReversedToDate ?? 0) || 0;
-  const remaining = Math.max(0, awarded - reversedToDate);
-
-  if (remaining <= 0) {
-    // still set cancelledAt
-    await db.orderPointsSnapshot.update({
-      where: { shop_orderId: { shop, orderId } as any },
-      data: { cancelledAt: new Date(order?.cancelled_at ?? Date.now()) },
+    await logWebhookEvent({
+      shop,
+      topic,
+      webhookId,
+      outcome: "FAILED",
+      message: String(e?.message ?? e),
+      payloadJson: safeJsonStringify(payload),
     });
-    return { outcome: "SKIPPED", code: "already_reversed", message: safeJsonStringify({ orderId }) };
+    return new Response("Webhook processing failed", { status: 500 });
   }
+};
 
-  const customerId = String(snapshot.customerId);
-
-  // Cancellation reversal: dedupe by order id (one cancellation per order)
-  try {
-    await db.$transaction(async (tx) => {
-      await tx.pointsLedger.create({
-        data: {
-          shop,
-          customerId,
-          type: "REVERSAL",
-          delta: -remaining,
-          source: "CANCEL",
-          sourceId: orderId,
-          description: `Cancellation reversal: -${remaining} points (order ${orderId})`,
-          createdAt: new Date(),
-        },
-      });
-
-      await tx.orderPointsSnapshot.update({
-        where: { shop_orderId: { shop, orderId } as any },
-        data: {
-          pointsReversedToDate: awarded,
-          cancelledAt: new Date(order?.cancelled_at ?? Date.now()),
-        },
-      });
-
-      // decrement balance but do NOT update lastActivityAt
-      const bal = await tx.customerPointsBalance.findUnique({ where: { shop_customerId: { shop, customerId } as any } });
-      const currentBal = bal?.balance ?? 0;
-      const newBal = Math.max(0, currentBal - remaining);
-
-      if (bal) {
-        await tx.customerPointsBalance.update({
-          where: { shop_customerId: { shop, customerId } as any },
-          data: { balance: newBal },
-        });
-      }
-    });
-  } catch (e: any) {
-    return {
-      outcome: "SKIPPED",
-      code: "deduped_or_conflict",
-      message: safeJsonStringify({ orderId, error: String(e?.message ?? e) }),
-    };
-  }
-
-  return {
-    outcome: "PROCESSED",
-    code: "cancel_reversal",
-    message: safeJsonStringify({ orderId, reversed: remaining }),
-  };
-}
-
-async function handleUninstalled(shop: string) {
-  // Purge shop-scoped data (best effort; order of deletes doesn’t matter since no FKs here)
-  const redemptionsDeleted = await db.redemption.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const balancesDeleted = await db.customerPointsBalance.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const ledgerDeleted = await db.pointsLedger.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const snapshotsDeleted = await db.orderPointsSnapshot.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const settingsDeleted = await db.shopSettings.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const webhookEventsDeleted = await db.webhookEvent.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const webhookErrorsDeleted = await db.webhookError.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-  const privacyDeleted = await db.privacyEvent.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-
-  // Sessions: delete both offline_ and any online sessions for shop
-  const sessionsDeleted = await db.session.deleteMany({ where: { shop } }).then((r) => r.count).catch(() => 0);
-
-  return {
-    redemptionsDeleted,
-    balancesDeleted,
-    ledgerDeleted,
-    snapshotsDeleted,
-    settingsDeleted,
-    webhookEventsDeleted,
-    webhookErrorsDeleted,
-    privacyDeleted,
-    sessionsDeleted,
-  };
-}
-
-async function handlePrivacy(topic: string, shop: string, payload: any) {
-  // Always log payload (Shopify compliance)
-  await db.privacyEvent
-    .create({
-      data: {
-        shop,
-        topic,
-        payloadJson: safeJsonStringify(payload, 15000),
-        createdAt: new Date(),
-      },
-    })
-    .catch(() => null);
-
-  if (topic === "customers/data_request") {
-    // No deletion required; just acknowledge and record.
-    return { recorded: true };
-  }
-
-  if (topic === "customers/redact") {
-    const customerId = String(payload?.customer?.id ?? "").trim();
-    if (!customerId) return { recorded: true, customerId: null };
-
-    const redemptionsDeleted = await db.redemption
-      .deleteMany({ where: { shop, customerId } })
-      .then((r) => r.count)
-      .catch(() => 0);
-
-    const balancesDeleted = await db.customerPointsBalance
-      .deleteMany({ where: { shop, customerId } })
-      .then((r) => r.count)
-      .catch(() => 0);
-
-    const ledgerDeleted = await db.pointsLedger
-      .deleteMany({ where: { shop, customerId } })
-      .then((r) => r.count)
-      .catch(() => 0);
-
-    const snapshotsDeleted = await db.orderPointsSnapshot
-      .deleteMany({ where: { shop, customerId } })
-      .then((r) => r.count)
-      .catch(() => 0);
-
-    return {
-      recorded: true,
-      customerId,
-      redemptionsDeleted,
-      balancesDeleted,
-      ledgerDeleted,
-      snapshotsDeleted,
-    };
-  }
-
-  if (topic === "shop/redact") {
-    const counts = await handleUninstalled(shop);
-    return { recorded: true, ...counts };
-  }
-
-  return { recorded: true };
-}
-
-export default function WebhooksRoute() {
-  // No UI – webhook endpoint only.
-  return null;
-}
+export const loader = async ({ request }: LoaderFunctionArgs) => {
+  // Health check / debug endpoint (optional)
+  return new Response("OK", { status: 200 });
+};
