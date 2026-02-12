@@ -9,6 +9,7 @@
  * This is NOT fixable in code alone. The app must be granted Protected Customer Data access
  * in Partner/Dev Dashboard for the relevant resources/fields.
  */
+
 export const PROTECTED_CUSTOMER_DATA_DOC_URL =
   "https://shopify.dev/docs/apps/launch/protected-customer-data";
 
@@ -16,6 +17,14 @@ export type ProtectedCustomerDataFailure = {
   ok: false;
   code: "PROTECTED_CUSTOMER_DATA";
   error: string;
+  docsUrl: string;
+};
+
+export type ProtectedCustomerDataFormatted = {
+  isProtectedCustomerDataIssue: boolean;
+  title?: string;
+  short?: string;
+  help?: string;
   docsUrl: string;
 };
 
@@ -27,10 +36,27 @@ function stringify(x: unknown): string {
   }
 }
 
+/**
+ * Collect error messages from:
+ * - a string
+ * - an array of strings
+ * - common Shopify GraphQL client error shapes
+ */
 function collectMessages(err: any): string[] {
   const msgs: string[] = [];
-
   if (!err) return msgs;
+
+  // Common case in your routes: pass string[]
+  if (Array.isArray(err)) {
+    for (const e of err) {
+      if (typeof e === "string") msgs.push(e);
+      else if (e?.message) msgs.push(String(e.message));
+      else if (e) msgs.push(stringify(e));
+    }
+    return msgs.filter(Boolean);
+  }
+
+  if (typeof err === "string") return [err];
 
   if (typeof err.message === "string") msgs.push(err.message);
 
@@ -38,6 +64,7 @@ function collectMessages(err: any): string[] {
   // - err.response?.errors
   // - err.response?.body?.errors
   // - err.body?.errors
+  // - err.errors
   const candidates = [
     err?.response?.errors,
     err?.response?.body?.errors,
@@ -76,7 +103,7 @@ export function isProtectedCustomerDataError(err: unknown): boolean {
 
 export function toProtectedCustomerDataFailure(
   err: unknown,
-  context?: { operation?: string }
+  context?: { operation?: string },
 ): ProtectedCustomerDataFailure | null {
   if (!isProtectedCustomerDataError(err)) return null;
 
@@ -90,6 +117,48 @@ export function toProtectedCustomerDataFailure(
       `⚠️ ${operation}Customer search failed: ${raw}\n\n` +
       `This usually means the app is missing Protected Customer Data access approval (even if scopes like read_customers are present).\n` +
       `See: ${PROTECTED_CUSTOMER_DATA_DOC_URL}`,
+    docsUrl: PROTECTED_CUSTOMER_DATA_DOC_URL,
+  };
+}
+
+/**
+ * ✅ This is the missing export expected by app/routes/app.customers.tsx
+ *
+ * Accepts either:
+ * - string[] (your route passes GraphQL errors as strings)
+ * - unknown error object (for other call sites)
+ *
+ * Returns a merchant-friendly message bundle usable by both UI + API route responses.
+ */
+export function formatProtectedCustomerDataError(errorsOrErr: unknown): ProtectedCustomerDataFormatted {
+  const messages = collectMessages(errorsOrErr as any);
+  const isPCD = isProtectedCustomerDataError(messages.length ? messages : errorsOrErr);
+
+  if (!isPCD) {
+    return {
+      isProtectedCustomerDataIssue: false,
+      docsUrl: PROTECTED_CUSTOMER_DATA_DOC_URL,
+    };
+  }
+
+  const raw = messages[0] ?? "This app is not approved to access customer data.";
+  const title = "Customer data access blocked by Shopify (Protected Customer Data)";
+  const short = "Shopify is restricting customer name/email fields for this app.";
+  const help =
+    `Shopify returned a Protected Customer Data error:\n` +
+    `• ${raw}\n\n` +
+    `What this means:\n` +
+    `• Public / App Store apps must be approved for Protected Customer Data to access Customer object or certain fields (name/email).\n\n` +
+    `Workarounds:\n` +
+    `• Use numeric Customer ID / GID lookups where possible (less likely to be blocked than free-text search).\n` +
+    `• If you need name/email search in-admin, request Protected Customer Data approval in the Shopify Partner/Dev Dashboard.\n\n` +
+    `Docs: ${PROTECTED_CUSTOMER_DATA_DOC_URL}`;
+
+  return {
+    isProtectedCustomerDataIssue: true,
+    title,
+    short,
+    help,
     docsUrl: PROTECTED_CUSTOMER_DATA_DOC_URL,
   };
 }
