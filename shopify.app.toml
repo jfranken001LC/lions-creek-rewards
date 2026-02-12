@@ -1,42 +1,31 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
-
 client_id = "018d1d4d00f8544b759266b72d17c00e"
-name = "Lions Creek Loyalty"
+name = "Lions Creek Rewards"
 application_url = "https://loyalty.basketbooster.ca"
 embedded = true
 
-
 [build]
 automatically_update_urls_on_dev = false
+dev_store_url = "lions-creek-dev-3.myshopify.com"
 
+[access_scopes]
+# Keep your existing scopes. (Protected customer data approval is still required — see section 6 notes.)
+scopes = "read_orders,read_customers,write_customers,read_products,write_discounts"
+optional_scopes = []
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [
+  "https://loyalty.basketbooster.ca/auth/callback",
+  "https://loyalty.basketbooster.ca/auth/shopify/callback"
+]
 
 [webhooks]
 api_version = "2026-01"
 
-
-[[webhooks.subscriptions]]
-topics = [
-"orders/paid",
-"refunds/create",
-"orders/cancelled",
-"app/uninstalled",
-"app/scopes_update",
-]
-compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
-uri = "/webhooks"
-
-
-[access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_orders,read_customers,write_customers,read_products,write_discounts"
-optional_scopes = [ ]
-use_legacy_install_flow = false
-
-
-[auth]
-redirect_urls = [ "https://loyalty.basketbooster.ca/auth/callback" ]
-
-
-[discount.metafields.app.function-configuration.access]
-admin = "merchant_read_write"
-storefront = "none"
+# ✅ Required by current Shopify CLI validation for discount UI/function configuration metafields
+# Mirrors Shopify’s documented structure (type=json) for the $app/function-configuration metafield.
+[discount.metafields.app.function-configuration]
+type = "json"
+name = "Function configuration"
+access.admin = "merchant_read_write"
+access.storefront = "none"
