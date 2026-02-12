@@ -1,311 +1,378 @@
 // app/routes/app.customers.tsx
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { data, Form, useActionData, useLoaderData } from "react-router";
+import { data, Form, Link, useActionData, useLoaderData, useNavigation } from "react-router";
+import {
+  Page,
+  Card,
+  Text,
+  TextField,
+  Button,
+  InlineStack,
+  BlockStack,
+  DataTable,
+  Banner,
+  Divider,
+} from "@shopify/polaris";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
-import { formatProtectedCustomerDataError } from "../lib/protectedCustomerData";
-
-/**
- * NOTE:
- * - "Search by name/email" requires Shopify Protected Customer Data approval for a Public/AppStore app.
- * - Without approval, Shopify returns HTTP 200 with GraphQL errors like:
- *   "This app is not approved to access the Customer object..."
- */
 
 type CustomerHit = {
-  id: string;
+  id: string; // GID
+  customerId: string; // legacy numeric as string
+  displayName: string;
   email?: string | null;
-  firstName?: string | null;
-  lastName?: string | null;
-  tags?: string[] | null;
 };
 
-type ActionData =
-  | { ok: true; mode: "id" | "query"; q: string; hits: CustomerHit[]; warnings?: string[] }
-  | { ok: false; mode: "id" | "query"; q: string; error: string; help?: string; debug?: string };
-
-function isNumeric(s: string) {
-  return /^[0-9]+$/.test(s);
-}
-
-function toCustomerGid(q: string) {
-  if (q.startsWith("gid://shopify/Customer/")) return q;
-  if (isNumeric(q)) return `gid://shopify/Customer/${q}`;
-  return null;
-}
-
-async function getOfflineAccessToken(shop: string): Promise<string | null> {
-  const id = `offline_${shop}`;
-  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
-  return s?.accessToken ?? null;
-}
-
-async function shopifyGraphqlRaw(shop: string, query: string, variables: any) {
-  const token = await getOfflineAccessToken(shop);
-  if (!token) {
-    return {
-      data: null,
-      errors: [{ message: "Missing offline access token for shop. Reinstall/re-auth the app." }],
-    };
-  }
-
-  const endpoint = `https://${shop}/admin/api/2026-01/graphql.json`;
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await resp.text().catch(() => "");
-  let json: any = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    // keep null
-  }
-
-  if (!resp.ok) {
-    return {
-      data: null,
-      errors: [
-        {
-          message: `Shopify GraphQL failed: ${resp.status} ${resp.statusText}${text ? ` ${text}` : ""}`,
-        },
-      ],
-    };
-  }
-
-  return { data: json?.data ?? null, errors: json?.errors ?? [] };
-}
-
-function buildCustomerSearchQuery(userQ: string) {
-  const q = userQ.trim();
-
-  // If it looks like an email, use email filter (still Level 2 field).
-  if (q.includes("@")) return `email:${JSON.stringify(q)}`;
-
-  // Otherwise, treat as name-ish input. Shopify customer search syntax supports "name:".
-  // This still requires Protected Customer Data access for name fields in most public app contexts.
-  return `name:${JSON.stringify(q)}`;
+function gidToLegacyId(gid: string): string {
+  const parts = String(gid).split("/");
+  return parts[parts.length - 1] ?? "";
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  return data({ shop: session.shop });
+  const url = new URL(request.url);
+  const customerId = url.searchParams.get("customerId")?.trim() ?? "";
+
+  if (!customerId) {
+    return data({
+      shop: session.shop,
+      selected: null as any,
+    });
+  }
+
+  const balance = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop: session.shop, customerId } },
+  });
+
+  const ledger = await db.pointsLedger.findMany({
+    where: { shop: session.shop, customerId },
+    orderBy: { createdAt: "desc" },
+    take: 100,
+  });
+
+  const redemptions = await db.redemption.findMany({
+    where: { shop: session.shop, customerId },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+  });
+
+  return data({
+    shop: session.shop,
+    selected: {
+      customerId,
+      balance,
+      ledger,
+      redemptions,
+    },
+  });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const shop = session.shop;
-
   const form = await request.formData();
   const intent = String(form.get("_intent") ?? "");
-  const q = String(form.get("q") ?? "").trim();
 
-  if (intent !== "search") {
-    return data<ActionData>({ ok: false, mode: "query", q, error: "Unknown intent." }, { status: 400 });
-  }
-  if (!q) {
-    return data<ActionData>({ ok: false, mode: "query", q, error: "Enter a customer ID, GID, name, or email." }, { status: 400 });
-  }
+  if (intent === "search") {
+    const query = String(form.get("query") ?? "").trim();
+    const customerId = String(form.get("customerId") ?? "").trim();
 
-  // Mode 1: ID/GID lookup (best-effort fallback)
-  const gid = toCustomerGid(q);
-  if (gid) {
-    const query = `
-      query CustomerById($id: ID!) {
-        customer(id: $id) {
-          id
-          tags
-          # These are Level 2 fields; if unapproved they may be redacted/null and/or emit errors.
-          email
-          firstName
-          lastName
+    // Allow direct lookup by numeric customerId without Shopify search
+    if (customerId) {
+      return data({ ok: true, hits: [] as CustomerHit[], directCustomerId: customerId });
+    }
+
+    if (!query) return data({ ok: false, error: "Enter a name/email/customer id to search." }, { status: 400 });
+
+    // Shopify GraphQL customer search
+    const accessToken = await db.session.findFirst({
+      where: { shop: session.shop, isOnline: false },
+      orderBy: { createdAt: "desc" },
+      select: { accessToken: true },
+    });
+
+    if (!accessToken?.accessToken) {
+      return data({ ok: false, error: "Missing offline token; reinstall or re-auth the app." }, { status: 500 });
+    }
+
+    const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
+    const endpoint = `https://${session.shop}/admin/api/${apiVersion}/graphql.json`;
+
+    // Search by name/email; if numeric provided, try id:NNN
+    const looksNumeric = /^\d+$/.test(query);
+    const search = looksNumeric ? `id:${query}` : query;
+
+    const gql = `
+      query Customers($first: Int!, $query: String!) {
+        customers(first: $first, query: $query) {
+          edges {
+            node {
+              id
+              displayName
+              email
+            }
+          }
         }
       }
     `;
 
-    const res = await shopifyGraphqlRaw(shop, query, { id: gid });
-    const errors = (res.errors ?? []).map((e: any) => String(e?.message ?? "")).filter(Boolean);
-
-    if (!res.data?.customer) {
-      const formatted = formatProtectedCustomerDataError(errors);
-      return data<ActionData>(
-        {
-          ok: false,
-          mode: "id",
-          q,
-          error: formatted.title ?? "Customer lookup failed.",
-          help: formatted.help,
-          debug: errors.length ? JSON.stringify(errors) : undefined,
-        },
-        { status: 400 },
-      );
-    }
-
-    const c = res.data.customer;
-    const warnings: string[] = [];
-    const formatted = formatProtectedCustomerDataError(errors);
-    if (formatted.isProtectedCustomerDataIssue) warnings.push(formatted.short ?? "Some customer fields may be redacted.");
-
-    return data<ActionData>({
-      ok: true,
-      mode: "id",
-      q,
-      hits: [
-        {
-          id: String(c.id),
-          tags: Array.isArray(c.tags) ? c.tags.map((t: any) => String(t)) : [],
-          email: c.email ?? null,
-          firstName: c.firstName ?? null,
-          lastName: c.lastName ?? null,
-        },
-      ],
-      warnings: warnings.length ? warnings : undefined,
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken.accessToken,
+      },
+      body: JSON.stringify({ query: gql, variables: { first: 20, query: search } }),
     });
+
+    const json = (await resp.json()) as any;
+    if (!resp.ok || json?.errors) {
+      return data({ ok: false, error: json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}` }, { status: 500 });
+    }
+
+    const edges = json?.data?.customers?.edges ?? [];
+    const hits: CustomerHit[] = edges.map((e: any) => {
+      const gid = String(e?.node?.id ?? "");
+      return {
+        id: gid,
+        customerId: gidToLegacyId(gid),
+        displayName: String(e?.node?.displayName ?? ""),
+        email: e?.node?.email ?? null,
+      };
+    });
+
+    return data({ ok: true, hits, directCustomerId: null });
   }
 
-  // Mode 2: name/email query search
-  const searchQ = buildCustomerSearchQuery(q);
-  const query = `
-    query CustomersSearch($q: String!) {
-      customers(first: 10, query: $q) {
-        nodes {
-          id
-          tags
-          # Level 2 fields (name/email). If unapproved, these can be null and may emit GraphQL errors.
-          email
-          firstName
-          lastName
-        }
-      }
+  if (intent === "adjust") {
+    const customerId = String(form.get("customerId") ?? "").trim();
+    const deltaRaw = String(form.get("delta") ?? "").trim();
+    const reason = String(form.get("reason") ?? "").trim();
+
+    if (!customerId) return data({ ok: false, error: "Missing customerId." }, { status: 400 });
+    if (!deltaRaw) return data({ ok: false, error: "Enter a delta (e.g., 50 or -50)." }, { status: 400 });
+    if (!reason) return data({ ok: false, error: "Reason is required." }, { status: 400 });
+
+    const delta = Math.trunc(Number(deltaRaw));
+    if (!Number.isFinite(delta) || delta === 0) {
+      return data({ ok: false, error: "Delta must be a non-zero integer." }, { status: 400 });
     }
-  `;
 
-  const res = await shopifyGraphqlRaw(shop, query, { q: searchQ });
-  const errors = (res.errors ?? []).map((e: any) => String(e?.message ?? "")).filter(Boolean);
-  const formatted = formatProtectedCustomerDataError(errors);
+    await db.$transaction(async (tx) => {
+      const existing =
+        (await tx.customerPointsBalance.findUnique({
+          where: { shop_customerId: { shop: session.shop, customerId } },
+        })) ??
+        (await tx.customerPointsBalance.create({
+          data: {
+            shop: session.shop,
+            customerId,
+            balance: 0,
+            lifetimeEarned: 0,
+            lifetimeRedeemed: 0,
+            lastActivityAt: null,
+            expiredAt: null,
+          },
+        }));
 
-  const nodes: any[] = res.data?.customers?.nodes ?? [];
-  if (!nodes.length) {
-    // If protected customer data is blocking, show that explicitly.
-    if (formatted.isProtectedCustomerDataIssue) {
-      return data<ActionData>(
-        {
-          ok: false,
-          mode: "query",
-          q,
-          error: formatted.title ?? "Customer search blocked by Shopify Protected Customer Data policy.",
-          help: formatted.help,
-          debug: errors.length ? JSON.stringify(errors) : undefined,
+      const next = Math.max(0, existing.balance + delta);
+      const applied = next - existing.balance;
+      if (applied === 0) return;
+
+      await tx.pointsLedger.create({
+        data: {
+          shop: session.shop,
+          customerId,
+          type: "ADJUST" as any,
+          delta: applied,
+          source: "ADMIN",
+          sourceId: crypto.randomUUID(),
+          description: reason,
         },
-        { status: 403 },
-      );
-    }
+      });
 
-    return data<ActionData>({ ok: false, mode: "query", q, error: "No customers found (or data was redacted)." }, { status: 404 });
+      await tx.customerPointsBalance.update({
+        where: { shop_customerId: { shop: session.shop, customerId } },
+        data: {
+          balance: next,
+          lastActivityAt: new Date(),
+        },
+      });
+    });
+
+    return data({ ok: true, adjustedCustomerId: customerId });
   }
 
-  const hits: CustomerHit[] = nodes.map((c) => ({
-    id: String(c.id),
-    tags: Array.isArray(c.tags) ? c.tags.map((t: any) => String(t)) : [],
-    email: c.email ?? null,
-    firstName: c.firstName ?? null,
-    lastName: c.lastName ?? null,
-  }));
-
-  const warnings: string[] = [];
-  if (formatted.isProtectedCustomerDataIssue) warnings.push(formatted.short ?? "Some customer fields may be redacted.");
-
-  return data<ActionData>({
-    ok: true,
-    mode: "query",
-    q,
-    hits,
-    warnings: warnings.length ? warnings : undefined,
-  });
+  return data({ ok: false, error: "Unsupported action." }, { status: 400 });
 };
 
-export default function CustomersRoute() {
-  const { shop } = useLoaderData<typeof loader>();
-  const a = useActionData<ActionData>();
+export default function CustomersAdmin() {
+  const ld = useLoaderData() as any;
+  const ad = useActionData() as any;
+  const nav = useNavigation();
+
+  const busy = nav.state !== "idle";
+  const selected = ld?.selected ?? null;
+
+  const hits: CustomerHit[] = ad?.hits ?? [];
+  const directCustomerId: string | null = ad?.directCustomerId ?? null;
 
   return (
-    <div style={{ padding: 16, maxWidth: 980 }}>
-      <h1 style={{ marginBottom: 6 }}>Customer Search</h1>
-      <div style={{ opacity: 0.7, marginBottom: 18 }}>Shop: {shop}</div>
+    <Page title="Customers (Loyalty)">
+      <BlockStack gap="400">
+        {ad?.error ? (
+          <Banner tone="critical">
+            <p>{ad.error}</p>
+          </Banner>
+        ) : null}
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14, marginBottom: 16 }}>
-        <h2 style={{ marginTop: 0 }}>Search</h2>
+        {ad?.ok && ad?.adjustedCustomerId ? (
+          <Banner tone="success">
+            <p>Adjustment applied for customerId {ad.adjustedCustomerId}.</p>
+          </Banner>
+        ) : null}
 
-        <Form method="post" style={{ display: "flex", gap: 8, alignItems: "end" }}>
-          <input type="hidden" name="_intent" value="search" />
-          <label style={{ flex: 1 }}>
-            Customer ID / GID / Name / Email
-            <input name="q" placeholder="1234567890 • gid://shopify/Customer/... • Jane Doe • jane@domain.com" />
-          </label>
-          <button type="submit">Search</button>
-        </Form>
+        <Card>
+          <BlockStack gap="300">
+            <Text as="h2" variant="headingMd">
+              Lookup
+            </Text>
 
-        <div style={{ marginTop: 10, opacity: 0.75 }}>
-          <strong>Important:</strong> Name/email search can be blocked unless your public app is approved for Protected Customer Data.
-          If blocked, use numeric Customer ID (from Shopify Admin URL) as a workaround.
-        </div>
-      </section>
+            <Form method="post">
+              <input type="hidden" name="_intent" value="search" />
+              <InlineStack gap="300" wrap>
+                <TextField
+                  label="Search (name/email) OR leave blank and use Customer ID"
+                  name="query"
+                  autoComplete="off"
+                  disabled={busy}
+                />
+                <TextField
+                  label="Customer ID (numeric)"
+                  name="customerId"
+                  autoComplete="off"
+                  disabled={busy}
+                />
+                <Button submit variant="primary" disabled={busy}>
+                  Search
+                </Button>
+              </InlineStack>
+            </Form>
 
-      {a && !a.ok && (
-        <section style={{ border: "1px solid #f2caca", background: "#fff5f5", borderRadius: 10, padding: 14, marginBottom: 16 }}>
-          <div style={{ fontWeight: 700 }}>⚠️ {a.error}</div>
-          {a.help && <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{a.help}</div>}
-          {a.debug && (
-            <details style={{ marginTop: 10 }}>
-              <summary>Debug</summary>
-              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{a.debug}</pre>
-            </details>
-          )}
-        </section>
-      )}
+            {directCustomerId ? (
+              <Banner tone="info">
+                <p>
+                  Direct lookup requested.{" "}
+                  <Link to={`/app/customers?customerId=${encodeURIComponent(directCustomerId)}`}>
+                    View customerId {directCustomerId}
+                  </Link>
+                </p>
+              </Banner>
+            ) : null}
 
-      {a && a.ok && (
-        <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14 }}>
-          <h2 style={{ marginTop: 0 }}>Results</h2>
-          {a.warnings?.length ? (
-            <div style={{ marginBottom: 10, opacity: 0.8 }}>
-              {a.warnings.map((w, i) => (
-                <div key={i}>⚠️ {w}</div>
-              ))}
-            </div>
-          ) : null}
+            {hits.length ? (
+              <>
+                <Divider />
+                <Text as="h3" variant="headingSm">
+                  Results
+                </Text>
+                <DataTable
+                  columnContentTypes={["text", "text", "text", "text"]}
+                  headings={["Customer ID", "Display Name", "Email", "Actions"]}
+                  rows={hits.map((h) => [
+                    h.customerId,
+                    h.displayName,
+                    h.email ?? "",
+                    <Link key={h.customerId} to={`/app/customers?customerId=${encodeURIComponent(h.customerId)}`}>
+                      View
+                    </Link>,
+                  ])}
+                />
+              </>
+            ) : null}
+          </BlockStack>
+        </Card>
 
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "8px 6px" }}>Customer</th>
-                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "8px 6px" }}>Email</th>
-                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "8px 6px" }}>Tags</th>
-              </tr>
-            </thead>
-            <tbody>
-              {a.hits.map((h) => (
-                <tr key={h.id}>
-                  <td style={{ borderBottom: "1px solid #f4f4f4", padding: "8px 6px" }}>
-                    <div style={{ fontFamily: "monospace", fontSize: 12 }}>{h.id}</div>
-                    <div style={{ opacity: 0.8 }}>
-                      {(h.firstName || h.lastName) ? `${h.firstName ?? ""} ${h.lastName ?? ""}`.trim() : <em>name redacted / unavailable</em>}
-                    </div>
-                  </td>
-                  <td style={{ borderBottom: "1px solid #f4f4f4", padding: "8px 6px" }}>
-                    {h.email ? h.email : <em>redacted / unavailable</em>}
-                  </td>
-                  <td style={{ borderBottom: "1px solid #f4f4f4", padding: "8px 6px" }}>
-                    {h.tags?.length ? h.tags.join(", ") : <em>—</em>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-    </div>
+        {selected ? (
+          <Card>
+            <BlockStack gap="300">
+              <Text as="h2" variant="headingMd">
+                Customer {selected.customerId}
+              </Text>
+
+              <Text as="p" variant="bodyMd">
+                Balance: <b>{selected.balance?.balance ?? 0}</b> points · Lifetime earned:{" "}
+                <b>{selected.balance?.lifetimeEarned ?? 0}</b> · Lifetime redeemed:{" "}
+                <b>{selected.balance?.lifetimeRedeemed ?? 0}</b>
+              </Text>
+
+              <Divider />
+
+              <Text as="h3" variant="headingSm">
+                Manual adjustment (FR-4.3)
+              </Text>
+
+              <Form method="post">
+                <input type="hidden" name="_intent" value="adjust" />
+                <input type="hidden" name="customerId" value={selected.customerId} />
+                <InlineStack gap="300" wrap>
+                  <TextField
+                    label="Delta (positive or negative)"
+                    name="delta"
+                    autoComplete="off"
+                    disabled={busy}
+                    helpText="Example: 50 adds 50 points, -50 removes 50 points. Balance will never go below 0."
+                  />
+                  <TextField
+                    label="Reason"
+                    name="reason"
+                    autoComplete="off"
+                    disabled={busy}
+                  />
+                  <Button submit variant="primary" disabled={busy}>
+                    Apply
+                  </Button>
+                </InlineStack>
+              </Form>
+
+              <Divider />
+
+              <Text as="h3" variant="headingSm">
+                Ledger (last 100) (FR-4.4)
+              </Text>
+
+              <DataTable
+                columnContentTypes={["text", "text", "numeric", "text", "text"]}
+                headings={["When", "Type", "Delta", "Source", "Description"]}
+                rows={(selected.ledger ?? []).map((l: any) => [
+                  new Date(l.createdAt).toLocaleString(),
+                  String(l.type),
+                  String(l.delta),
+                  `${l.source}:${l.sourceId}`,
+                  l.description,
+                ])}
+              />
+
+              <Divider />
+
+              <Text as="h3" variant="headingSm">
+                Redemptions (last 50)
+              </Text>
+
+              <DataTable
+                columnContentTypes={["text", "text", "numeric", "numeric", "text"]}
+                headings={["Issued", "Code", "Value", "Points", "Status"]}
+                rows={(selected.redemptions ?? []).map((r: any) => [
+                  new Date(r.createdAt).toLocaleString(),
+                  r.code,
+                  String(r.value),
+                  String(r.points),
+                  String(r.status),
+                ])}
+              />
+            </BlockStack>
+          </Card>
+        ) : null}
+      </BlockStack>
+    </Page>
   );
 }

@@ -129,7 +129,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     select: {
       id: true,
       shop: true,
-      code: true,
+      discountCode: true,
       discountNodeId: true,
       status: true,
     },

@@ -1,128 +1,85 @@
+// app/routes/loyalty.json.tsx
 import type { LoaderFunctionArgs } from "react-router";
 import { data } from "react-router";
 import crypto from "node:crypto";
 import db from "../db.server";
 import { getShopSettings } from "../lib/shopSettings.server";
 
-function verifyAppProxyHmac(url: URL, secret: string): boolean {
-  const signature = url.searchParams.get("signature") ?? "";
-  if (!signature) return false;
+function verifyProxySignature(url: URL, secret: string): boolean {
+  // Shopify app proxy signs with "signature" (legacy) or "hmac" depending on config.
+  const signature = url.searchParams.get("signature");
+  const hmac = url.searchParams.get("hmac");
+  const provided = signature ?? hmac;
+  if (!provided) return false;
 
-  const sorted = [...url.searchParams.entries()]
-    .filter(([k]) => k !== "signature")
-    .sort(([a], [b]) => a.localeCompare(b));
+  // Build message from sorted query params excluding signature/hmac
+  const params = Array.from(url.searchParams.entries())
+    .filter(([k]) => k !== "signature" && k !== "hmac")
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("");
 
-  const message = sorted.map(([k, v]) => `${k}=${v}`).join("");
-
-  const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(signature, "utf8");
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
-async function getOfflineAccessToken(shop: string): Promise<string | null> {
-  const id = `offline_${shop}`;
-  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
-  return s?.accessToken ?? null;
-}
-
-async function shopifyGraphql(shop: string, query: string, variables: any) {
-  const token = await getOfflineAccessToken(shop);
-  if (!token) throw new Error("Missing offline access token for shop. Reinstall/re-auth the app.");
-
-  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await resp.json().catch(() => ({} as any));
-  if (!resp.ok) throw new Error(`Shopify GraphQL HTTP ${resp.status}: ${JSON.stringify(json)}`);
-  if (json.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  return json.data;
-}
-
-async function getCustomerTags(shop: string, customerGid: string): Promise<{ tags: string[]; warning?: string | null }> {
-  const query = `
-    query CustomerTags($id: ID!) { customer(id: $id) { tags } }
-  `;
-  try {
-    const data = await shopifyGraphql(shop, query, { id: customerGid });
-    const tags: any[] = data?.customer?.tags ?? [];
-    return { tags: Array.isArray(tags) ? tags.map((t) => String(t)) : [] };
-  } catch (e: any) {
-    return { tags: [], warning: String(e?.message ?? e) };
-  }
-}
-
-function toCustomerGid(id: string) {
-  const numeric = String(id ?? "").trim();
-  return numeric ? `gid://shopify/Customer/${numeric}` : "";
-}
-
-function addMonths(date: Date, months: number): Date {
-  const d = new Date(date);
-  d.setMonth(d.getMonth() + months);
-  return d;
+  const digest = crypto.createHmac("sha256", secret).update(params).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(provided, "utf8"));
 }
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
-  const apiSecret = process.env.SHOPIFY_API_SECRET ?? "";
+  const shop = url.searchParams.get("shop");
+  const customerId = url.searchParams.get("logged_in_customer_id");
 
-  const shop = (url.searchParams.get("shop") ?? "").toLowerCase();
-  const customerId = url.searchParams.get("logged_in_customer_id") ?? "";
-  const ok = verifyAppProxyHmac(url, apiSecret);
-
-  if (!ok || !shop || !customerId) {
-    return data({ ok: false }, { status: 401 });
+  if (!shop || !customerId) {
+    return data({ ok: false, error: "Missing shop or logged_in_customer_id" }, { status: 400 });
   }
 
-  const expiryMonths = 12;
+  const secret = process.env.SHOPIFY_API_SECRET ?? "";
+  if (!secret || !verifyProxySignature(url, secret)) {
+    return data({ ok: false, error: "Invalid proxy signature" }, { status: 401 });
+  }
+
   const settings = await getShopSettings(shop);
 
-  const customerGid = toCustomerGid(customerId);
-  const tagResult = customerGid ? await getCustomerTags(shop, customerGid) : { tags: [], warning: "Missing customer id" };
-  const excludedTagList = settings.excludedCustomerTags ?? [];
-  const customerExcluded = excludedTagList.some((t) => tagResult.tags.includes(t));
-  const customerExcludedReason = customerExcluded
-    ? `Excluded customer tag: ${excludedTagList.find((t) => tagResult.tags.includes(t))}`
-    : null;
-  const tagCheckWarning = tagResult.warning ?? null;
+  const bal = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop, customerId } },
+  });
 
-  const bal = await db.customerPointsBalance
-    .findUnique({ where: { shop_customerId: { shop, customerId } } })
-    .catch(() => null);
+  const now = new Date();
+  const lastActivityAt = bal?.lastActivityAt ?? null;
 
-  const balance = bal?.balance ?? 0;
-  const lifetimeEarned = bal?.lifetimeEarned ?? 0;
-  const lifetimeRedeemed = bal?.lifetimeRedeemed ?? 0;
-
-  const lastActivityAt = bal?.lastActivityAt ? bal.lastActivityAt.toISOString() : null;
+  // Estimated expiry = last activity + 365 days (per FR-2.3); adjust if you later make this configurable.
   const estimatedExpiryAt =
-    bal?.lastActivityAt ? addMonths(new Date(bal.lastActivityAt), expiryMonths).toISOString() : null;
+    lastActivityAt ? new Date(lastActivityAt.getTime() + 365 * 86400000) : null;
+
+  // Active redemption (if any)
+  const activeRedemption = await db.redemption.findFirst({
+    where: {
+      shop,
+      customerId,
+      status: { in: ["ISSUED", "APPLIED"] } as any,
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+    },
+    orderBy: { createdAt: "desc" },
+    select: { code: true, value: true, points: true, status: true, expiresAt: true, issuedAt: true },
+  });
 
   return data({
     ok: true,
     shop,
     customerId,
-    customerExcluded,
-    customerExcludedReason,
-    tagCheckWarning,
-
-    balance,
-    lifetimeEarned,
-    lifetimeRedeemed,
-    lastActivityAt,
-    estimatedExpiryAt,
-
-    redemptionMinOrder: Number(settings.redemptionMinOrder ?? 0) || 0,
-    redemptionSteps: settings.redemptionSteps,
-    redemptionValueMap: settings.redemptionValueMap,
-    expiryMonths,
+    points: {
+      balance: bal?.balance ?? 0,
+      lifetimeEarned: bal?.lifetimeEarned ?? 0,
+      lifetimeRedeemed: bal?.lifetimeRedeemed ?? 0,
+      lastActivityAt,
+      estimatedExpiryAt,
+      expiredAt: bal?.expiredAt ?? null,
+    },
+    activeRedemption,
+    // Minimal merchant-config surface for dashboard UI
+    settings: {
+      earnRate: settings.earnRate,
+      redemptionMinOrderCad: settings.redemptionMinOrderCad,
+      codeExpiryDays: settings.codeExpiryDays,
+    },
   });
 };
