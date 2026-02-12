@@ -1,280 +1,300 @@
-// app/routes/loyalty.tsx
-// DROP-IN REPLACEMENT: only the changed parts are included here as a full file.
-// (This is the full file content; paste over existing.)
-
-import crypto from "node:crypto";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { data, Form, useActionData, useLoaderData, useNavigation } from "react-router";
+import {
+  json,
+  LoaderFunctionArgs,
+  ActionFunctionArgs,
+} from "@shopify/shopify-app-react-router/server";
 import db from "../db.server";
-import { getShopSettings, parseRedemptionSteps } from "../lib/shopSettings.server";
+import { authenticate } from "../shopify.server";
+import { getShopSettings, V1_REDEMPTION_STEPS, V1_REDEMPTION_VALUE_MAP } from "../lib/shopSettings.server";
 
-// ... keep the rest of your existing imports/components exactly as-is ...
+type LedgerRow = {
+  id: string;
+  type: string;
+  delta: number;
+  description: string | null;
+  createdAt: string;
+};
 
-// IMPORTANT: Everything above this point should remain identical to your current file,
-// except for the action() changes below.
-//
-// If you have local modifications already, keep them — just ensure the changes shown
-// in the action() are applied verbatim.
+function toInt(n: any, fallback = 0): number {
+  const x = Math.floor(Number(n));
+  return Number.isFinite(x) ? x : fallback;
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function centsToMoney(cents: number): string {
+  const v = (cents / 100).toFixed(2);
+  return `$${v}`;
+}
+
+function makeCode(): string {
+  // Short, readable, low-collision
+  const part = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `LCR-${part}`;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  // (UNCHANGED) keep your existing loader implementation
-  // ---- START existing loader ----
-  const url = new URL(request.url);
-  const shop = url.searchParams.get("shop");
-  const customerId = url.searchParams.get("logged_in_customer_id");
+  const { admin, session, appProxy } = await authenticate.public.appProxy(request);
 
-  if (!shop || !customerId) {
-    return data({ ok: false, error: "Missing shop or customer_id" }, { status: 400 });
-  }
+  const shop = session.shop;
+  const customerId = appProxy.customerId ? String(appProxy.customerId) : null;
 
   const settings = await getShopSettings(shop);
+
+  if (!customerId) {
+    return json({
+      ok: true,
+      mode: "app_proxy",
+      customerId: null,
+      settings,
+      balance: null,
+      ledger: [],
+      redemptionActive: null,
+      message: "Not logged in.",
+    });
+  }
 
   const balance = await db.customerPointsBalance.findUnique({
     where: { shop_customerId: { shop, customerId } },
   });
 
-  const steps = parseRedemptionSteps(settings.redemptionStepsJson);
+  const ledgerRaw = await db.pointsLedger.findMany({
+    where: { shop, customerId },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+    select: {
+      id: true,
+      type: true,
+      delta: true,
+      description: true,
+      createdAt: true,
+    },
+  });
 
-  const latestRedemption = await db.redemption.findFirst({
+  const ledger: LedgerRow[] = ledgerRaw.map((r) => ({
+    ...r,
+    createdAt: r.createdAt.toISOString(),
+  }));
+
+  const redemptionActive = await db.redemption.findFirst({
     where: {
       shop,
       customerId,
-      status: { in: ["ISSUED", "APPLIED"] } as any,
-      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+      status: { in: ["ISSUED", "APPLIED"] },
+      expiresAt: { gt: new Date() },
     },
     orderBy: { createdAt: "desc" },
-    select: { code: true, value: true, points: true, status: true, expiresAt: true },
   });
 
-  return data({
+  return json({
     ok: true,
-    shop,
+    mode: "app_proxy",
     customerId,
     settings,
     balance,
-    steps,
-    latestRedemption,
+    ledger,
+    redemptionActive,
   });
-  // ---- END existing loader ----
 };
 
-async function getOfflineAccessToken(shop: string) {
-  const session = await db.session.findFirst({
-    where: { shop, isOnline: false },
-    orderBy: { createdAt: "desc" },
-    select: { accessToken: true },
-  });
-  if (!session?.accessToken) throw new Error(`No offline token for ${shop}`);
-  return session.accessToken;
-}
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { admin, session, appProxy } = await authenticate.public.appProxy(request);
 
-async function shopifyGraphql<T>(shop: string, query: string, variables: Record<string, any>) {
-  const token = await getOfflineAccessToken(shop);
-  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
+  const shop = session.shop;
+  const customerId = appProxy.customerId ? String(appProxy.customerId) : null;
+  const customerGid = appProxy.customerId ? `gid://shopify/Customer/${appProxy.customerId}` : null;
 
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = (await resp.json()) as any;
-  if (!resp.ok || json?.errors) {
-    throw new Error(json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}`);
+  if (!customerId || !customerGid) {
+    return json({ ok: false, error: "Not authenticated." }, { status: 401 });
   }
-  return json.data as T;
-}
 
-async function createShopifyDiscountCode(params: {
-  shop: string;
-  title: string;
-  code: string;
-  valueCad: number;
-  minimumSubtotalCad: number;
-  startsAt: Date;
-  endsAt: Date | null;
-}) {
-  const { shop, title, code, valueCad, minimumSubtotalCad, startsAt, endsAt } = params;
+  const settings = await getShopSettings(shop);
 
-  const mutation = `
-    mutation CreateDiscount($basic: DiscountCodeBasicInput!) {
-      discountCodeBasicCreate(basicCodeDiscount: $basic) {
+  const body = await request.formData();
+  const pointsRequested = toInt(body.get("points"), 0);
+
+  if (!pointsRequested) {
+    return json({ ok: false, error: "Missing points." }, { status: 400 });
+  }
+
+  // v1 hard lock: only allow 500 or 1000
+  if (!V1_REDEMPTION_STEPS.includes(pointsRequested as any)) {
+    return json(
+      { ok: false, error: `Invalid redemption amount. Allowed: ${V1_REDEMPTION_STEPS.join(", ")}.` },
+      { status: 400 },
+    );
+  }
+
+  const dollars = V1_REDEMPTION_VALUE_MAP[String(pointsRequested)] ?? 0;
+  const valueCents = dollars * 100;
+
+  // idempotency (per customer + points): if a live code exists, return it
+  const active = await db.redemption.findFirst({
+    where: {
+      shop,
+      customerId,
+      status: { in: ["ISSUED", "APPLIED"] },
+      expiresAt: { gt: new Date() },
+      valueCents,
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (active) {
+    return json({
+      ok: true,
+      alreadyIssued: true,
+      code: active.code,
+      expiresAt: active.expiresAt.toISOString(),
+      redemptionId: active.id,
+      valueCents: active.valueCents,
+      minimumSubtotalCents: active.minimumSubtotalCents,
+    });
+  }
+
+  // balance check
+  const balance = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop, customerId } },
+  });
+
+  const currentPoints = balance?.pointsBalance ?? 0;
+  if (currentPoints < pointsRequested) {
+    return json(
+      { ok: false, error: `Insufficient points. You have ${currentPoints}, need ${pointsRequested}.` },
+      { status: 400 },
+    );
+  }
+
+  const minOrderCents = Math.max(0, settings.redemptionMinOrder * 100);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000);
+  const code = makeCode();
+  const idemKey = `${customerId}:${valueCents}:${expiresAt.toISOString().slice(0, 13)}`; // hourly window
+
+  // Prevent duplicate discount creation
+  const idemExisting = await db.redemption.findUnique({
+    where: { shop_idemKey: { shop, idemKey } },
+  });
+
+  if (idemExisting) {
+    return json({
+      ok: true,
+      alreadyIssued: true,
+      code: idemExisting.code,
+      expiresAt: idemExisting.expiresAt.toISOString(),
+      redemptionId: idemExisting.id,
+      valueCents: idemExisting.valueCents,
+      minimumSubtotalCents: idemExisting.minimumSubtotalCents,
+    });
+  }
+
+  // Create discount code in Shopify (Admin GraphQL)
+  const mutation = `#graphql
+    mutation CreateDiscount($basicCodeDiscount: DiscountCodeBasicInput!) {
+      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
         codeDiscountNode { id }
         userErrors { field message }
       }
     }
   `;
 
-  const basic = {
-    title,
-    code,
-    startsAt: startsAt.toISOString(),
-    endsAt: endsAt ? endsAt.toISOString() : null,
-    customerSelection: { all: true },
-    customerGets: {
-      value: { discountAmount: { amount: String(valueCad), appliesOnEachItem: false } },
-      items: { all: true },
+  const variables = {
+    basicCodeDiscount: {
+      title: `LCR Redemption ${code}`,
+      code,
+      startsAt: now.toISOString(),
+      endsAt: expiresAt.toISOString(),
+      usageLimit: 1,
+      appliesOncePerCustomer: true,
+      customerSelection: { customers: { add: [customerGid] } },
+      minimumRequirement: minOrderCents
+        ? { subtotal: { greaterThanOrEqualToSubtotal: centsToMoney(minOrderCents) } }
+        : null,
+      customerGets: {
+        value: { fixedAmount: { amount: centsToMoney(valueCents), appliesOnEachItem: false } },
+        items: { all: true },
+      },
     },
-    minimumRequirement: {
-      subtotal: { greaterThanOrEqualToSubtotal: String(minimumSubtotalCad) },
-    },
-    usageLimit: 1,
-    appliesOncePerCustomer: true,
-    combinesWith: { orderDiscounts: true, productDiscounts: true, shippingDiscounts: true },
   };
 
-  type Resp = {
-    discountCodeBasicCreate: {
-      codeDiscountNode: { id: string } | null;
-      userErrors: Array<{ field: string[] | null; message: string }>;
-    };
-  };
+  const gqlResp = await admin.graphql(mutation, { variables });
+  const gqlJson = await gqlResp.json();
 
-  const res = await shopifyGraphql<Resp>(shop, mutation, { basic });
-  const errors = res.discountCodeBasicCreate.userErrors ?? [];
-  if (errors.length) {
-    throw new Error(errors.map((e) => e.message).join("; "));
-  }
-  const nodeId = res.discountCodeBasicCreate.codeDiscountNode?.id;
-  if (!nodeId) throw new Error("discountCodeBasicCreate returned no node id");
-  return { nodeId, code };
-}
-
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const form = await request.formData();
-  const intent = String(form.get("_intent") ?? "");
-
-  // (UNCHANGED) you might have other intents; keep them.
-  if (intent !== "redeem") {
-    return data({ ok: false, error: "Unsupported action" }, { status: 400 });
+  const userErrors = gqlJson?.data?.discountCodeBasicCreate?.userErrors ?? [];
+  if (Array.isArray(userErrors) && userErrors.length) {
+    return json(
+      { ok: false, error: userErrors.map((e: any) => e.message).join("; ") },
+      { status: 400 },
+    );
   }
 
-  const shop = String(form.get("shop") ?? "");
-  const customerId = String(form.get("customerId") ?? "");
-  const stepKey = String(form.get("stepKey") ?? "");
-  const idemKey = String(form.get("idemKey") ?? "");
-
-  if (!shop || !customerId || !stepKey || !idemKey) {
-    return data({ ok: false, error: "Missing required fields" }, { status: 400 });
+  const discountNodeId = gqlJson?.data?.discountCodeBasicCreate?.codeDiscountNode?.id;
+  if (!discountNodeId) {
+    return json({ ok: false, error: "Failed to create discount." }, { status: 500 });
   }
 
-  const settings = await getShopSettings(shop);
-  const steps = parseRedemptionSteps(settings.redemptionStepsJson);
-  const step = steps.find((s) => s.key === stepKey);
-
-  if (!step) return data({ ok: false, error: "Invalid redemption step" }, { status: 400 });
-
-  // Idempotency: Redemption is unique on (idemKey)
-  const existing = await db.redemption.findFirst({
-    where: { shop, customerId, idemKey },
-    select: { code: true, value: true, points: true, status: true, expiresAt: true },
-  });
-  if (existing) return data({ ok: true, redemption: existing });
-
-  const bal = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
-
-  const currentBalance = bal?.balance ?? 0;
-  if (currentBalance < step.pointsCost) {
-    return data({ ok: false, error: "Not enough points to redeem this reward." }, { status: 400 });
-  }
-
-  // Generate code + create Shopify discount
-  const code = `LC-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
-  const now = new Date();
-  const expiresAt = settings.codeExpiryDays ? new Date(now.getTime() + settings.codeExpiryDays * 86400000) : null;
-
-  const title = `Lions Creek Rewards (${step.valueCad} off)`;
-  const created = await createShopifyDiscountCode({
-    shop,
-    title,
-    code,
-    valueCad: step.valueCad,
-    minimumSubtotalCad: settings.redemptionMinOrderCad ?? 0,
-    startsAt: now,
-    endsAt: expiresAt,
-  });
-
-  // Persist redemption + ledger + balance update (schema-consistent!)
-  await db.$transaction(async (tx) => {
-    // Deduct points using ledger (source/sourceId required)
-    await tx.pointsLedger.create({
+  // Commit redemption + ledger + balance update
+  const result = await db.$transaction(async (tx) => {
+    const redemption = await tx.redemption.create({
       data: {
         shop,
         customerId,
-        type: "REDEEM" as any,
-        delta: -step.pointsCost,
-        source: "REDEMPTION",
-        sourceId: idemKey,
-        description: `Redeemed ${step.pointsCost} points for $${step.valueCad} off (${code}).`,
-      },
-    });
-
-    // Update balance
-    await tx.customerPointsBalance.upsert({
-      where: { shop_customerId: { shop, customerId } },
-      create: {
-        shop,
-        customerId,
-        balance: Math.max(0, currentBalance - step.pointsCost),
-        lifetimeEarned: 0,
-        lifetimeRedeemed: step.pointsCost,
-        lastActivityAt: now,
-        expiredAt: null,
-      },
-      update: {
-        balance: Math.max(0, currentBalance - step.pointsCost),
-        lifetimeRedeemed: { increment: step.pointsCost },
-        lastActivityAt: now,
-      },
-    });
-
-    // Create redemption record (idemKey / discountNodeId)
-    await tx.redemption.create({
-      data: {
-        shop,
-        customerId,
-        points: step.pointsCost,
-        value: step.valueCad,
         code,
-        discountNodeId: created.nodeId,
-        status: "ISSUED" as any,
+        discountNodeId,
+        valueCents,
+        minimumSubtotalCents: minOrderCents,
+        status: "ISSUED",
         issuedAt: now,
         expiresAt,
         idemKey,
       },
     });
+
+    await tx.pointsLedger.create({
+      data: {
+        shop,
+        customerId,
+        type: "REDEEM",
+        delta: -pointsRequested,
+        source: "REDEMPTION",
+        sourceId: redemption.id,
+        description: `Redeemed ${pointsRequested} points for ${centsToMoney(valueCents)} code ${code}`,
+      },
+    });
+
+    const updated = await tx.customerPointsBalance.update({
+      where: { shop_customerId: { shop, customerId } },
+      data: {
+        pointsBalance: { decrement: pointsRequested },
+        pointsLifetimeRedeemed: { increment: pointsRequested },
+        pointsLastActivityAt: new Date(),
+      },
+    });
+
+    // guard against negatives (shouldn’t happen due to earlier check)
+    if (updated.pointsBalance < 0) {
+      await tx.customerPointsBalance.update({
+        where: { shop_customerId: { shop, customerId } },
+        data: { pointsBalance: 0 },
+      });
+    }
+
+    return redemption;
   });
 
-  const redemption = await db.redemption.findFirst({
-    where: { shop, customerId, idemKey },
-    select: { code: true, value: true, points: true, status: true, expiresAt: true },
+  return json({
+    ok: true,
+    code: result.code,
+    expiresAt: result.expiresAt.toISOString(),
+    redemptionId: result.id,
+    valueCents: result.valueCents,
+    minimumSubtotalCents: result.minimumSubtotalCents,
   });
-
-  return data({ ok: true, redemption });
 };
 
-// (UNCHANGED) keep the rest of your existing React component UI as-is.
-// Ensure your redeem form still posts: _intent=redeem, shop, customerId, stepKey, idemKey.
-export default function Loyalty() {
-  // keep your existing component
-  const ld: any = useLoaderData();
-  const ad: any = useActionData();
-  const nav = useNavigation();
-
-  // ... unchanged UI rendering ...
-  return (
-    <div style={{ padding: 16 }}>
-      <h2>Lions Creek Rewards</h2>
-      <p>Keep your existing UI here. (This file replacement focuses on server congruency.)</p>
-      <pre style={{ background: "#f6f6f6", padding: 12, overflow: "auto" }}>
-        {JSON.stringify({ loader: ld, action: ad, state: nav.state }, null, 2)}
-      </pre>
-    </div>
-  );
+export default function LoyaltyRoute() {
+  // App proxy routes typically render via Liquid/Storefront. No embedded UI here.
+  return null;
 }

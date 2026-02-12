@@ -1,35 +1,41 @@
-# shopify.app.toml
-
-client_id = "REDACTED"
+client_id = "018d1d4d00f8544b759266b72d17c00e"
 name = "Lions Creek Rewards"
-application_url = "https://app.lionscreekrewards.ca"
+application_url = "https://loyalty.basketbooster.ca"
 embedded = true
-handle = "lions-creek-rewards"
 
 [build]
-dev_store_url = "lions-creek-olive-estates.myshopify.com"
-automatically_update_urls_on_dev = true
-include_config_on_deploy = true
+automatically_update_urls_on_dev = false
+dev_store_url = "lions-creek-dev-3.myshopify.com"
 
 [access_scopes]
-scopes = "read_customers,read_orders,write_discounts"
+# Keep your existing scopes. (Protected customer data approval is still required — see section 6 notes.)
+scopes = "read_orders,read_customers,write_customers,read_products,write_discounts"
+optional_scopes = []
+use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://app.lionscreekrewards.ca/auth/callback",
-  "https://app.lionscreekrewards.ca/auth/shopify/callback",
-  "https://app.lionscreekrewards.ca/api/auth/callback"
+  "https://loyalty.basketbooster.ca/auth/callback",
+  "https://loyalty.basketbooster.ca/auth/shopify/callback"
 ]
 
 [webhooks]
 api_version = "2026-01"
 
-# Core loyalty automation
+# App-specific webhooks (Shopify CLI will register these on deploy)
 [[webhooks.subscriptions]]
-topics = ["orders/paid", "refunds/create", "orders/cancelled", "app/uninstalled"]
+topics = ["orders/paid", "orders/cancelled", "refunds/create"]
 uri = "/webhooks"
 
-# Compliance
+# Mandatory compliance topics (route handles these too)
 [[webhooks.subscriptions]]
-compliance_topics = ["customers/redact", "customers/data_request", "shop/redact"]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
 uri = "/webhooks"
+
+# ✅ Required by current Shopify CLI validation for discount UI/function configuration metafields
+# Mirrors Shopify’s documented structure (type=json) for the $app/function-configuration metafield.
+[discount.metafields.app.function-configuration]
+type = "json"
+name = "Function configuration"
+access.admin = "merchant_read_write"
+access.storefront = "none"

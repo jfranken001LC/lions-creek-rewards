@@ -1,0 +1,13 @@
+name = "LCR Loyalty Dashboard"
+type = "ui_extension"
+api_version = "2026-01"
+
+[[extensions.targeting]]
+target = "customer-account.page.render"
+module = "./src/index.tsx"
+
+[extensions.capabilities]
+network_access = true
+
+[settings]
+# If you later want to parameterize backend URL, add a setting here.

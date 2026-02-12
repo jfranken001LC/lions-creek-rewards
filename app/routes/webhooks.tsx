@@ -1,606 +1,659 @@
-// app/routes/webhooks.tsx
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import { ActionFunctionArgs } from "@shopify/shopify-app-react-router/server";
+import { LedgerType, WebhookEventOutcome } from "@prisma/client";
 import db from "../db.server";
+import { authenticate } from "../shopify.server";
 import { getShopSettings } from "../lib/shopSettings.server";
-import { Prisma, WebhookOutcome } from "@prisma/client";
 
 /**
- * Notes:
- * - Uses authenticate.webhook() for HMAC + payload parsing.
- * - Writes WebhookEvent + WebhookError per FR-6.1/6.2.
- * - Applies points using PointsLedger(source, sourceId) uniqueness constraints.
+ * Lions Creek Rewards — Webhook Receiver
+ *
+ * Handles (FR-4.7):
+ * - orders/paid         => award points
+ * - refunds/create      => proportional reversal (clamped; supports multiple refunds)
+ * - orders/cancelled    => reverse remaining points
+ * - compliance topics   => customers/data_request, customers/redact, shop/redact
+ *
+ * Dedupe:
+ * - WebhookEvent.webhookId unique
+ * - PointsLedger unique indexes (ledger_dedupe, ledger_refund_dedupe)
  */
 
-export const loader = async (_args: LoaderFunctionArgs) => {
-  return new Response("ok", { status: 200 });
-};
+function normalizeShopFromDest(dest: string): string {
+  return String(dest || "").replace(/^https?:\/\//i, "").trim();
+}
 
-function normalizeTopic(raw: unknown): string {
-  const s = String(raw ?? "").trim();
-  const lower = s.toLowerCase();
-  if (lower.includes("/")) return lower;
+function normalizeTopic(topic: string): string {
+  const t = String(topic || "").trim();
+  if (!t) return t;
+  // If already app-specific format:
+  if (t.includes("/")) return t.toLowerCase();
+  // Convert ORDERS_PAID -> orders/paid
+  return t.toLowerCase().replace(/_/g, "/");
+}
 
-  // Shopify libs sometimes surface topics as "ORDERS_PAID"
-  if (lower.includes("_")) {
-    const [a, ...rest] = lower.split("_");
-    return `${a}/${rest.join("_")}`;
+function toGid(kind: "Product" | "Customer", id: string | number): string {
+  const n = String(id ?? "").trim();
+  if (n.startsWith("gid://")) return n;
+  return `gid://shopify/${kind}/${n}`;
+}
+
+function parseCustomerIdFromPayload(payload: any): string | null {
+  const raw =
+    payload?.customer?.id ??
+    payload?.order?.customer?.id ??
+    payload?.customer_id ??
+    payload?.customerId ??
+    null;
+
+  if (!raw) return null;
+
+  const s = String(raw);
+  const m = s.match(/Customer\/(\d+)$/);
+  if (m) return m[1];
+  if (/^\d+$/.test(s)) return s;
+
+  // last resort: if it's a gid but not matching, keep as-is
+  return s;
+}
+
+function parseOrderId(payload: any): string | null {
+  const raw = payload?.id ?? payload?.order_id ?? payload?.order?.id ?? null;
+  if (raw == null) return null;
+  const s = String(raw);
+  const m = s.match(/Order\/(\d+)$/);
+  if (m) return m[1];
+  return /^\d+$/.test(s) ? s : s;
+}
+
+function parseRefundId(payload: any): string | null {
+  const raw = payload?.id ?? payload?.refund?.id ?? null;
+  if (raw == null) return null;
+  const s = String(raw);
+  const m = s.match(/Refund\/(\d+)$/);
+  if (m) return m[1];
+  return /^\d+$/.test(s) ? s : s;
+}
+
+function toNumber(x: any): number {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function fetchProductTagsMap(admin: any, productNumericIds: Array<string | number>) {
+  const ids = productNumericIds
+    .map((id) => String(id))
+    .filter((id) => /^\d+$/.test(id))
+    .map((id) => toGid("Product", id));
+
+  const map = new Map<string, string[]>();
+  if (!ids.length) return map;
+
+  const query = `#graphql
+    query ProductTags($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Product { id tags }
+      }
+    }`;
+
+  const resp = await admin.graphql(query, { variables: { ids } });
+  const json = await resp.json();
+
+  const nodes = json?.data?.nodes ?? [];
+  for (const node of nodes) {
+    if (node?.id && Array.isArray(node?.tags)) {
+      const m = String(node.id).match(/Product\/(\d+)$/);
+      if (m) map.set(m[1], node.tags.map((t: any) => String(t)));
+    }
   }
-
-  return lower;
+  return map;
 }
 
-function moneyToCents(amount: unknown): number {
-  const n = Number(amount);
-  if (!Number.isFinite(n)) return 0;
-  return Math.round(n * 100);
-}
-
-function clampInt(n: number): number {
-  if (!Number.isFinite(n)) return 0;
-  return Math.trunc(n);
-}
-
-function isEligibleByTags(
+function isLineEligibleByTags(
   productTags: string[],
   includeTags: string[],
   excludeTags: string[],
 ): boolean {
-  const tags = new Set(productTags.map((t) => t.trim().toLowerCase()).filter(Boolean));
-  const excludes = excludeTags.map((t) => t.trim().toLowerCase()).filter(Boolean);
+  const tagsLower = new Set(productTags.map((t) => t.toLowerCase()));
+  const excludes = excludeTags.map((t) => t.toLowerCase()).filter(Boolean);
   for (const ex of excludes) {
-    if (tags.has(ex)) return false;
+    if (tagsLower.has(ex)) return false;
   }
-
-  const includes = includeTags.map((t) => t.trim().toLowerCase()).filter(Boolean);
-  if (includes.length === 0) return true;
-  return includes.some((inc) => tags.has(inc));
+  const includes = includeTags.map((t) => t.toLowerCase()).filter(Boolean);
+  if (!includes.length) return true; // no include filter => eligible (unless excluded)
+  return includes.some((inc) => tagsLower.has(inc));
 }
 
-async function getOfflineAccessToken(shop: string): Promise<string> {
-  const s = await db.session.findFirst({
-    where: { shop, isOnline: false },
-    orderBy: { createdAt: "desc" },
-    select: { accessToken: true },
-  });
+function computeEligibleNetMerchandiseFromOrder(
+  payload: any,
+  productTagsMap: Map<string, string[]>,
+  includeProductTags: string[],
+  excludeProductTags: string[],
+): number {
+  const lines = Array.isArray(payload?.line_items) ? payload.line_items : [];
+  let eligible = 0;
 
-  if (!s?.accessToken) {
-    throw new Error(`No offline access token found for shop ${shop}`);
-  }
-  return s.accessToken;
-}
+  for (const li of lines) {
+    if (li?.gift_card === true) continue;
 
-async function shopifyGraphql<T>(
-  shop: string,
-  query: string,
-  variables: Record<string, any>,
-): Promise<T> {
-  const token = await getOfflineAccessToken(shop);
-  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
+    const qty = Math.max(0, Math.floor(toNumber(li?.quantity)));
+    const price = toNumber(li?.price);
+    const totalDiscount = toNumber(li?.total_discount);
+    const lineNet = Math.max(0, price * qty - totalDiscount);
 
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = (await resp.json()) as any;
-  if (!resp.ok || json?.errors) {
-    const msg = json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}`;
-    throw new Error(`GraphQL failed: ${msg}`);
-  }
-  return json.data as T;
-}
-
-async function upsertWebhookReceived(shop: string, webhookId: string, topic: string, resourceId: string) {
-  try {
-    await db.webhookEvent.create({
-      data: {
-        shop,
-        webhookId,
-        topic,
-        resourceId,
-        outcome: WebhookOutcome.RECEIVED,
-        outcomeCode: null,
-        outcomeMessage: null,
-      },
-    });
-    return { isDuplicate: false };
-  } catch (e: any) {
-    // Duplicate delivery
-    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-      await db.webhookEvent.update({
-        where: { shop_webhookId: { shop, webhookId } },
-        data: {
-          outcome: WebhookOutcome.SKIPPED,
-          outcomeCode: "DUPLICATE",
-          outcomeMessage: "Duplicate webhook delivery (shop_webhookId unique).",
-          processedAt: new Date(),
-        },
-      });
-      return { isDuplicate: true };
+    const productId = li?.product_id != null ? String(li.product_id) : null;
+    if (productId && productTagsMap.size) {
+      const tags = productTagsMap.get(productId) ?? [];
+      if (!isLineEligibleByTags(tags, includeProductTags, excludeProductTags)) continue;
     }
-    throw e;
+
+    eligible += lineNet;
   }
+
+  return Math.max(0, eligible);
 }
 
-async function markWebhookProcessed(shop: string, webhookId: string, outcome: WebhookOutcome, code: string | null, message: string | null) {
-  await db.webhookEvent.update({
-    where: { shop_webhookId: { shop, webhookId } },
-    data: {
-      outcome,
-      outcomeCode: code,
-      outcomeMessage: message,
-      processedAt: new Date(),
+function computeEligibleRefundNet(
+  refundPayload: any,
+  productTagsMap: Map<string, string[]>,
+  includeProductTags: string[],
+  excludeProductTags: string[],
+): number {
+  const items = Array.isArray(refundPayload?.refund_line_items)
+    ? refundPayload.refund_line_items
+    : [];
+
+  let eligible = 0;
+
+  for (const rli of items) {
+    const li = rli?.line_item ?? null;
+
+    // Prefer line_item.product_id for tag checks
+    const productId =
+      li?.product_id != null ? String(li.product_id) : rli?.product_id != null ? String(rli.product_id) : null;
+
+    if (productId && productTagsMap.size) {
+      const tags = productTagsMap.get(productId) ?? [];
+      if (!isLineEligibleByTags(tags, includeProductTags, excludeProductTags)) continue;
+    }
+
+    // Subtotal is the net refunded amount for that line (pre-tax/shipping)
+    const subtotal =
+      rli?.subtotal != null ? toNumber(rli.subtotal) : rli?.subtotal_set?.shop_money?.amount != null ? toNumber(rli.subtotal_set.shop_money.amount) : 0;
+
+    eligible += Math.max(0, subtotal);
+  }
+
+  return Math.max(0, eligible);
+}
+
+async function applyLedgerDelta(params: {
+  shop: string;
+  customerId: string;
+  type: LedgerType;
+  delta: number; // + for earn, - for redeem/reversal/expiry
+  source: string;
+  sourceId: string;
+  description: string;
+  now?: Date;
+}) {
+  const { shop, customerId, type, delta, source, sourceId, description } = params;
+  const now = params.now ?? new Date();
+
+  // Upsert balance row
+  const bal = await db.customerPointsBalance.upsert({
+    where: { shop_customerId: { shop, customerId } },
+    create: {
+      shop,
+      customerId,
+      pointsBalance: Math.max(0, delta),
+      pointsLifetimeEarned: delta > 0 && type === LedgerType.EARN ? delta : 0,
+      pointsLifetimeRedeemed: delta < 0 && type === LedgerType.REDEEM ? Math.abs(delta) : 0,
+      pointsLastActivityAt: now,
+    },
+    update: {
+      pointsBalance: { increment: delta },
+      pointsLifetimeEarned:
+        delta > 0 && type === LedgerType.EARN ? { increment: delta } : undefined,
+      pointsLifetimeRedeemed:
+        delta < 0 && type === LedgerType.REDEEM ? { increment: Math.abs(delta) } : undefined,
+      pointsLastActivityAt: now,
     },
   });
-}
 
-async function logWebhookError(shop: string, topic: string, webhookId: string, payload: any, err: unknown) {
-  const message =
-    err instanceof Error ? `${err.name}: ${err.message}` : typeof err === "string" ? err : JSON.stringify(err);
+  // Clamp negative balances back to zero (never allow negative customer balances)
+  if (bal.pointsBalance < 0) {
+    await db.customerPointsBalance.update({
+      where: { shop_customerId: { shop, customerId } },
+      data: { pointsBalance: 0 },
+    });
+  }
 
-  await db.webhookError.create({
+  // Insert ledger (unique indexes enforce idempotency across same source/sourceId)
+  await db.pointsLedger.create({
     data: {
       shop,
-      topic,
-      webhookId,
-      error: message,
-      payloadJson: JSON.stringify(payload ?? {}),
+      customerId,
+      type,
+      delta,
+      source,
+      sourceId,
+      description,
+      createdAt: now,
     },
   });
+}
+
+async function handleOrdersPaid(ctx: {
+  shop: string;
+  admin: any;
+  payload: any;
+}) {
+  const { shop, admin, payload } = ctx;
+
+  const orderId = parseOrderId(payload);
+  const orderName = payload?.name ? String(payload.name) : orderId ? `#${orderId}` : "(order)";
+  const customerId = parseCustomerIdFromPayload(payload);
+
+  if (!orderId || !customerId) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "missing_ids", message: "Missing orderId or customerId." };
+  }
+
+  const settings = await getShopSettings(shop);
+
+  const productIds = (Array.isArray(payload?.line_items) ? payload.line_items : [])
+    .map((li: any) => li?.product_id)
+    .filter((id: any) => id != null);
+
+  const tagsMap = await fetchProductTagsMap(admin, productIds);
+
+  const eligibleNet = computeEligibleNetMerchandiseFromOrder(
+    payload,
+    tagsMap,
+    settings.includeProductTags,
+    settings.excludeProductTags,
+  );
+
+  const eligibleDollars = Math.floor(eligibleNet);
+  const pointsAwarded = Math.max(0, eligibleDollars * settings.earnRate);
+
+  // Snapshot always created/updated (idempotent by unique shop+orderId)
+  const snapshotExisting = await db.orderPointsSnapshot.findUnique({
+    where: { shop_orderId: { shop, orderId } },
+  });
+
+  if (snapshotExisting && snapshotExisting.pointsAwarded > 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "already_awarded", message: `Order ${orderName} already awarded.` };
+  }
+
+  await db.$transaction(async (tx) => {
+    await tx.orderPointsSnapshot.upsert({
+      where: { shop_orderId: { shop, orderId } },
+      create: {
+        shop,
+        orderId,
+        orderName,
+        customerId,
+        eligibleNetMerchandise: eligibleNet,
+        pointsAwarded,
+        pointsReversedToDate: 0,
+        discountCodesJson: Array.isArray(payload?.discount_codes)
+          ? JSON.stringify(payload.discount_codes)
+          : payload?.discount_codes
+            ? JSON.stringify(payload.discount_codes)
+            : null,
+      },
+      update: {
+        orderName,
+        customerId,
+        eligibleNetMerchandise: eligibleNet,
+        pointsAwarded,
+      },
+    });
+
+    if (pointsAwarded > 0) {
+      // Use unique ledger_dedupe: (shop, customerId, type, source, sourceId)
+      await tx.pointsLedger.create({
+        data: {
+          shop,
+          customerId,
+          type: LedgerType.EARN,
+          delta: pointsAwarded,
+          source: "ORDER",
+          sourceId: orderId,
+          description: `Earned ${pointsAwarded} points on order ${orderName}`,
+        },
+      });
+
+      await tx.customerPointsBalance.upsert({
+        where: { shop_customerId: { shop, customerId } },
+        create: {
+          shop,
+          customerId,
+          pointsBalance: pointsAwarded,
+          pointsLifetimeEarned: pointsAwarded,
+          pointsLifetimeRedeemed: 0,
+          pointsLastActivityAt: new Date(),
+        },
+        update: {
+          pointsBalance: { increment: pointsAwarded },
+          pointsLifetimeEarned: { increment: pointsAwarded },
+          pointsLastActivityAt: new Date(),
+        },
+      });
+    }
+  });
+
+  return { outcome: WebhookEventOutcome.PROCESSED, code: "ok", message: `Awarded ${pointsAwarded} on ${orderName}.` };
+}
+
+async function handleRefundsCreate(ctx: {
+  shop: string;
+  admin: any;
+  payload: any;
+}) {
+  const { shop, admin } = ctx;
+
+  // refunds/create payload is typically a Refund object
+  const refund = ctx.payload?.refund ?? ctx.payload;
+  const refundId = parseRefundId(refund);
+  const orderId = parseOrderId(refund);
+
+  if (!refundId || !orderId) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "missing_ids", message: "Missing refundId or orderId." };
+  }
+
+  const snapshot = await db.orderPointsSnapshot.findUnique({
+    where: { shop_orderId: { shop, orderId } },
+  });
+
+  if (!snapshot || snapshot.pointsAwarded <= 0 || snapshot.eligibleNetMerchandise <= 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "no_snapshot", message: `No snapshot/points for order ${orderId}.` };
+  }
+
+  const customerId = snapshot.customerId;
+
+  const settings = await getShopSettings(shop);
+
+  const productIds = (Array.isArray(refund?.refund_line_items) ? refund.refund_line_items : [])
+    .map((rli: any) => rli?.line_item?.product_id ?? rli?.product_id)
+    .filter((id: any) => id != null);
+
+  const tagsMap = await fetchProductTagsMap(admin, productIds);
+
+  const refundedEligibleNet = computeEligibleRefundNet(
+    refund,
+    tagsMap,
+    settings.includeProductTags,
+    settings.excludeProductTags,
+  );
+
+  if (refundedEligibleNet <= 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "no_eligible_refund", message: "Refund had no eligible net to reverse." };
+  }
+
+  const remaining = Math.max(0, snapshot.pointsAwarded - snapshot.pointsReversedToDate);
+  if (remaining <= 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "already_reversed", message: "All points already reversed." };
+  }
+
+  // Proportional reversal for this event (clamped)
+  const raw = Math.floor((refundedEligibleNet / snapshot.eligibleNetMerchandise) * snapshot.pointsAwarded);
+  const pointsToReverse = Math.max(0, Math.min(remaining, raw));
+
+  if (pointsToReverse <= 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "rounds_to_zero", message: "Proportional reversal rounded to 0 after clamp." };
+  }
+
+  await db.$transaction(async (tx) => {
+    // ledger_refund_dedupe: (shop, customerId, type, sourceId) => use refundId
+    await tx.pointsLedger.create({
+      data: {
+        shop,
+        customerId,
+        type: LedgerType.REVERSAL,
+        delta: -pointsToReverse,
+        source: "REFUND",
+        sourceId: String(refundId),
+        description: `Reversed ${pointsToReverse} points due to refund on order ${snapshot.orderName ?? orderId}`,
+      },
+    });
+
+    const bal = await tx.customerPointsBalance.findUnique({
+      where: { shop_customerId: { shop, customerId } },
+    });
+
+    const current = bal?.pointsBalance ?? 0;
+    const next = Math.max(0, current - pointsToReverse);
+
+    await tx.customerPointsBalance.upsert({
+      where: { shop_customerId: { shop, customerId } },
+      create: {
+        shop,
+        customerId,
+        pointsBalance: next,
+        pointsLifetimeEarned: 0,
+        pointsLifetimeRedeemed: 0,
+        pointsLastActivityAt: new Date(),
+      },
+      update: {
+        pointsBalance: next,
+        pointsLastActivityAt: new Date(),
+      },
+    });
+
+    await tx.orderPointsSnapshot.update({
+      where: { shop_orderId: { shop, orderId } },
+      data: { pointsReversedToDate: { increment: pointsToReverse } },
+    });
+  });
+
+  return {
+    outcome: WebhookEventOutcome.PROCESSED,
+    code: "ok",
+    message: `Reversed ${pointsToReverse} points (refund ${refundId}, order ${orderId}).`,
+  };
+}
+
+async function handleOrdersCancelled(ctx: { shop: string; payload: any }) {
+  const { shop, payload } = ctx;
+
+  const orderId = parseOrderId(payload);
+  if (!orderId) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "missing_order", message: "Missing orderId." };
+  }
+
+  const snapshot = await db.orderPointsSnapshot.findUnique({
+    where: { shop_orderId: { shop, orderId } },
+  });
+
+  if (!snapshot || snapshot.pointsAwarded <= 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "no_snapshot", message: `No snapshot/points for order ${orderId}.` };
+  }
+
+  const remaining = Math.max(0, snapshot.pointsAwarded - snapshot.pointsReversedToDate);
+  if (remaining <= 0) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "already_reversed", message: "All points already reversed." };
+  }
+
+  await db.$transaction(async (tx) => {
+    await tx.pointsLedger.create({
+      data: {
+        shop,
+        customerId: snapshot.customerId,
+        type: LedgerType.REVERSAL,
+        delta: -remaining,
+        source: "ORDER_CANCEL",
+        sourceId: orderId,
+        description: `Reversed ${remaining} points due to order cancellation (${snapshot.orderName ?? orderId})`,
+      },
+    });
+
+    const bal = await tx.customerPointsBalance.findUnique({
+      where: { shop_customerId: { shop, customerId: snapshot.customerId } },
+    });
+
+    const current = bal?.pointsBalance ?? 0;
+    const next = Math.max(0, current - remaining);
+
+    await tx.customerPointsBalance.upsert({
+      where: { shop_customerId: { shop, customerId: snapshot.customerId } },
+      create: {
+        shop,
+        customerId: snapshot.customerId,
+        pointsBalance: next,
+        pointsLifetimeEarned: 0,
+        pointsLifetimeRedeemed: 0,
+        pointsLastActivityAt: new Date(),
+      },
+      update: {
+        pointsBalance: next,
+        pointsLastActivityAt: new Date(),
+      },
+    });
+
+    await tx.orderPointsSnapshot.update({
+      where: { shop_orderId: { shop, orderId } },
+      data: { pointsReversedToDate: { increment: remaining } },
+    });
+  });
+
+  return {
+    outcome: WebhookEventOutcome.PROCESSED,
+    code: "ok",
+    message: `Reversed remaining ${remaining} points for cancelled order ${orderId}.`,
+  };
 }
 
 async function handleCustomersRedact(shop: string, payload: any) {
-  // Best-effort: remove customer-centric state (balance, redemptions, snapshots)
-  // Keep PointsLedger only if merchant prefers; in absence of a config flag, we *delete* customer-linked ledger to be safe.
-  const customerId =
-    String(payload?.customer?.id ?? payload?.customer_id ?? payload?.customerId ?? "").trim();
-
-  if (!customerId) return;
+  const customerId = parseCustomerIdFromPayload(payload);
+  if (!customerId) {
+    return { outcome: WebhookEventOutcome.SKIPPED, code: "missing_customer", message: "Missing customerId." };
+  }
 
   await db.$transaction(async (tx) => {
     await tx.redemption.deleteMany({ where: { shop, customerId } });
+    await tx.pointsLedger.deleteMany({ where: { shop, customerId } });
     await tx.orderPointsSnapshot.deleteMany({ where: { shop, customerId } });
     await tx.customerPointsBalance.deleteMany({ where: { shop, customerId } });
-    await tx.pointsLedger.deleteMany({ where: { shop, customerId } });
   });
+
+  return { outcome: WebhookEventOutcome.PROCESSED, code: "ok", message: `Deleted loyalty data for customer ${customerId}.` };
 }
 
 async function handleShopRedact(shop: string) {
   await db.$transaction(async (tx) => {
     await tx.redemption.deleteMany({ where: { shop } });
+    await tx.pointsLedger.deleteMany({ where: { shop } });
     await tx.orderPointsSnapshot.deleteMany({ where: { shop } });
     await tx.customerPointsBalance.deleteMany({ where: { shop } });
-    await tx.pointsLedger.deleteMany({ where: { shop } });
-    await tx.webhookError.deleteMany({ where: { shop } });
-    await tx.webhookEvent.deleteMany({ where: { shop } });
-    await tx.privacyEvent.deleteMany({ where: { shop } });
     await tx.shopSettings.deleteMany({ where: { shop } });
+    await tx.webhookEvent.deleteMany({ where: { shop } });
     await tx.session.deleteMany({ where: { shop } });
-    await tx.jobLock.deleteMany({ where: { shop } });
   });
-}
 
-async function applyPointsDelta(params: {
-  shop: string;
-  customerId: string;
-  delta: number;
-  ledgerType: "EARN" | "REVERSAL" | "EXPIRE" | "REDEEM" | "ADJUST";
-  source: string;
-  sourceId: string;
-  description: string;
-}) {
-  const { shop, customerId, delta, ledgerType, source, sourceId, description } = params;
-
-  await db.$transaction(async (tx) => {
-    // Dedupe by ledger unique constraint
-    const existing = await tx.pointsLedger.findFirst({
-      where: { shop, customerId, type: ledgerType as any, source, sourceId },
-      select: { id: true },
-    });
-    if (existing) return;
-
-    // Ensure balance row exists
-    const bal =
-      (await tx.customerPointsBalance.findUnique({
-        where: { shop_customerId: { shop, customerId } },
-      })) ??
-      (await tx.customerPointsBalance.create({
-        data: {
-          shop,
-          customerId,
-          balance: 0,
-          lifetimeEarned: 0,
-          lifetimeRedeemed: 0,
-          lastActivityAt: null,
-          expiredAt: null,
-        },
-      }));
-
-    const requested = clampInt(delta);
-    const next = Math.max(0, bal.balance + requested);
-    const applied = next - bal.balance; // clamped delta actually applied
-
-    if (applied === 0) return;
-
-    await tx.pointsLedger.create({
-      data: {
-        shop,
-        customerId,
-        type: ledgerType as any,
-        delta: applied,
-        source,
-        sourceId,
-        description,
-      },
-    });
-
-    await tx.customerPointsBalance.update({
-      where: { shop_customerId: { shop, customerId } },
-      data: {
-        balance: next,
-        // only lifetimeEarned/lifetimeRedeemed updated for their natural flows;
-        // webhooks use EARN/REVERSAL; redeem uses REDEEM; expiry uses EXPIRE.
-        lifetimeEarned:
-          ledgerType === "EARN" ? { increment: Math.max(0, applied) } : undefined,
-        lifetimeRedeemed:
-          ledgerType === "REDEEM" ? { increment: Math.max(0, -applied) } : undefined,
-        lastActivityAt: new Date(),
-      },
-    });
-  });
+  return { outcome: WebhookEventOutcome.PROCESSED, code: "ok", message: `Deleted all app data for shop ${shop}.` };
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  if (request.method !== "POST") return new Response("ok", { status: 200 });
+  const webhookAt = new Date();
 
-  // Authenticate + parse payload via Shopify framework
-  let ctx: any;
-  try {
-    ctx = await authenticate.webhook(request);
-  } catch {
-    return new Response("Unauthorized", { status: 401 });
-  }
+  // Authenticate + parse payload using Shopify’s helpers (HMAC verified)
+  const { topic, shop, webhookId, payload, admin } = await authenticate.webhook(request);
+  const t = normalizeTopic(String(topic));
+  const s = String(shop);
 
-  const shop: string = ctx.shop;
-  const webhookId: string = String(ctx.webhookId ?? "");
-  const topicNorm = normalizeTopic(ctx.topic);
-  const payload = typeof ctx.payload === "string" ? JSON.parse(ctx.payload) : ctx.payload;
+  // Dedupe by webhookId
+  const wid = String(webhookId);
+  const existing = await db.webhookEvent.findUnique({ where: { webhookId: wid } }).catch(() => null);
+  if (existing) return new Response(null, { status: 200 });
 
-  // Determine a resourceId for logging
+  // Resource id (best-effort)
   const resourceId =
-    String(payload?.id ?? payload?.order_id ?? payload?.orderId ?? payload?.customer_id ?? payload?.shop_id ?? "unknown");
+    (t.startsWith("orders/") ? parseOrderId(payload) : null) ??
+    (t.startsWith("refunds/") ? parseRefundId(payload) : null) ??
+    (t.startsWith("customers/") ? parseCustomerIdFromPayload(payload) : null) ??
+    null;
 
-  // Create RECEIVED record (or mark duplicate)
+  await db.webhookEvent.create({
+    data: {
+      webhookId: wid,
+      shop: s,
+      topic: t,
+      resourceId: resourceId ? String(resourceId) : null,
+      receivedAt: webhookAt,
+      outcome: WebhookEventOutcome.RECEIVED,
+    },
+  });
+
   try {
-    const r = await upsertWebhookReceived(shop, webhookId, topicNorm, resourceId);
-    if (r.isDuplicate) return new Response("ok", { status: 200 });
-  } catch (e) {
-    // If we can't even log, still return 200 to avoid retry storms.
-    return new Response("ok", { status: 200 });
-  }
+    let result:
+      | { outcome: WebhookEventOutcome; code: string; message: string }
+      | null = null;
 
-  try {
-    // Compliance topics
-    if (topicNorm === "customers/data_request" || topicNorm === "customers/redact" || topicNorm === "shop/redact") {
-      await db.privacyEvent.create({
-        data: {
-          shop,
-          topic: topicNorm,
-          payloadJson: JSON.stringify(payload ?? {}),
-        },
-      });
+    switch (t) {
+      case "orders/paid":
+        result = await handleOrdersPaid({ shop: s, admin, payload });
+        break;
 
-      if (topicNorm === "customers/redact") await handleCustomersRedact(shop, payload);
-      if (topicNorm === "shop/redact") await handleShopRedact(shop);
+      case "refunds/create":
+        result = await handleRefundsCreate({ shop: s, admin, payload });
+        break;
 
-      await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "COMPLIANCE_OK", null);
-      return new Response("ok", { status: 200 });
-    }
+      case "orders/cancelled":
+        result = await handleOrdersCancelled({ shop: s, payload });
+        break;
 
-    // app/uninstalled: best-effort cleanup
-    if (topicNorm === "app/uninstalled") {
-      await db.session.deleteMany({ where: { shop } });
-      await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "UNINSTALLED_OK", null);
-      return new Response("ok", { status: 200 });
-    }
-
-    // Loyalty topics
-    const settings = await getShopSettings(shop);
-
-    if (topicNorm === "orders/paid") {
-      const orderId = String(payload?.id ?? "");
-      const orderName = String(payload?.name ?? payload?.order_number ?? "");
-      const currency = String(payload?.currency ?? "CAD");
-      const customerId = String(payload?.customer?.id ?? payload?.customer_id ?? "").trim();
-
-      if (!orderId || !customerId) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "NO_CUSTOMER", "Guest checkout / no customerId.");
-        return new Response("ok", { status: 200 });
-      }
-
-      // Customer exclusion based on tags (if present in payload)
-      const customerTags = String(payload?.customer?.tags ?? "")
-        .split(",")
-        .map((t: string) => t.trim())
-        .filter(Boolean);
-      const excluded = new Set(settings.excludedCustomerTags.map((t) => t.trim().toLowerCase()).filter(Boolean));
-      if (customerTags.some((t) => excluded.has(t.toLowerCase()))) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "CUSTOMER_EXCLUDED", "Customer tag excludes earning.");
-        return new Response("ok", { status: 200 });
-      }
-
-      // Gather product IDs from line items (REST webhook payload)
-      const lineItems: any[] = Array.isArray(payload?.line_items) ? payload.line_items : [];
-      const productIds = Array.from(
-        new Set(
-          lineItems
-            .map((li) => li?.product_id)
-            .filter((id) => id !== null && id !== undefined)
-            .map((id) => String(id)),
-        ),
-      );
-
-      // Pull tags for all products in one call
-      let productTagsById = new Map<string, string[]>();
-      if (productIds.length > 0) {
-        const ids = productIds.map((id) => `gid://shopify/Product/${id}`);
-        const query = `
-          query ProductTags($ids: [ID!]!) {
-            nodes(ids: $ids) {
-              ... on Product { id tags }
-            }
-          }
-        `;
-        type Resp = { nodes: Array<{ id: string; tags: string[] } | null> };
-        const data = await shopifyGraphql<Resp>(shop, query, { ids });
-        for (const node of data.nodes) {
-          if (!node?.id) continue;
-          const legacyId = String(node.id).split("/").pop() ?? "";
-          if (legacyId) productTagsById.set(legacyId, node.tags ?? []);
-        }
-      }
-
-      // Compute eligible net merchandise (cents)
-      let eligibleNetCents = 0;
-      for (const li of lineItems) {
-        const qty = clampInt(Number(li?.quantity ?? 0));
-        if (qty <= 0) continue;
-
-        const productId = li?.product_id != null ? String(li.product_id) : "";
-        const tags = productId ? productTagsById.get(productId) ?? [] : [];
-
-        const eligible = isEligibleByTags(tags, settings.includeProductTags, settings.excludeProductTags);
-        if (!eligible) continue;
-
-        const priceCents = moneyToCents(li?.price);
-        const discountCents = moneyToCents(li?.total_discount ?? 0);
-        const lineNet = priceCents * qty - discountCents;
-        if (lineNet > 0) eligibleNetCents += lineNet;
-      }
-
-      const earnRate = clampInt(settings.earnRate ?? 1);
-      const pointsEarned = Math.max(0, Math.floor((eligibleNetCents * earnRate) / 100));
-
-      // Persist snapshot (cents stored in eligibleNetMerchandise)
-      await db.orderPointsSnapshot.upsert({
-        where: { shop_orderId: { shop, orderId } },
-        create: {
-          shop,
-          orderId,
-          orderName,
-          customerId,
-          eligibleNetMerchandise: eligibleNetCents,
-          pointsAwarded: pointsEarned,
-          pointsReversedToDate: 0,
-          paidAt: payload?.processed_at ? new Date(payload.processed_at) : new Date(),
-          cancelledAt: null,
-          currency,
-          discountCodesJson: payload?.discount_codes ? JSON.stringify(payload.discount_codes) : null,
-        },
-        update: {
-          orderName,
-          customerId,
-          eligibleNetMerchandise: eligibleNetCents,
-          pointsAwarded: pointsEarned,
-          paidAt: payload?.processed_at ? new Date(payload.processed_at) : new Date(),
-          currency,
-          discountCodesJson: payload?.discount_codes ? JSON.stringify(payload.discount_codes) : null,
-        },
-      });
-
-      if (pointsEarned <= 0) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "NO_POINTS", "Eligible net merchandise produced 0 points.");
-        return new Response("ok", { status: 200 });
-      }
-
-      await applyPointsDelta({
-        shop,
-        customerId,
-        delta: pointsEarned,
-        ledgerType: "EARN",
-        source: "ORDER",
-        sourceId: orderId,
-        description: `Earned ${pointsEarned} points for order ${orderName || orderId}.`,
-      });
-
-      await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "EARN_OK", null);
-      return new Response("ok", { status: 200 });
-    }
-
-    if (topicNorm === "refunds/create") {
-      const refundId = String(payload?.id ?? "");
-      const orderId = String(payload?.order_id ?? "");
-      if (!refundId || !orderId) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "MISSING_IDS", "Missing refundId or orderId in payload.");
-        return new Response("ok", { status: 200 });
-      }
-
-      const snapshot = await db.orderPointsSnapshot.findUnique({
-        where: { shop_orderId: { shop, orderId } },
-      });
-
-      // If we have no snapshot, we cannot reliably reverse; skip (still logged)
-      if (!snapshot?.customerId) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "NO_SNAPSHOT", "No order snapshot found for refund reversal.");
-        return new Response("ok", { status: 200 });
-      }
-
-      const remaining = Math.max(0, snapshot.pointsAwarded - snapshot.pointsReversedToDate);
-      if (remaining <= 0) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "NO_REMAINING", "No remaining points to reverse.");
-        return new Response("ok", { status: 200 });
-      }
-
-      // Best-effort compute reversal amount from refund_line_items
-      const refundLineItems: any[] = Array.isArray(payload?.refund_line_items) ? payload.refund_line_items : [];
-
-      // Pull order line items w/ product tags to keep reversals tag-accurate
-      const orderGid = `gid://shopify/Order/${orderId}`;
-      const q = `
-        query OrderForRefund($id: ID!) {
-          order(id: $id) {
-            name
-            customer { id legacyResourceId tags }
-            lineItems(first: 250) {
-              nodes {
-                legacyResourceId
-                quantity
-                discountedTotalSet { shopMoney { amount currencyCode } }
-                product { id tags }
-              }
-            }
-          }
-        }
-      `;
-
-      type OrderForRefund = {
-        order: null | {
-          name: string;
-          customer: null | { legacyResourceId: string; tags: string[] };
-          lineItems: { nodes: Array<any> };
+      // Compliance topics:
+      case "customers/data/request":
+      case "customers/data_request":
+        result = {
+          outcome: WebhookEventOutcome.PROCESSED,
+          code: "ok",
+          message: "Data request received (no stored PII beyond IDs).",
         };
-      };
+        break;
 
-      const od = await shopifyGraphql<OrderForRefund>(shop, q, { id: orderGid });
-      const lineByLegacyId = new Map<string, any>();
-      for (const li of od.order?.lineItems?.nodes ?? []) {
-        const legacy = String(li?.legacyResourceId ?? "");
-        if (legacy) lineByLegacyId.set(legacy, li);
-      }
+      case "customers/redact":
+        result = await handleCustomersRedact(s, payload);
+        break;
 
-      let eligibleRefundedCents = 0;
-      for (const rli of refundLineItems) {
-        const lineItemId = String(rli?.line_item_id ?? rli?.lineItemId ?? "");
-        const qtyRefunded = clampInt(Number(rli?.quantity ?? 0));
-        if (!lineItemId || qtyRefunded <= 0) continue;
+      case "shop/redact":
+        result = await handleShopRedact(s);
+        break;
 
-        const orderLi = lineByLegacyId.get(lineItemId);
-        if (!orderLi) continue;
-
-        const totalAmountCents = moneyToCents(orderLi?.discountedTotalSet?.shopMoney?.amount);
-        const qtyOrdered = clampInt(Number(orderLi?.quantity ?? 0));
-        if (qtyOrdered <= 0) continue;
-
-        const perUnitCents = Math.round(totalAmountCents / qtyOrdered);
-        const refundedCents = perUnitCents * qtyRefunded;
-
-        const tags = Array.isArray(orderLi?.product?.tags) ? orderLi.product.tags : [];
-        const eligible = isEligibleByTags(tags, settings.includeProductTags, settings.excludeProductTags);
-        if (!eligible) continue;
-
-        if (refundedCents > 0) eligibleRefundedCents += refundedCents;
-      }
-
-      const earnRate = clampInt(settings.earnRate ?? 1);
-      const computedReverse = Math.max(0, Math.floor((eligibleRefundedCents * earnRate) / 100));
-      const pointsToReverse = Math.min(remaining, computedReverse);
-
-      if (pointsToReverse <= 0) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "REVERSE_0", "Refund contained no eligible value for reversal.");
-        return new Response("ok", { status: 200 });
-      }
-
-      // Apply reversal and update snapshot
-      await applyPointsDelta({
-        shop,
-        customerId: snapshot.customerId,
-        delta: -pointsToReverse,
-        ledgerType: "REVERSAL",
-        source: "REFUND",
-        sourceId: refundId,
-        description: `Reversed ${pointsToReverse} points due to refund ${refundId} (order ${snapshot.orderName || orderId}).`,
-      });
-
-      await db.orderPointsSnapshot.update({
-        where: { shop_orderId: { shop, orderId } },
-        data: { pointsReversedToDate: { increment: pointsToReverse } },
-      });
-
-      await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "REFUND_OK", null);
-      return new Response("ok", { status: 200 });
+      default:
+        result = {
+          outcome: WebhookEventOutcome.SKIPPED,
+          code: "unhandled_topic",
+          message: `Unhandled topic: ${t}`,
+        };
+        break;
     }
 
-    if (topicNorm === "orders/cancelled") {
-      const orderId = String(payload?.id ?? "");
-      if (!orderId) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "MISSING_ORDER", "Missing orderId in payload.");
-        return new Response("ok", { status: 200 });
-      }
+    await db.webhookEvent.update({
+      where: { webhookId: wid },
+      data: {
+        outcome: result.outcome,
+        outcomeCode: result.code,
+        outcomeMessage: result.message,
+      },
+    });
 
-      const snapshot = await db.orderPointsSnapshot.findUnique({
-        where: { shop_orderId: { shop, orderId } },
-      });
+    return new Response(null, { status: 200 });
+  } catch (err: any) {
+    const msg = typeof err?.message === "string" ? err.message : String(err);
 
-      if (!snapshot?.customerId) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "NO_SNAPSHOT", "No order snapshot found.");
-        return new Response("ok", { status: 200 });
-      }
+    await db.webhookEvent.update({
+      where: { webhookId: wid },
+      data: {
+        outcome: WebhookEventOutcome.FAILED,
+        outcomeCode: "error",
+        outcomeMessage: msg.slice(0, 4000),
+      },
+    });
 
-      const remaining = Math.max(0, snapshot.pointsAwarded - snapshot.pointsReversedToDate);
-      if (remaining <= 0) {
-        await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "NO_REMAINING", "No remaining points to reverse.");
-        return new Response("ok", { status: 200 });
-      }
-
-      await applyPointsDelta({
-        shop,
-        customerId: snapshot.customerId,
-        delta: -remaining,
-        ledgerType: "REVERSAL",
-        source: "CANCEL",
-        sourceId: orderId,
-        description: `Reversed ${remaining} points due to order cancellation ${snapshot.orderName || orderId}.`,
-      });
-
-      await db.orderPointsSnapshot.update({
-        where: { shop_orderId: { shop, orderId } },
-        data: {
-          pointsReversedToDate: { increment: remaining },
-          cancelledAt: payload?.cancelled_at ? new Date(payload.cancelled_at) : new Date(),
-        },
-      });
-
-      await markWebhookProcessed(shop, webhookId, WebhookOutcome.PROCESSED, "CANCEL_OK", null);
-      return new Response("ok", { status: 200 });
-    }
-
-    // Unhandled topic
-    await markWebhookProcessed(shop, webhookId, WebhookOutcome.SKIPPED, "TOPIC_UNHANDLED", `Unhandled topic ${topicNorm}`);
-    return new Response("ok", { status: 200 });
-  } catch (err) {
-    await logWebhookError(shop, topicNorm, webhookId, payload, err);
-    try {
-      await markWebhookProcessed(shop, webhookId, WebhookOutcome.FAILED, "PROCESSING_ERROR", err instanceof Error ? err.message : "Unknown error");
-    } catch {
-      // ignore
-    }
-    // Return 200 to prevent retry storms; failures are recorded for admin review (FR-6.2).
-    return new Response("ok", { status: 200 });
+    // Shopify expects 200 to stop retries only if processed; but for FAILED we still return 200
+    // to avoid retry storms. You can change to 500 if you explicitly want retries.
+    return new Response(null, { status: 200 });
   }
 };
