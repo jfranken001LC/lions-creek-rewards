@@ -1,266 +1,79 @@
-import { data, Form, useLoaderData } from "react-router";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { data, Link, useLoaderData } from "react-router";
+import type { LoaderFunctionArgs } from "react-router";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
-
-type SettingsShape = {
-  earnRate: number;
-  redemptionMinOrder: number;
-  excludedCustomerTags: string[];
-  includeProductTags: string[];
-  excludeProductTags: string[];
-};
-
-function parseCsvList(value: string): string[] {
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function jsonList(value: unknown, fallback: string[]): string[] {
-  if (Array.isArray(value)) return value.map(String);
-  try {
-    if (typeof value === "string") {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed.map(String);
-    }
-  } catch {
-    // ignore
-  }
-  return fallback;
-}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const defaults: SettingsShape = {
-    earnRate: 1,
-    redemptionMinOrder: 0,
-    excludedCustomerTags: ["Wholesale"],
-    includeProductTags: [],
-    excludeProductTags: [],
-  };
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-  const settings = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+  const [customerCount, balanceAgg, activeRedemptions, failedWebhooks24h] = await Promise.all([
+    db.customerPointsBalance.count({ where: { shop } }),
+    db.customerPointsBalance.aggregate({ where: { shop }, _sum: { balance: true } }),
+    db.redemption.count({ where: { shop, status: "ISSUED" } }),
+    db.webhookEvent.count({ where: { shop, outcome: "FAILED", receivedAt: { gte: since24h } } }),
+  ]);
 
   return data({
     shop,
-    settings: settings
-      ? {
-          earnRate: settings.earnRate ?? defaults.earnRate,
-          redemptionMinOrder: settings.redemptionMinOrder ?? defaults.redemptionMinOrder,
-          excludedCustomerTags: jsonList(settings.excludedCustomerTags, defaults.excludedCustomerTags),
-          includeProductTags: jsonList(settings.includeProductTags, defaults.includeProductTags),
-          excludeProductTags: jsonList(settings.excludeProductTags, defaults.excludeProductTags),
-        }
-      : defaults,
+    stats: {
+      customersWithBalance: customerCount,
+      outstandingPoints: balanceAgg._sum.balance ?? 0,
+      activeRedemptions,
+      failedWebhooks24h,
+    },
   });
 };
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  const shop = session.shop;
-
-  const form = await request.formData();
-  const intent = String(form.get("_intent") ?? "");
-
-  if (intent === "saveSettings") {
-    const earnRate = Number(form.get("earnRate") ?? 1) || 1;
-    const redemptionMinOrder = Number(form.get("redemptionMinOrder") ?? 0) || 0;
-
-    const excludedCustomerTags = parseCsvList(String(form.get("excludedCustomerTags") ?? ""));
-    const includeProductTags = parseCsvList(String(form.get("includeProductTags") ?? ""));
-    const excludeProductTags = parseCsvList(String(form.get("excludeProductTags") ?? ""));
-
-    await db.shopSettings.upsert({
-      where: { shop },
-      create: {
-        shop,
-        earnRate,
-        redemptionMinOrder,
-        excludedCustomerTags,
-        includeProductTags,
-        excludeProductTags,
-        updatedAt: new Date(),
-      },
-      update: {
-        earnRate,
-        redemptionMinOrder,
-        excludedCustomerTags,
-        includeProductTags,
-        excludeProductTags,
-        updatedAt: new Date(),
-      },
-    });
-
-    return data({ ok: true, message: "Settings saved." });
-  }
-
-  if (intent === "adjustPoints") {
-    const customerId = String(form.get("customerId") ?? "").trim();
-    const delta = Math.trunc(Number(form.get("delta") ?? 0) || 0);
-    const reason = String(form.get("reason") ?? "").trim();
-
-    if (!customerId || !delta || !reason) {
-      return data({ ok: false, message: "CustomerId, delta, and reason are required." }, { status: 400 });
-    }
-
-    await db.$transaction(async (tx) => {
-      await tx.pointsLedger.create({
-        data: {
-          shop,
-          customerId,
-          type: "ADJUST",
-          delta,
-          source: "ADMIN",
-          sourceId: String(session.id),
-          description: `Admin adjust: ${reason}`,
-          createdAt: new Date(),
-        },
-      });
-
-      const bal = await tx.customerPointsBalance.upsert({
-        where: { shop_customerId: { shop, customerId } },
-        create: {
-          shop,
-          customerId,
-          balance: delta,
-          lifetimeEarned: Math.max(0, delta),
-          lifetimeRedeemed: 0,
-          lastActivityAt: new Date(),
-        },
-        update: {
-          balance: { increment: delta },
-          lastActivityAt: new Date(),
-        },
-      });
-
-      if (bal.balance < 0) {
-        await tx.customerPointsBalance.update({
-          where: { shop_customerId: { shop, customerId } },
-          data: { balance: 0 },
-        });
-      }
-    });
-
-    return data({ ok: true, message: "Adjustment applied." });
-  }
-
-  if (intent === "lookupCustomer") {
-    const q = String(form.get("q") ?? "").trim();
-    if (!q) return data({ ok: false, message: "Enter a customer ID (numeric) or email." }, { status: 400 });
-
-    // v1: customerId lookup only.
-    const customerId = q;
-
-    const balance = await db.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop, customerId } },
-    });
-
-    const ledger = await db.pointsLedger.findMany({
-      where: { shop, customerId },
-      orderBy: { createdAt: "desc" },
-      take: 50,
-    });
-
-    return data({ ok: true, customerId, balance, ledger });
-  }
-
-  return data({ ok: false, message: "Unknown action." }, { status: 400 });
-};
-
-export default function AdminHome() {
-  const { shop, settings } = useLoaderData<typeof loader>();
+export default function AdminIndex() {
+  const { shop, stats } = useLoaderData<typeof loader>();
 
   return (
-    <div style={{ padding: 16, maxWidth: 980 }}>
-      <h1 style={{ marginBottom: 6 }}>Lions Creek Rewards</h1>
-      <div style={{ opacity: 0.7, marginBottom: 18 }}>Shop: {shop}</div>
+    <div style={{ padding: 18, maxWidth: 980 }}>
+      <h1 style={{ margin: 0 }}>Lions Creek Rewards — Admin</h1>
+      <div style={{ opacity: 0.7, marginTop: 6, marginBottom: 14 }}>Shop: {shop}</div>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14, marginBottom: 16 }}>
-        <h2 style={{ marginTop: 0 }}>Program Settings</h2>
-        <Form method="post">
-          <input type="hidden" name="_intent" value="saveSettings" />
-
-          <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-            <label>
-              Earn rate (points per $1 eligible net)
-              <input name="earnRate" defaultValue={settings.earnRate} type="number" step="1" min="0" />
-            </label>
-
-            <label>
-              Minimum order subtotal to redeem (CAD)
-              <input name="redemptionMinOrder" defaultValue={settings.redemptionMinOrder} type="number" step="1" min="0" />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Excluded customer tags (CSV) — e.g. Wholesale
-              <input name="excludedCustomerTags" defaultValue={(settings.excludedCustomerTags ?? []).join(", ")} />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Include product tags (CSV) — blank means “all eligible”
-              <input name="includeProductTags" defaultValue={(settings.includeProductTags ?? []).join(", ")} />
-            </label>
-
-            <label style={{ gridColumn: "1 / -1" }}>
-              Exclude product tags (CSV)
-              <input name="excludeProductTags" defaultValue={(settings.excludeProductTags ?? []).join(", ")} />
-            </label>
+      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+        <h2 style={{ marginTop: 0 }}>Quick stats</h2>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>Customers with a balance row</div>
+            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.customersWithBalance}</div>
           </div>
-
-          <button style={{ marginTop: 12 }} type="submit">
-            Save settings
-          </button>
-        </Form>
-
-        <p style={{ marginTop: 12, opacity: 0.8 }}>
-          Points are earned on <code>orders/paid</code>. Refunds/cancellations reverse proportionally. Redemptions are 500=$10 and 1000=$20 (v1).
-        </p>
-      </section>
-
-      <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14, marginBottom: 16 }}>
-        <h2 style={{ marginTop: 0 }}>Customer lookup</h2>
-        <Form method="post" style={{ display: "flex", gap: 8, alignItems: "end" }}>
-          <input type="hidden" name="_intent" value="lookupCustomer" />
-          <label style={{ flex: 1 }}>
-            Customer ID (Shopify)
-            <input name="q" placeholder="e.g. 1234567890" />
-          </label>
-          <button type="submit">Lookup</button>
-        </Form>
-
-        <div style={{ marginTop: 12, opacity: 0.75 }}>
-          After lookup, view the JSON response in the Network tab (next iteration will render it in-page).
+          <div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>Outstanding points</div>
+            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.outstandingPoints}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>Active (ISSUED) redemptions</div>
+            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.activeRedemptions}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>Webhook failures (last 24h)</div>
+            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.failedWebhooks24h}</div>
+          </div>
         </div>
       </section>
 
-      <section style={{ border: "1px solid #ddd", borderRadius: 10, padding: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Manual points adjustment</h2>
-        <Form method="post" style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-          <input type="hidden" name="_intent" value="adjustPoints" />
-
-          <label>
-            Customer ID
-            <input name="customerId" placeholder="1234567890" />
-          </label>
-
-          <label>
-            Delta (+/- points)
-            <input name="delta" type="number" step="1" />
-          </label>
-
-          <label style={{ gridColumn: "1 / -1" }}>
-            Reason (required)
-            <input name="reason" placeholder="e.g. goodwill adjustment" />
-          </label>
-
-          <button type="submit" style={{ gridColumn: "1 / -1" }}>
-            Apply adjustment
-          </button>
-        </Form>
+      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+        <h2 style={{ marginTop: 0 }}>Admin tools</h2>
+        <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
+          <li>
+            <Link to="/app/customers">Customer lookup + manual adjustments</Link>
+          </li>
+          <li>
+            <Link to="/app/reports">Reports + CSV export</Link>
+          </li>
+          <li>
+            <Link to="/app/webhooks">Webhook processing logs</Link>
+          </li>
+        </ul>
+        <div style={{ marginTop: 10, opacity: 0.75 }}>
+          Note: Program Settings remain on the Customers page (same fields you already had), but now the required “Ops” surfaces
+          (lookup/adjust/report/logs) are fully usable.
+        </div>
       </section>
     </div>
   );
