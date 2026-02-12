@@ -2,30 +2,27 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { data, Form, Link, useActionData, useLoaderData } from "react-router";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
-import {
-  getShopSettings,
-  upsertShopSettings,
-  V1_REDEMPTION_STEPS,
-  V1_REDEMPTION_VALUE_MAP,
-} from "../lib/shopSettings.server";
 
 /**
- * Admin Program Settings
- * - Saves earning + eligibility settings
- * - Diagnostics:
- *   - Missing include/exclude product tags (tag not used by any products)
- *   - Effective eligibility preview (sample eligible products)
- *   - Overlap warning (same tag in include and exclude)
- *   - Customer excluded tag validation (tag not used by any customers)
+ * Lions Creek Rewards — Admin Settings
+ *
+ * IMPORTANT (React Router / Vite):
+ * - Do NOT import *.server modules that are used by the default component.
+ * - Only server exports (loader/action) may depend on server-only modules.
+ *
+ * This file:
+ * - Stores ShopSettings in Prisma
+ * - Computes eligibility diagnostics via Shopify Admin GraphQL using offline token
+ * - Validates:
+ *    - product include/exclude tags that match 0 products
+ *    - include/exclude overlap (same tag in both lists)
+ *    - sample of eligible products from effective query
+ *    - excluded customer tags that match 0 customers (typo/unexpected casing)
  */
 
-function csvToList(raw: FormDataEntryValue | null): string[] {
-  if (!raw) return [];
-  return String(raw)
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-}
+// v1.1 hard requirements
+const V1_REDEMPTION_STEPS = [500, 1000] as const;
+const V1_REDEMPTION_VALUE_MAP: Record<string, number> = { "500": 10, "1000": 20 };
 
 type ActionData = { ok: true; message: string } | { ok: false; error: string };
 
@@ -50,9 +47,19 @@ type EligibilityDiagnostics = {
   notes: string[];
 };
 
+type ShopSettingsShape = {
+  earnRate: number;
+  redemptionMinOrder: number;
+  excludedCustomerTags: string[];
+  includeProductTags: string[];
+  excludeProductTags: string[];
+  redemptionSteps: number[];
+  redemptionValueMap: Record<string, number>;
+};
+
 type LoaderData = {
   shop: string;
-  settings: Awaited<ReturnType<typeof getShopSettings>>;
+  settings: ShopSettingsShape;
   diagnostics: EligibilityDiagnostics;
 };
 
@@ -62,32 +69,18 @@ function clampInt(n: any, min: number, max: number): number {
   return Math.max(min, Math.min(max, x));
 }
 
-async function getOfflineAccessToken(shop: string): Promise<string | null> {
-  const id = `offline_${shop}`;
-  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
-  return s?.accessToken ?? null;
+function csvToList(raw: FormDataEntryValue | null): string[] {
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
 }
 
-async function shopifyGraphql(shop: string, query: string, variables: any) {
-  const token = await getOfflineAccessToken(shop);
-  if (!token) throw new Error("Missing offline access token. Reinstall/re-auth the app.");
-
-  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await resp.json().catch(() => ({} as any));
-  if (!resp.ok) throw new Error(`Shopify GraphQL HTTP ${resp.status}: ${JSON.stringify(json)}`);
-  if (json.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  return json.data;
+function toStringListJson(v: any): string[] {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map((x) => String(x ?? "").trim()).filter(Boolean);
+  return [];
 }
 
 function normalizeTagList(tags: string[]): string[] {
@@ -105,12 +98,12 @@ function normalizeTagList(tags: string[]): string[] {
 }
 
 function buildProductTagTerm(tag: string): string {
-  // Shopify product search: tag:"My Tag"
+  // Shopify product search term
   return `tag:${JSON.stringify(tag)}`;
 }
 
 function buildCustomerTagTerm(tag: string): string {
-  // Shopify customer search supports tag:"My Tag" as well
+  // Shopify customer search term
   return `tag:${JSON.stringify(tag)}`;
 }
 
@@ -125,23 +118,81 @@ function buildEffectiveProductEligibilityQuery(includeTags: string[], excludeTag
   return [includeQ, excludeQ].filter(Boolean).join(" ").trim();
 }
 
-async function computeEligibilityDiagnostics({
-  shop,
-  includeProductTagsRaw,
-  excludeProductTagsRaw,
-  excludedCustomerTagsRaw,
-}: {
-  shop: string;
-  includeProductTagsRaw: string[];
-  excludeProductTagsRaw: string[];
-  excludedCustomerTagsRaw: string[];
-}): Promise<EligibilityDiagnostics> {
-  const includeProductTags = normalizeTagList(includeProductTagsRaw);
-  const excludeProductTags = normalizeTagList(excludeProductTagsRaw);
-  const excludedCustomerTags = normalizeTagList(excludedCustomerTagsRaw);
+async function getOfflineAccessToken(shop: string): Promise<string | null> {
+  const id = `offline_${shop}`;
+  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
+  return s?.accessToken ?? null;
+}
+
+async function shopifyGraphql(shop: string, query: string, variables: any) {
+  const token = await getOfflineAccessToken(shop);
+  if (!token) throw new Error("Missing offline access token for shop. Reinstall/re-auth the app.");
+
+  // Keep consistent with other routes in this app:
+  const endpoint = `https://${shop}/admin/api/2026-01/graphql.json`;
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await resp.text().catch(() => "");
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
+
+  if (!resp.ok) {
+    throw new Error(`Shopify GraphQL failed: ${resp.status} ${resp.statusText}${text ? ` ${text}` : ""}`);
+  }
+  if (json?.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+
+  return json?.data ?? null;
+}
+
+async function getShopSettings(shop: string): Promise<ShopSettingsShape> {
+  const defaults: ShopSettingsShape = {
+    earnRate: 1,
+    redemptionMinOrder: 0,
+    // Default is helpful for your use case; remove in UI if you don't want it.
+    excludedCustomerTags: ["Wholesale"],
+    includeProductTags: [],
+    excludeProductTags: [],
+    redemptionSteps: [...V1_REDEMPTION_STEPS],
+    redemptionValueMap: { ...V1_REDEMPTION_VALUE_MAP },
+  };
+
+  const existing = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+  if (!existing) return defaults;
+
+  const stepsRaw = (existing as any).redemptionSteps ?? defaults.redemptionSteps;
+  const steps =
+    Array.isArray(stepsRaw) && stepsRaw.length
+      ? stepsRaw.map((x: any) => Number(x)).filter((n: any) => Number.isFinite(n))
+      : defaults.redemptionSteps;
+
+  return {
+    ...defaults,
+    ...existing,
+    excludedCustomerTags: toStringListJson((existing as any).excludedCustomerTags) || defaults.excludedCustomerTags,
+    includeProductTags: toStringListJson((existing as any).includeProductTags) || defaults.includeProductTags,
+    excludeProductTags: toStringListJson((existing as any).excludeProductTags) || defaults.excludeProductTags,
+    redemptionSteps: steps.length ? steps : defaults.redemptionSteps,
+    redemptionValueMap: ((existing as any).redemptionValueMap as any) ?? defaults.redemptionValueMap,
+  };
+}
+
+async function computeEligibilityDiagnostics(shop: string, settings: ShopSettingsShape): Promise<EligibilityDiagnostics> {
+  const includeProductTags = normalizeTagList(settings.includeProductTags ?? []);
+  const excludeProductTags = normalizeTagList(settings.excludeProductTags ?? []);
+  const excludedCustomerTags = normalizeTagList(settings.excludedCustomerTags ?? []);
 
   const computedAt = new Date().toISOString();
-
   const overlapProductTags = includeProductTags.filter((t) =>
     excludeProductTags.some((x) => x.toLowerCase() === t.toLowerCase()),
   );
@@ -165,7 +216,7 @@ async function computeEligibilityDiagnostics({
     notes: [],
   };
 
-  // Configuration-derived notes
+  // Notes
   if (!effectiveProductQuery) {
     diagnostics.notes.push("No product tag filters set: all products are eligible for earning/redemption.");
   } else if (includeProductTags.length > 0 && excludeProductTags.length === 0) {
@@ -173,9 +224,7 @@ async function computeEligibilityDiagnostics({
   } else if (includeProductTags.length === 0 && excludeProductTags.length > 0) {
     diagnostics.notes.push("Exclude tags set: all products are eligible except those with an excluded tag.");
   } else {
-    diagnostics.notes.push(
-      "Include + exclude tags set: eligible products must match include tags and must NOT match excluded tags.",
-    );
+    diagnostics.notes.push("Include + exclude tags set: must match include tags and must NOT match excluded tags.");
   }
 
   if (overlapProductTags.length > 0) {
@@ -194,23 +243,23 @@ async function computeEligibilityDiagnostics({
     );
   }
 
-  // Decide whether to run Shopify checks
-  const needsShopifyChecks = Boolean(effectiveProductQuery) || excludedCustomerTags.length > 0;
-  if (!needsShopifyChecks) return diagnostics;
+  // Nothing to validate remotely?
+  const needsRemoteChecks = Boolean(effectiveProductQuery) || excludedCustomerTags.length > 0;
+  if (!needsRemoteChecks) return diagnostics;
 
   // Cap to keep query bounded
   const includeCapped = includeProductTags.slice(0, 20);
   const excludeCapped = excludeProductTags.slice(0, 20);
   const excludedCustomerCapped = excludedCustomerTags.slice(0, 20);
 
+  // Build one GraphQL request with many small queries
   const varDefs: string[] = [];
   const varVals: Record<string, string> = {};
   const fieldLines: string[] = [];
 
-  // Eligible product sample only if we have product constraints
   if (effectiveProductQuery) {
     varDefs.push(`$qEligibleProducts: String!`);
-    varVals["qEligibleProducts"] = effectiveProductQuery;
+    varVals.qEligibleProducts = effectiveProductQuery;
     fieldLines.push(`
       eligibleProducts: products(first: 5, query: $qEligibleProducts) {
         pageInfo { hasNextPage }
@@ -219,34 +268,25 @@ async function computeEligibilityDiagnostics({
     `);
   }
 
-  // Product include tag existence
   includeCapped.forEach((tag, i) => {
     const v = `qIncProd${i}`;
     varDefs.push(`$${v}: String!`);
     varVals[v] = buildProductTagTerm(tag);
-    fieldLines.push(`
-      incProd${i}: products(first: 1, query: $${v}) { nodes { id } }
-    `);
+    fieldLines.push(`incProd${i}: products(first: 1, query: $${v}) { nodes { id } }`);
   });
 
-  // Product exclude tag existence
   excludeCapped.forEach((tag, i) => {
     const v = `qExcProd${i}`;
     varDefs.push(`$${v}: String!`);
     varVals[v] = buildProductTagTerm(tag);
-    fieldLines.push(`
-      excProd${i}: products(first: 1, query: $${v}) { nodes { id } }
-    `);
+    fieldLines.push(`excProd${i}: products(first: 1, query: $${v}) { nodes { id } }`);
   });
 
-  // Customer excluded tag existence
   excludedCustomerCapped.forEach((tag, i) => {
     const v = `qExcCust${i}`;
     varDefs.push(`$${v}: String!`);
     varVals[v] = buildCustomerTagTerm(tag);
-    fieldLines.push(`
-      excCust${i}: customers(first: 1, query: $${v}) { nodes { id } }
-    `);
+    fieldLines.push(`excCust${i}: customers(first: 1, query: $${v}) { nodes { id } }`);
   });
 
   const query = `
@@ -256,38 +296,36 @@ async function computeEligibilityDiagnostics({
   `;
 
   try {
-    const data = await shopifyGraphql(shop, query, varVals);
+    const res = await shopifyGraphql(shop, query, varVals);
 
-    // Eligible product sample
+    // Eligible sample
     if (effectiveProductQuery) {
-      const eligibleNodes: any[] = data?.eligibleProducts?.nodes ?? [];
+      const eligibleNodes: any[] = res?.eligibleProducts?.nodes ?? [];
       diagnostics.eligibleProductSample = eligibleNodes.map((n) => ({
         id: String(n?.id ?? ""),
         title: String(n?.title ?? ""),
         handle: n?.handle ? String(n.handle) : null,
       }));
-      diagnostics.eligibleProductSampleHasMore = Boolean(data?.eligibleProducts?.pageInfo?.hasNextPage);
+      diagnostics.eligibleProductSampleHasMore = Boolean(res?.eligibleProducts?.pageInfo?.hasNextPage);
     }
 
-    // Missing include product tags
+    // Missing tags (products)
     includeCapped.forEach((tag, i) => {
-      const nodes: any[] = data?.[`incProd${i}`]?.nodes ?? [];
+      const nodes: any[] = res?.[`incProd${i}`]?.nodes ?? [];
       if (!nodes.length) diagnostics.includeMissingProductTags.push(tag);
     });
 
-    // Missing exclude product tags (informational)
     excludeCapped.forEach((tag, i) => {
-      const nodes: any[] = data?.[`excProd${i}`]?.nodes ?? [];
+      const nodes: any[] = res?.[`excProd${i}`]?.nodes ?? [];
       if (!nodes.length) diagnostics.excludeMissingProductTags.push(tag);
     });
 
-    // Missing excluded customer tags (informational but important for typo detection)
+    // Missing tags (customers)
     excludedCustomerCapped.forEach((tag, i) => {
-      const nodes: any[] = data?.[`excCust${i}`]?.nodes ?? [];
+      const nodes: any[] = res?.[`excCust${i}`]?.nodes ?? [];
       if (!nodes.length) diagnostics.excludedCustomerMissingTags.push(tag);
     });
 
-    // Warnings based on reality
     if (includeProductTags.length > 0 && diagnostics.includeMissingProductTags.length > 0) {
       diagnostics.warnings.push(
         `Some include product tags are not present on ANY products: ${diagnostics.includeMissingProductTags.join(", ")}.`,
@@ -327,13 +365,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shop = session.shop;
 
   const settings = await getShopSettings(shop);
-
-  const diagnostics = await computeEligibilityDiagnostics({
-    shop,
-    includeProductTagsRaw: settings.includeProductTags ?? [],
-    excludeProductTagsRaw: settings.excludeProductTags ?? [],
-    excludedCustomerTagsRaw: settings.excludedCustomerTags ?? [],
-  });
+  const diagnostics = await computeEligibilityDiagnostics(shop, settings);
 
   return data<LoaderData>({ shop, settings, diagnostics });
 };
@@ -344,16 +376,40 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const form = await request.formData();
 
-  const earnRate = Number(form.get("earnRate") ?? 1);
-  const redemptionMinOrder = Number(form.get("redemptionMinOrder") ?? 0);
-
   try {
-    await upsertShopSettings(shop, {
-      earnRate: clampInt(earnRate, 1, 100),
-      redemptionMinOrder: clampInt(redemptionMinOrder, 0, 100000),
-      excludedCustomerTags: csvToList(form.get("excludedCustomerTags")),
-      includeProductTags: csvToList(form.get("includeProductTags")),
-      excludeProductTags: csvToList(form.get("excludeProductTags")),
+    const earnRate = clampInt(form.get("earnRate"), 1, 100);
+    const redemptionMinOrder = clampInt(form.get("redemptionMinOrder"), 0, 100000);
+
+    const excludedCustomerTags = normalizeTagList(csvToList(form.get("excludedCustomerTags")));
+    const includeProductTags = normalizeTagList(csvToList(form.get("includeProductTags")));
+    const excludeProductTags = normalizeTagList(csvToList(form.get("excludeProductTags")));
+
+    // Enforce v1.1 hard redemption rule (fixed steps + fixed values)
+    const redemptionSteps = [...V1_REDEMPTION_STEPS];
+    const redemptionValueMap = { ...V1_REDEMPTION_VALUE_MAP };
+
+    await db.shopSettings.upsert({
+      where: { shop },
+      create: {
+        shop,
+        earnRate,
+        redemptionMinOrder,
+        excludedCustomerTags,
+        includeProductTags,
+        excludeProductTags,
+        redemptionSteps,
+        redemptionValueMap,
+      } as any,
+      update: {
+        earnRate,
+        redemptionMinOrder,
+        excludedCustomerTags,
+        includeProductTags,
+        excludeProductTags,
+        redemptionSteps,
+        redemptionValueMap,
+        updatedAt: new Date(),
+      } as any,
     });
 
     return data<ActionData>({ ok: true, message: "Settings saved." });
@@ -394,111 +450,62 @@ export default function SettingsPage() {
         </div>
       ) : null}
 
-      {(hasWarnings || hasNotes || diagnostics.effectiveProductQuery) && (
-        <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
-          <h2 style={{ marginTop: 0 }}>Eligibility diagnostics</h2>
+      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
+        <h2 style={{ marginTop: 0 }}>Eligibility diagnostics</h2>
 
-          <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 10 }}>
-            Checked: {new Date(diagnostics.computedAt).toLocaleString()}
+        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 10 }}>
+          Checked: {new Date(diagnostics.computedAt).toLocaleString()}
+        </div>
+
+        {hasWarnings && (
+          <div style={{ border: "1px solid #fecaca", background: "#fff1f2", padding: 12, borderRadius: 12, marginBottom: 10 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Warnings</div>
+            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+              {diagnostics.warnings.map((w, idx) => (
+                <li key={idx}>{w}</li>
+              ))}
+            </ul>
           </div>
+        )}
 
-          {hasWarnings && (
-            <div
+        {hasNotes && (
+          <div style={{ border: "1px solid #e5e5e5", background: "#fafafa", padding: 12, borderRadius: 12, marginBottom: 10 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Notes</div>
+            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+              {diagnostics.notes.map((n, idx) => (
+                <li key={idx}>{n}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {diagnostics.effectiveProductQuery ? (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Effective product query</div>
+            <code
               style={{
-                border: "1px solid #fecaca",
-                background: "#fff1f2",
-                padding: 12,
+                display: "block",
+                padding: 10,
                 borderRadius: 12,
-                marginBottom: 10,
+                background: "#111827",
+                color: "white",
+                overflowX: "auto",
               }}
             >
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Warnings</div>
-              <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
-                {diagnostics.warnings.map((w, idx) => (
-                  <li key={idx}>{w}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {hasNotes && (
-            <div
-              style={{
-                border: "1px solid #e5e5e5",
-                background: "#fafafa",
-                padding: 12,
-                borderRadius: 12,
-                marginBottom: 10,
-              }}
-            >
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Notes</div>
-              <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
-                {diagnostics.notes.map((n, idx) => (
-                  <li key={idx}>{n}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {diagnostics.effectiveProductQuery ? (
-            <div style={{ marginBottom: 10 }}>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Effective product query</div>
-              <code
-                style={{
-                  display: "block",
-                  padding: 10,
-                  borderRadius: 12,
-                  background: "#111827",
-                  color: "white",
-                  overflowX: "auto",
-                }}
-              >
-                {diagnostics.effectiveProductQuery}
-              </code>
-              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                This is the Shopify Admin product search expression used to determine eligible products.
-              </div>
-            </div>
-          ) : null}
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
-            <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Include product tags with 0 products</div>
-              {diagnostics.includeMissingProductTags.length ? (
-                <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
-                  {diagnostics.includeMissingProductTags.map((t) => (
-                    <li key={t}>{t}</li>
-                  ))}
-                </ul>
-              ) : (
-                <div style={{ opacity: 0.75 }}>None</div>
-              )}
-            </div>
-
-            <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
-              <div style={{ fontWeight: 800, marginBottom: 6 }}>Exclude product tags with 0 products</div>
-              {diagnostics.excludeMissingProductTags.length ? (
-                <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
-                  {diagnostics.excludeMissingProductTags.map((t) => (
-                    <li key={t}>{t}</li>
-                  ))}
-                </ul>
-              ) : (
-                <div style={{ opacity: 0.75 }}>None</div>
-              )}
+              {diagnostics.effectiveProductQuery}
+            </code>
+            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+              This is the Shopify Admin product search expression used to determine eligible products.
             </div>
           </div>
+        ) : null}
 
-          <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12, marginBottom: 10 }}>
-            <div style={{ fontWeight: 800, marginBottom: 6 }}>Excluded customer tags with 0 customers</div>
-            <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
-              Helps catch typos/unexpected casing/spaces. If a tag shows here, it currently matches no customers.
-            </div>
-            {diagnostics.excludedCustomerTags.length === 0 ? (
-              <div style={{ opacity: 0.75 }}>No excluded customer tags configured.</div>
-            ) : diagnostics.excludedCustomerMissingTags.length ? (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+          <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Include product tags with 0 products</div>
+            {diagnostics.includeMissingProductTags.length ? (
               <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
-                {diagnostics.excludedCustomerMissingTags.map((t) => (
+                {diagnostics.includeMissingProductTags.map((t) => (
                   <li key={t}>{t}</li>
                 ))}
               </ul>
@@ -508,43 +515,83 @@ export default function SettingsPage() {
           </div>
 
           <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
-            <div style={{ fontWeight: 800, marginBottom: 6 }}>Eligible products (sample)</div>
-
-            {diagnostics.effectiveProductQuery == null ? (
-              <div style={{ opacity: 0.75 }}>All products are eligible (no product tag filters set).</div>
-            ) : diagnostics.eligibleProductSample.length === 0 ? (
-              <div style={{ opacity: 0.75 }}>No eligible products found with the current include/exclude tags.</div>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Exclude product tags with 0 products</div>
+            {diagnostics.excludeMissingProductTags.length ? (
+              <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+                {diagnostics.excludeMissingProductTags.map((t) => (
+                  <li key={t}>{t}</li>
+                ))}
+              </ul>
             ) : (
-              <>
-                <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
-                  {diagnostics.eligibleProductSample.map((p) => (
-                    <li key={p.id}>
-                      {p.title}
-                      {p.handle ? <span style={{ opacity: 0.7 }}> ({p.handle})</span> : null}
-                    </li>
-                  ))}
-                </ul>
-                {diagnostics.eligibleProductSampleHasMore ? (
-                  <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
-                    More eligible products exist (sample limited to 5).
-                  </div>
-                ) : null}
-              </>
+              <div style={{ opacity: 0.75 }}>None</div>
             )}
           </div>
-        </section>
-      )}
+        </div>
+
+        <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12, marginBottom: 10 }}>
+          <div style={{ fontWeight: 800, marginBottom: 6 }}>Excluded customer tags with 0 customers</div>
+          <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
+            Helps catch typos/unexpected casing/spaces. If a tag shows here, it currently matches no customers.
+          </div>
+          {diagnostics.excludedCustomerTags.length === 0 ? (
+            <div style={{ opacity: 0.75 }}>No excluded customer tags configured.</div>
+          ) : diagnostics.excludedCustomerMissingTags.length ? (
+            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+              {diagnostics.excludedCustomerMissingTags.map((t) => (
+                <li key={t}>{t}</li>
+              ))}
+            </ul>
+          ) : (
+            <div style={{ opacity: 0.75 }}>None</div>
+          )}
+          <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
+            Note: Shopify may restrict Customer object access for public apps without Protected Customer Data approval. If so, you’ll see a warning above.
+          </div>
+        </div>
+
+        <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
+          <div style={{ fontWeight: 800, marginBottom: 6 }}>Eligible products (sample)</div>
+
+          {diagnostics.effectiveProductQuery == null ? (
+            <div style={{ opacity: 0.75 }}>All products are eligible (no product tag filters set).</div>
+          ) : diagnostics.eligibleProductSample.length === 0 ? (
+            <div style={{ opacity: 0.75 }}>No eligible products found with the current include/exclude tags.</div>
+          ) : (
+            <>
+              <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+                {diagnostics.eligibleProductSample.map((p) => (
+                  <li key={p.id}>
+                    {p.title}
+                    {p.handle ? <span style={{ opacity: 0.7 }}> ({p.handle})</span> : null}
+                  </li>
+                ))}
+              </ul>
+              {diagnostics.eligibleProductSampleHasMore ? (
+                <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>More eligible products exist (sample limited to 5).</div>
+              ) : null}
+            </>
+          )}
+        </div>
+      </section>
 
       <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Earning rules</h2>
+        <h2 style={{ marginTop: 0 }}>Program rules</h2>
 
         <Form method="post" style={{ display: "grid", gap: 12, maxWidth: 740 }}>
           <label style={{ display: "grid", gap: 6 }}>
             <span style={{ fontWeight: 600 }}>Earn rate</span>
             <span style={{ fontSize: 12, opacity: 0.75 }}>
-              Points per $1 of <em>eligible net merchandise</em> on Paid orders. v1 is typically 1.
+              Points per $1 of <em>eligible net merchandise</em> on Paid orders.
             </span>
             <input name="earnRate" type="number" min={1} max={100} step={1} defaultValue={settings.earnRate} />
+          </label>
+
+          <label style={{ display: "grid", gap: 6 }}>
+            <span style={{ fontWeight: 600 }}>Minimum order subtotal to redeem (CAD)</span>
+            <span style={{ fontSize: 12, opacity: 0.75 }}>
+              Applied to generated discount codes as a Shopify minimum-subtotal requirement.
+            </span>
+            <input name="redemptionMinOrder" type="number" min={0} max={100000} step={1} defaultValue={settings.redemptionMinOrder} />
           </label>
 
           <label style={{ display: "grid", gap: 6 }}>
@@ -552,12 +599,7 @@ export default function SettingsPage() {
             <span style={{ fontSize: 12, opacity: 0.75 }}>
               Customers with any of these tags are excluded from earning and redemption.
             </span>
-            <input
-              name="excludedCustomerTags"
-              type="text"
-              placeholder="Wholesale, Staff"
-              defaultValue={settings.excludedCustomerTags.join(", ")}
-            />
+            <input name="excludedCustomerTags" type="text" placeholder="Wholesale, Staff" defaultValue={settings.excludedCustomerTags.join(", ")} />
           </label>
 
           <label style={{ display: "grid", gap: 6 }}>
@@ -565,12 +607,7 @@ export default function SettingsPage() {
             <span style={{ fontSize: 12, opacity: 0.75 }}>
               If set, <strong>only</strong> products with at least one of these tags are eligible.
             </span>
-            <input
-              name="includeProductTags"
-              type="text"
-              placeholder="RewardsEligible"
-              defaultValue={settings.includeProductTags.join(", ")}
-            />
+            <input name="includeProductTags" type="text" placeholder="RewardsEligible" defaultValue={settings.includeProductTags.join(", ")} />
           </label>
 
           <label style={{ display: "grid", gap: 6 }}>
@@ -578,12 +615,7 @@ export default function SettingsPage() {
             <span style={{ fontSize: 12, opacity: 0.75 }}>
               Products with any of these tags are never eligible.
             </span>
-            <input
-              name="excludeProductTags"
-              type="text"
-              placeholder="NoRewards"
-              defaultValue={settings.excludeProductTags.join(", ")}
-            />
+            <input name="excludeProductTags" type="text" placeholder="NoRewards" defaultValue={settings.excludeProductTags.join(", ")} />
           </label>
 
           <button type="submit" style={{ width: 180 }}>
@@ -593,42 +625,19 @@ export default function SettingsPage() {
       </section>
 
       <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Redemption rules (v1)</h2>
-
-        <Form method="post" style={{ display: "grid", gap: 12, maxWidth: 740 }}>
-          <label style={{ display: "grid", gap: 6 }}>
-            <span style={{ fontWeight: 600 }}>Minimum order subtotal to redeem (CAD)</span>
-            <span style={{ fontSize: 12, opacity: 0.75 }}>
-              Applied to generated discount codes as a Shopify minimum-subtotal requirement.
-            </span>
-            <input
-              name="redemptionMinOrder"
-              type="number"
-              min={0}
-              max={100000}
-              step={1}
-              defaultValue={settings.redemptionMinOrder}
-            />
-          </label>
-
-          <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6 }}>Fixed redemption steps (hard-locked for v1)</div>
-            <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
-              {V1_REDEMPTION_STEPS.map((pts) => (
-                <li key={pts}>
-                  {pts} points → ${V1_REDEMPTION_VALUE_MAP[String(pts)].toFixed(0)} off
-                </li>
-              ))}
-            </ul>
-            <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-              Max redeemable per order in v1 is 1000 points.
-            </div>
+        <h2 style={{ marginTop: 0 }}>Redemption rules (v1.1 fixed)</h2>
+        <div style={{ border: "1px dashed #e5e5e5", borderRadius: 12, padding: 12 }}>
+          <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
+            {V1_REDEMPTION_STEPS.map((pts) => (
+              <li key={pts}>
+                {pts} points → ${Number(V1_REDEMPTION_VALUE_MAP[String(pts)] ?? 0).toFixed(0)} off
+              </li>
+            ))}
+          </ul>
+          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
+            Max redeemable per order in v1.1 is {Math.max(...V1_REDEMPTION_STEPS)} points.
           </div>
-
-          <button type="submit" style={{ width: 180 }}>
-            Save Settings
-          </button>
-        </Form>
+        </div>
       </section>
     </div>
   );
