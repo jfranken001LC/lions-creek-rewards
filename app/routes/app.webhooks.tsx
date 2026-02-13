@@ -1,153 +1,130 @@
-// app/routes/app.webhooks.tsx
-// Drop-in replacement (small congruency update: wording + expects payloadJson exists)
-
+import {
+  Page,
+  Card,
+  DataTable,
+  Text,
+  Badge,
+  InlineStack,
+  Select,
+  TextField,
+  Button,
+} from "@shopify/polaris";
 import type { LoaderFunctionArgs } from "react-router";
-import { data, Form, useLoaderData } from "react-router";
+import { useLoaderData, useSubmit } from "react-router";
+import { useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
-import { Page, Layout, Card, BlockStack, InlineStack, Text, Select, DataTable, Badge } from "@shopify/polaris";
-
-type LoaderData = {
-  events: Array<{
-    id: string;
-    receivedAt: string;
-    topic: string;
-    resourceId: string;
-    outcome: string;
-    outcomeMessage: string | null;
-  }>;
-  filters: {
-    outcome: string;
-    topic: string;
-  };
-  topicOptions: Array<{ label: string; value: string }>;
-};
-
-function formatIso(iso: string) {
-  try {
-    return new Date(iso).toLocaleString();
-  } catch {
-    return iso;
-  }
-}
-
-function outcomeBadge(outcome: string) {
-  switch (outcome) {
-    case "PROCESSED":
-      return <Badge tone="success">PROCESSED</Badge>;
-    case "FAILED":
-      return <Badge tone="critical">FAILED</Badge>;
-    case "IGNORED":
-      return <Badge tone="warning">IGNORED</Badge>;
-    default:
-      return <Badge>RECEIVED</Badge>;
-  }
-}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
 
   const url = new URL(request.url);
-  const outcome = url.searchParams.get("outcome") ?? "ALL";
-  const topic = url.searchParams.get("topic") ?? "ALL";
+  const outcome = url.searchParams.get("outcome") || "ALL";
+  const topic = url.searchParams.get("topic") || "";
+  const resourceId = url.searchParams.get("resourceId") || "";
 
-  const where: any = {};
+  const where: any = { shop };
   if (outcome !== "ALL") where.outcome = outcome;
-  if (topic !== "ALL") where.topic = topic;
+  if (topic) where.topic = { contains: topic };
+  if (resourceId) where.resourceId = resourceId;
 
   const events = await db.webhookEvent.findMany({
     where,
     orderBy: { receivedAt: "desc" },
-    take: 200,
+    take: 250,
     select: {
-      id: true,
-      receivedAt: true,
+      webhookId: true,
       topic: true,
       resourceId: true,
+      receivedAt: true,
+      processedAt: true,
       outcome: true,
       outcomeMessage: true,
     },
   });
 
-  const distinctTopics = await db.webhookEvent
-    .findMany({
-      distinct: ["topic"],
-      select: { topic: true },
-      orderBy: { topic: "asc" },
-    })
-    .catch(() => []);
-
-  const topicOptions = [
-    { label: "All topics", value: "ALL" },
-    ...distinctTopics.map((t) => ({ label: t.topic, value: t.topic })),
-  ];
-
-  return data<LoaderData>({
-    events: events.map((e) => ({
-      id: e.id,
-      receivedAt: e.receivedAt.toISOString(),
-      topic: e.topic,
-      resourceId: e.resourceId,
-      outcome: String(e.outcome),
-      outcomeMessage: e.outcomeMessage,
-    })),
-    filters: { outcome, topic },
-    topicOptions,
-  });
+  return { events, filters: { outcome, topic, resourceId } };
 };
 
 export default function WebhooksLogPage() {
-  const { events, filters, topicOptions } = useLoaderData() as LoaderData;
+  const { events, filters } = useLoaderData<typeof loader>();
+  const submit = useSubmit();
 
-  const outcomeOptions = [
-    { label: "All outcomes", value: "ALL" },
-    { label: "RECEIVED", value: "RECEIVED" },
-    { label: "PROCESSED", value: "PROCESSED" },
-    { label: "IGNORED", value: "IGNORED" },
-    { label: "FAILED", value: "FAILED" },
-  ];
+  const [topic, setTopic] = useState(filters.topic);
+  const [resourceId, setResourceId] = useState(filters.resourceId);
+  const [outcome, setOutcome] = useState(filters.outcome);
 
-  const rows = events.map((e) => [
-    formatIso(e.receivedAt),
-    e.topic,
-    e.resourceId,
-    outcomeBadge(e.outcome),
-    e.outcomeMessage ?? "",
-  ]);
+  const rows = useMemo(
+    () =>
+      events.map((e) => [
+        e.webhookId,
+        e.topic,
+        e.resourceId || "—",
+        new Date(e.receivedAt).toLocaleString(),
+        e.processedAt ? new Date(e.processedAt).toLocaleString() : "—",
+        <Badge
+          key={`${e.webhookId}-badge`}
+          tone={
+            e.outcome === "PROCESSED"
+              ? "success"
+              : e.outcome === "FAILED"
+              ? "critical"
+              : e.outcome === "SKIPPED"
+              ? "warning"
+              : "info"
+          }
+        >
+          {e.outcome}
+        </Badge>,
+        e.outcomeMessage || "—",
+      ]),
+    [events],
+  );
+
+  const runSearch = () => {
+    const fd = new FormData();
+    fd.set("outcome", outcome);
+    fd.set("topic", topic);
+    fd.set("resourceId", resourceId);
+    submit(fd, { method: "get" });
+  };
 
   return (
-    <Page title="Webhooks">
-      <Layout>
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text as="p" tone="subdued">
-                Webhooks are app-managed via <Text as="span">shopify.app.toml</Text> and delivered to <Text as="span">/webhooks</Text>. Payloads are stored (truncated) in the database for auditing.
-              </Text>
+    <Page title="Webhook Processing Log">
+      <Card sectioned>
+        <InlineStack gap="400" align="start" blockAlign="center">
+          <Select
+            label="Outcome"
+            options={[
+              { label: "All", value: "ALL" },
+              { label: "Received", value: "RECEIVED" },
+              { label: "Processed", value: "PROCESSED" },
+              { label: "Skipped", value: "SKIPPED" },
+              { label: "Failed", value: "FAILED" },
+            ]}
+            value={outcome}
+            onChange={(value) => setOutcome(value)}
+          />
 
-              <Form method="get">
-                <InlineStack gap="300" align="start">
-                  <Select label="Outcome" name="outcome" options={outcomeOptions} value={filters.outcome} onChange={() => {}} />
-                  <Select label="Topic" name="topic" options={topicOptions} value={filters.topic} onChange={() => {}} />
-                  <div style={{ paddingTop: 22 }}>
-                    <button type="submit" className="Polaris-Button Polaris-Button--primary">
-                      <span className="Polaris-Button__Content">
-                        <span className="Polaris-Button__Text">Filter</span>
-                      </span>
-                    </button>
-                  </div>
-                </InlineStack>
-              </Form>
+          <TextField label="Topic contains" value={topic} onChange={(v) => setTopic(v)} autoComplete="off" />
+          <TextField label="Resource ID" value={resourceId} onChange={(v) => setResourceId(v)} autoComplete="off" />
 
-              <DataTable
-                columnContentTypes={["text", "text", "text", "text", "text"]}
-                headings={["Received", "Topic", "Resource", "Outcome", "Message"]}
-                rows={rows}
-              />
-            </BlockStack>
-          </Card>
-        </Layout.Section>
-      </Layout>
+          <Button onClick={runSearch}>Search</Button>
+        </InlineStack>
+
+        <Text as="p" tone="subdued">
+          Latest webhook events received and how they were handled.
+        </Text>
+      </Card>
+
+      <Card>
+        <DataTable
+          columnContentTypes={["text", "text", "text", "text", "text", "text", "text"]}
+          headings={["Webhook ID", "Topic", "Resource", "Received", "Processed", "Outcome", "Message"]}
+          rows={rows}
+        />
+      </Card>
     </Page>
   );
 }

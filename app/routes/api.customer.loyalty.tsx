@@ -1,36 +1,46 @@
-import { json, LoaderFunctionArgs, ActionFunctionArgs } from "@shopify/shopify-app-react-router/server";
-import db from "../db.server";
+import { json, type ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
-import { getShopSettings, V1_REDEMPTION_STEPS, V1_REDEMPTION_VALUE_MAP } from "../lib/shopSettings.server";
+import db from "../db.server";
+import { getShopSettings } from "../lib/shopSettings.server";
+import { RedemptionStatus } from "@prisma/client";
 
-function normalizeShopFromDest(dest: string): string {
-  return String(dest || "").replace(/^https?:\/\//i, "").trim();
-}
-
-function customerIdFromSub(sub: string): string {
-  const s = String(sub || "");
-  const m = s.match(/Customer\/(\d+)$/);
-  if (m) return m[1];
-  return s; // fallback
-}
-
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  // Handles preflight (OPTIONS) automatically via authenticate helper
-  await authenticate.public.customerAccount(request);
-  return new Response(null, { status: 204 });
-};
-
+/**
+ * Customer Account UI Extension endpoint.
+ *
+ * Auth: Authorization: Bearer <customer account session token>
+ */
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { cors, sessionToken } = await authenticate.public.customerAccount(request);
 
-  const shop = normalizeShopFromDest(sessionToken.dest);
-  const customerId = customerIdFromSub(sessionToken.sub);
+  // CORS preflight
+  if (request.method === "OPTIONS") {
+    return cors(new Response(null, { status: 204 }));
+  }
+
+  const shop = sessionToken?.dest?.replace(/^https:\/\//, "") ?? "";
+  const customerGid = sessionToken?.sub ?? "";
+  const customerId = customerGid.replace(/^gid:\/\/shopify\/Customer\//, "");
+
+  if (!shop || !customerId) {
+    return cors(json({ ok: false, error: "Missing shop or customer identity" }, { status: 401 }));
+  }
 
   const settings = await getShopSettings(shop);
 
-  const balance = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
+  // Ensure the row exists (so first-time customers don't 404)
+  const balanceRow =
+    (await db.customerPointsBalance.findUnique({
+      where: { shop_customerId: { shop, customerId } },
+    })) ??
+    (await db.customerPointsBalance.create({
+      data: {
+        shop,
+        customerId,
+        balance: 0,
+        lifetimeEarned: 0,
+        lifetimeRedeemed: 0,
+      },
+    }));
 
   const ledger = await db.pointsLedger.findMany({
     where: { shop, customerId },
@@ -45,55 +55,63 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     },
   });
 
+  const now = new Date();
   const redemptionActive = await db.redemption.findFirst({
     where: {
       shop,
       customerId,
-      status: { in: ["ISSUED", "APPLIED"] },
-      expiresAt: { gt: new Date() },
+      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
     },
-    orderBy: { createdAt: "desc" },
+    orderBy: { issuedAt: "desc" },
     select: {
       id: true,
       code: true,
-      valueCents: true,
-      minimumSubtotalCents: true,
+      value: true,
+      points: true,
       status: true,
       expiresAt: true,
-      issuedAt: true,
-      appliedAt: true,
-      voidedAt: true,
     },
   });
 
-  const resp = json({
-    ok: true,
-    shop,
-    customerId,
-    pointsBalance: balance?.pointsBalance ?? 0,
-    pointsLifetimeEarned: balance?.pointsLifetimeEarned ?? 0,
-    pointsLifetimeRedeemed: balance?.pointsLifetimeRedeemed ?? 0,
-    pointsLastActivityAt: balance?.pointsLastActivityAt ? balance.pointsLastActivityAt.toISOString() : null,
-    ledger: ledger.map((r) => ({ ...r, createdAt: r.createdAt.toISOString() })),
-    redemptionActive: redemptionActive
-      ? {
-          ...redemptionActive,
-          expiresAt: redemptionActive.expiresAt.toISOString(),
-          issuedAt: redemptionActive.issuedAt ? redemptionActive.issuedAt.toISOString() : null,
-          appliedAt: redemptionActive.appliedAt ? redemptionActive.appliedAt.toISOString() : null,
-          voidedAt: redemptionActive.voidedAt ? redemptionActive.voidedAt.toISOString() : null,
-        }
-      : null,
-    catalog: V1_REDEMPTION_STEPS.map((p) => ({
-      points: p,
-      valueDollars: V1_REDEMPTION_VALUE_MAP[String(p)],
-      minimumOrderDollars: settings.redemptionMinOrder,
-    })),
-    copy: {
-      earn: `Earn ${settings.earnRate} point(s) per $1 of eligible merchandise (net of discounts; excludes taxes/shipping).`,
-      expiry: `Points expire after your shop’s configured policy. Unused points may be removed automatically.`,
-    },
-  });
+  const catalog = (settings.redemptionSteps ?? [])
+    .map((step) => {
+      const points = Number(step.points);
+      const valueDollars = Number(settings.redemptionValueMap?.[points] ?? 0);
+      return {
+        points,
+        valueDollars,
+        minimumOrderDollars: settings.redemptionMinOrder,
+      };
+    })
+    .filter((c) => c.points > 0 && c.valueDollars > 0);
 
-  return cors(resp);
+  return cors(
+    json({
+      ok: true,
+      pointsBalance: balanceRow.balance,
+      pointsLifetimeEarned: balanceRow.lifetimeEarned,
+      pointsLifetimeRedeemed: balanceRow.lifetimeRedeemed,
+      pointsLastActivityAt: balanceRow.lastActivityAt?.toISOString?.() ?? null,
+      ledger: ledger.map((r) => ({
+        ...r,
+        createdAt: r.createdAt.toISOString(),
+      })),
+      redemptionActive: redemptionActive
+        ? {
+            id: redemptionActive.id,
+            code: redemptionActive.code,
+            valueCents: Math.round(Number(redemptionActive.value) * 100),
+            minimumSubtotalCents: Math.round(settings.redemptionMinOrder * 100),
+            status: redemptionActive.status,
+            expiresAt: (redemptionActive.expiresAt ?? new Date(now.getTime() + 72 * 60 * 60 * 1000)).toISOString(),
+          }
+        : null,
+      catalog,
+      copy: {
+        earn: `Earn ${settings.earnRate} point(s) for every $1 you spend on eligible items (after discounts).`,
+        expiry: "Points expire after 12 months of inactivity.",
+      },
+    }),
+  );
 };

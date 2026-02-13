@@ -1,206 +1,129 @@
-import { json, LoaderFunctionArgs, ActionFunctionArgs } from "@shopify/shopify-app-react-router/server";
+import { json, type ActionFunctionArgs } from "react-router";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
-import { getShopSettings, V1_REDEMPTION_STEPS, V1_REDEMPTION_VALUE_MAP } from "../lib/shopSettings.server";
+import { getShopSettings } from "../lib/shopSettings.server";
+import { LedgerType, RedemptionStatus } from "@prisma/client";
 
-function normalizeShopFromDest(dest: string): string {
-  return String(dest || "").replace(/^https?:\/\//i, "").trim();
-}
 
-function customerIdFromSub(sub: string): string {
-  const s = String(sub || "");
-  const m = s.match(/Customer\/(\d+)$/);
-  if (m) return m[1];
-  return s;
-}
-
-function centsToMoney(cents: number): string {
-  return `$${(cents / 100).toFixed(2)}`;
-}
-
-function makeCode(): string {
-  const part = Math.random().toString(36).slice(2, 8).toUpperCase();
-  return `LCR-${part}`;
-}
-
-async function adminGraphql(shop: string, accessToken: string, query: string, variables: any) {
-  const resp = await fetch(`https://${shop}/admin/api/2026-01/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": accessToken,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    const msg = json?.errors?.[0]?.message ?? `Admin GraphQL failed (${resp.status})`;
-    throw new Error(msg);
-  }
-  return json;
-}
-
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.public.customerAccount(request);
-  return new Response(null, { status: 204 });
-};
-
+/**
+ * Customer Account UI Extension endpoint: redeem points -> create a Shopify discount code.
+ */
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { cors, sessionToken } = await authenticate.public.customerAccount(request);
 
-  const shop = normalizeShopFromDest(sessionToken.dest);
-  const customerId = customerIdFromSub(sessionToken.sub);
-  const customerGid = sessionToken.sub; // gid://shopify/Customer/...
-
-  const settings = await getShopSettings(shop);
-
-  const { points } = await request.json().catch(() => ({ points: 0 }));
-  const pointsRequested = Math.floor(Number(points));
-
-  if (!pointsRequested) {
-    return cors(json({ ok: false, error: "Missing points." }, { status: 400 }));
+  // CORS preflight
+  if (request.method === "OPTIONS") {
+    return cors(new Response(null, { status: 204 }));
   }
 
-  if (!V1_REDEMPTION_STEPS.includes(pointsRequested as any)) {
+  const shop = sessionToken?.dest?.replace(/^https:\/\//, "") ?? "";
+  const customerGid = sessionToken?.sub ?? "";
+  const customerId = customerGid.replace(/^gid:\/\/shopify\/Customer\//, "");
+
+  if (!shop || !customerId) {
+    return cors(json({ ok: false, error: "Missing shop or customer identity" }, { status: 401 }));
+  }
+
+  const body = await safeJson(request);
+  const pointsRequested = Number(body?.points);
+
+  if (!Number.isFinite(pointsRequested) || pointsRequested <= 0) {
+    return cors(json({ ok: false, error: "Invalid points" }, { status: 400 }));
+  }
+
+  const settings = await getShopSettings(shop);
+  const valueDollars = Number(settings.redemptionValueMap?.[pointsRequested] ?? 0);
+
+  if (!valueDollars) {
+    return cors(json({ ok: false, error: "Unsupported redemption step" }, { status: 400 }));
+  }
+
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000); // 72 hours
+
+  // Hour-bucket idempotency key: prevents double-clicks generating multiple codes
+  const hourBucket = now.toISOString().slice(0, 13); // YYYY-MM-DDTHH
+  const idemKey = `${customerId}:${pointsRequested}:${hourBucket}`;
+
+  const existingByIdem = await db.redemption.findUnique({
+    where: { shop_customerId_idemKey: { shop, customerId, idemKey } },
+    select: { id: true, code: true, value: true, points: true, status: true, expiresAt: true },
+  });
+
+  if (existingByIdem && [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED].includes(existingByIdem.status)) {
     return cors(
-      json(
-        { ok: false, error: `Invalid redemption amount. Allowed: ${V1_REDEMPTION_STEPS.join(", ")}.` },
-        { status: 400 },
-      ),
+      json({
+        ok: true,
+        code: existingByIdem.code,
+        expiresAt: (existingByIdem.expiresAt ?? expiresAt).toISOString(),
+      }),
     );
   }
 
-  const dollars = V1_REDEMPTION_VALUE_MAP[String(pointsRequested)] ?? 0;
-  const valueCents = dollars * 100;
-
-  // if there is an active redemption, return it
   const active = await db.redemption.findFirst({
     where: {
       shop,
       customerId,
-      status: { in: ["ISSUED", "APPLIED"] },
-      expiresAt: { gt: new Date() },
-      valueCents,
+      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
     },
-    orderBy: { createdAt: "desc" },
+    select: { id: true, code: true, status: true, expiresAt: true },
   });
 
   if (active) {
     return cors(
       json({
-        ok: true,
-        alreadyIssued: true,
-        code: active.code,
-        expiresAt: active.expiresAt.toISOString(),
-        redemptionId: active.id,
-        valueCents: active.valueCents,
-        minimumSubtotalCents: active.minimumSubtotalCents,
+        ok: false,
+        error: "You already have an active discount code. Use it or wait for it to expire.",
       }),
     );
   }
 
-  const balance = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
-
-  const currentPoints = balance?.pointsBalance ?? 0;
-  if (currentPoints < pointsRequested) {
-    return cors(
-      json(
-        { ok: false, error: `Insufficient points. You have ${currentPoints}, need ${pointsRequested}.` },
-        { status: 400 },
-      ),
-    );
-  }
-
-  const minOrderCents = Math.max(0, settings.redemptionMinOrder * 100);
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + 72 * 60 * 60 * 1000);
-  const code = makeCode();
-  const idemKey = `${customerId}:${valueCents}:${expiresAt.toISOString().slice(0, 13)}`;
-
-  const idemExisting = await db.redemption.findUnique({
-    where: { shop_idemKey: { shop, idemKey } },
-  });
-
-  if (idemExisting) {
-    return cors(
-      json({
-        ok: true,
-        alreadyIssued: true,
-        code: idemExisting.code,
-        expiresAt: idemExisting.expiresAt.toISOString(),
-        redemptionId: idemExisting.id,
-        valueCents: idemExisting.valueCents,
-        minimumSubtotalCents: idemExisting.minimumSubtotalCents,
-      }),
-    );
-  }
-
-  // get offline access token
-  const offline = await db.session.findFirst({
-    where: { shop, isOnline: false },
-    orderBy: { id: "desc" },
-  });
-
-  if (!offline?.accessToken) {
-    return cors(json({ ok: false, error: "Missing offline session for shop." }, { status: 500 }));
-  }
-
-  const mutation = `#graphql
-    mutation CreateDiscount($basicCodeDiscount: DiscountCodeBasicInput!) {
-      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-        codeDiscountNode { id }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const variables = {
-    basicCodeDiscount: {
-      title: `LCR Redemption ${code}`,
-      code,
-      startsAt: now.toISOString(),
-      endsAt: expiresAt.toISOString(),
-      usageLimit: 1,
-      appliesOncePerCustomer: true,
-      customerSelection: { customers: { add: [customerGid] } },
-      minimumRequirement: minOrderCents
-        ? { subtotal: { greaterThanOrEqualToSubtotal: centsToMoney(minOrderCents) } }
-        : null,
-      customerGets: {
-        value: { fixedAmount: { amount: centsToMoney(valueCents), appliesOnEachItem: false } },
-        items: { all: true },
-      },
-    },
-  };
-
-  const gqlJson = await adminGraphql(shop, offline.accessToken, mutation, variables);
-
-  const userErrors = gqlJson?.data?.discountCodeBasicCreate?.userErrors ?? [];
-  if (Array.isArray(userErrors) && userErrors.length) {
-    return cors(json({ ok: false, error: userErrors.map((e: any) => e.message).join("; ") }, { status: 400 }));
-  }
-
-  const discountNodeId = gqlJson?.data?.discountCodeBasicCreate?.codeDiscountNode?.id;
-  if (!discountNodeId) {
-    return cors(json({ ok: false, error: "Failed to create discount." }, { status: 500 }));
-  }
-
-  const redemption = await db.$transaction(async (tx) => {
-    const r = await tx.redemption.create({
+  const balanceRow =
+    (await db.customerPointsBalance.findUnique({
+      where: { shop_customerId: { shop, customerId } },
+    })) ??
+    (await db.customerPointsBalance.create({
       data: {
         shop,
         customerId,
-        code,
-        discountNodeId,
-        valueCents,
-        minimumSubtotalCents: minOrderCents,
-        status: "ISSUED",
-        issuedAt: now,
-        expiresAt,
+        balance: 0,
+        lifetimeEarned: 0,
+        lifetimeRedeemed: 0,
+      },
+    }));
+
+  if (balanceRow.balance < pointsRequested) {
+    return cors(json({ ok: false, error: `Not enough points. You have ${balanceRow.balance}.` }, { status: 400 }));
+  }
+
+  // 1) Create discount in Shopify using offline token
+  const discount = await createShopifyDiscountCode({
+  shop,
+  customerGid,
+  code: generateCode(),
+  valueDollars,
+  minOrderDollars: settings.redemptionMinOrder,
+  startsAt: now,
+  endsAt: expiresAt,
+  eligibleCollectionHandle: settings.eligibleCollectionHandle,
+  eligibleCollectionGid: settings.eligibleCollectionGid,
+});
+
+  // 2) Persist in DB atomically
+  const created = await db.$transaction(async (tx) => {
+    const redemption = await tx.redemption.create({
+      data: {
+        shop,
+        customerId,
+        points: pointsRequested,
+        value: valueDollars,
+        code: discount.code,
+        discountNodeId: discount.discountNodeId,
         idemKey,
+        status: RedemptionStatus.ISSUED,
+        expiresAt,
+        issuedAt: now,
       },
     });
 
@@ -208,41 +131,186 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       data: {
         shop,
         customerId,
-        type: "REDEEM",
+        type: LedgerType.REDEEM,
         delta: -pointsRequested,
         source: "REDEMPTION",
-        sourceId: r.id,
-        description: `Redeemed ${pointsRequested} points for ${centsToMoney(valueCents)} code ${code}`,
+        sourceId: redemption.id,
+        description: `Redeemed ${pointsRequested} points for $${valueDollars.toFixed(0)} off (code ${redemption.code}).`,
       },
     });
 
-    const updated = await tx.customerPointsBalance.update({
+    await tx.customerPointsBalance.update({
       where: { shop_customerId: { shop, customerId } },
       data: {
-        pointsBalance: { decrement: pointsRequested },
-        pointsLifetimeRedeemed: { increment: pointsRequested },
-        pointsLastActivityAt: new Date(),
+        balance: Math.max(0, balanceRow.balance - pointsRequested),
+        lifetimeRedeemed: { increment: pointsRequested },
+        lastActivityAt: now,
+        expiredAt: null,
       },
     });
 
-    if (updated.pointsBalance < 0) {
-      await tx.customerPointsBalance.update({
-        where: { shop_customerId: { shop, customerId } },
-        data: { pointsBalance: 0 },
-      });
-    }
-
-    return r;
+    return redemption;
   });
 
   return cors(
     json({
       ok: true,
-      code: redemption.code,
-      expiresAt: redemption.expiresAt.toISOString(),
-      redemptionId: redemption.id,
-      valueCents: redemption.valueCents,
-      minimumSubtotalCents: redemption.minimumSubtotalCents,
+      code: created.code,
+      expiresAt: (created.expiresAt ?? expiresAt).toISOString(),
     }),
   );
 };
+
+function generateCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "LCR-";
+  for (let i = 0; i < 8; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return out;
+}
+
+async function safeJson(request: Request): Promise<any> {
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
+}
+
+ttype CreateDiscountArgs = {
+  shop: string;
+  customerGid: string;
+  code: string;
+  valueDollars: number;
+  minOrderDollars: number;
+  startsAt: Date;
+  endsAt: Date;
+  eligibleCollectionHandle: string;
+  eligibleCollectionGid: string | null;
+};
+
+async function resolveEligibleItemsForDiscount(args: {
+  shop: string;
+  token: string;
+  handle: string;
+  cachedGid: string | null;
+}): Promise<{ collections: { add: string[] } }> {
+  if (args.cachedGid) {
+    return { collections: { add: [args.cachedGid] } };
+  }
+
+  const query = `#graphql
+    query EligibleCollectionByHandle($handle: String!) {
+      collectionByHandle(handle: $handle) { id }
+    }
+  `;
+
+  const resp = await adminGraphql(args.shop, args.token, query, { handle: args.handle });
+  const gid = resp?.data?.collectionByHandle?.id as string | undefined;
+
+  if (!gid) {
+    throw new Error(
+      `Eligible collection not found. Create a collection with handle '${args.handle}' (Settings → Eligible collection handle).`,
+    );
+  }
+
+  // Best-effort cache for faster subsequent mutations.
+  try {
+    await db.shopSettings.update({ where: { shop: args.shop }, data: { eligibleCollectionGid: gid } });
+  } catch {
+    // ignore
+  }
+
+  return { collections: { add: [gid] } };
+}
+
+async function createShopifyDiscountCode(args: CreateDiscountArgs): Promise<{ code: string; discountNodeId: string }> {
+  const token = await getOfflineAccessToken(args.shop);
+  if (!token) throw new Error(`No offline access token found for shop ${args.shop}`);
+
+  const mutation = `#graphql
+    mutation CreateRewardDiscount($discount: DiscountCodeBasicInput!) {
+      discountCodeBasicCreate(basicCodeDiscount: $discount) {
+        codeDiscountNode {
+          id
+          codeDiscount {
+            ... on DiscountCodeBasic {
+              codes(first: 1) { nodes { code } }
+            }
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+const eligibleItems = await resolveEligibleItemsForDiscount({
+  shop: args.shop,
+  token,
+  handle: args.eligibleCollectionHandle,
+  cachedGid: args.eligibleCollectionGid,
+});
+  const variables = {
+    discount: {
+      title: `Lions Creek Rewards $${args.valueDollars.toFixed(0)} off`,
+      code: args.code,
+      startsAt: args.startsAt.toISOString(),
+      endsAt: args.endsAt.toISOString(),
+      usageLimit: 1,
+      appliesOncePerCustomer: true,
+      customerSelection: { customers: { add: [args.customerGid] } },
+      customerGets: {
+  // Enforce eligible-merchandise-only discounting via a curated collection.
+  items: eligibleItems,
+  value: {
+    fixedAmount: {
+      amount: money(args.valueDollars),
+      appliesOnEachItem: false,
+    },
+  },
+},
+      minimumRequirement: {
+        subtotal: { greaterThanOrEqualToSubtotal: money(args.minOrderDollars) },
+      },
+    },
+  };
+
+  const resp = await adminGraphql(args.shop, token, mutation, variables);
+  const errors = resp?.data?.discountCodeBasicCreate?.userErrors ?? [];
+  if (errors.length) throw new Error(`Shopify discountCodeBasicCreate userErrors: ${JSON.stringify(errors)}`);
+
+  const node = resp?.data?.discountCodeBasicCreate?.codeDiscountNode;
+  const discountNodeId = node?.id;
+  const code = node?.codeDiscount?.codes?.nodes?.[0]?.code;
+
+  if (!discountNodeId || !code) throw new Error(`Unexpected Shopify response: ${JSON.stringify(resp)}`);
+  return { code, discountNodeId };
+}
+
+function money(amount: number): string {
+  // Shopify Money inputs are decimal strings without currency symbols.
+  return Number(amount).toFixed(2);
+}
+
+async function getOfflineAccessToken(shop: string): Promise<string | null> {
+  const offlineId = `offline_${shop}`;
+  const session = await db.session.findUnique({ where: { id: offlineId }, select: { accessToken: true } });
+  return session?.accessToken ?? null;
+}
+
+async function adminGraphql(shop: string, accessToken: string, query: string, variables?: any) {
+  const apiVersion = process.env.SHOPIFY_API_VERSION || "2026-01";
+  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": accessToken },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await res.text();
+  const jsonResp = JSON.parse(text);
+
+  if (!res.ok || jsonResp.errors) {
+    throw new Error(`Shopify GraphQL error (${res.status}): ${JSON.stringify(jsonResp.errors ?? jsonResp)}`);
+  }
+  return jsonResp;
+}

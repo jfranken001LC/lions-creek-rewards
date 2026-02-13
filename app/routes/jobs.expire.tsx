@@ -1,264 +1,182 @@
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { json, type ActionFunctionArgs } from "react-router";
 import db from "../db.server";
+import { LedgerType, RedemptionStatus } from "@prisma/client";
+
+const DEFAULT_REDEMPTION_TTL_HOURS = 72;
+const DEFAULT_POINTS_INACTIVITY_DAYS = 365;
 
 /**
- * POST /jobs/expire
- * Header: X-Job-Token = process.env.JOB_TOKEN
+ * Cron/job endpoint to:
+ *  - expire unused reward discount codes (72h TTL)
+ *  - expire points after 12 months of inactivity
  *
- * This job does:
- *  1) Expire unused redemption codes (ISSUED/APPLIED -> EXPIRED) past TTL,
- *     and deactivate OR delete the Shopify discount node (best-effort).
- *  2) Expire points after 12 months of inactivity.
- *
- * Env:
- *  - JOB_TOKEN=...
- *  - REDEMPTION_CODE_TTL_DAYS=7
- *  - REDEMPTION_EXPIRE_BATCH=250
- *  - REDEMPTION_DELETE_ON_EXPIRE=true   (optional; default false)
+ * Security: requires X-Job-Secret header matching JOB_SECRET env var.
  */
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const secret = request.headers.get("X-Job-Secret") ?? "";
+  const expected = process.env.JOB_SECRET ?? "";
 
-export const loader = async (_args: LoaderFunctionArgs) => {
-  return new Response("ok", { status: 200 });
-};
-
-async function getOfflineAccessToken(shop: string): Promise<string | null> {
-  const id = `offline_${shop}`;
-  const s = await db.session.findUnique({ where: { id } }).catch(() => null);
-  return s?.accessToken ?? null;
-}
-
-async function shopifyGraphql(shop: string, query: string, variables: any) {
-  const token = await getOfflineAccessToken(shop);
-  if (!token) throw new Error(`Missing offline access token for shop ${shop}. Reinstall/re-auth the app.`);
-
-  const endpoint = `https://${shop}/admin/api/2026-01/graphql.json`;
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    throw new Error(`Shopify GraphQL failed (${resp.status}): ${t}`);
+  if (!expected || secret !== expected) {
+    return json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
-  const json = await resp.json().catch(() => null);
-  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  return json?.data;
+  const now = new Date();
+  const jobKey = `expire-${now.toISOString().slice(0, 10)}`; // YYYY-MM-DD
+
+  // Ensure once per day (best-effort).
+  const acquired = await tryAcquireJobLock(jobKey);
+  if (!acquired) {
+    return json({ ok: true, skipped: true, message: "Already executed today." });
+  }
+
+  const ttlHours = Number(process.env.REDEMPTION_CODE_TTL_HOURS ?? DEFAULT_REDEMPTION_TTL_HOURS);
+  const inactivityDays = Number(process.env.POINTS_INACTIVITY_DAYS ?? DEFAULT_POINTS_INACTIVITY_DAYS);
+
+  const shops = await listShops();
+
+  let expiredRedemptions = 0;
+  let expiredPointBalances = 0;
+
+  for (const shop of shops) {
+    expiredRedemptions += await expireRedemptionsForShop(shop, now, ttlHours);
+    expiredPointBalances += await expirePointsForShop(shop, now, inactivityDays, jobKey);
+  }
+
+  return json({ ok: true, expiredRedemptions, expiredPointBalances });
+};
+
+async function listShops() {
+  const [a, b] = await Promise.all([
+    db.redemption.findMany({ distinct: ["shop"], select: { shop: true } }),
+    db.customerPointsBalance.findMany({ distinct: ["shop"], select: { shop: true } }),
+  ]);
+  return Array.from(new Set([...a.map((x) => x.shop), ...b.map((x) => x.shop)])).filter(Boolean);
 }
 
-async function deactivateDiscountNode(shop: string, discountNodeId: string) {
-  const mutation = `
-    mutation Deactivate($id: ID!) {
+async function tryAcquireJobLock(name: string) {
+  try {
+    await db.jobLock.create({ data: { key: name } as any });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function expireRedemptionsForShop(shop: string, now: Date, ttlHours: number) {
+  const cutoff = new Date(now.getTime() - ttlHours * 60 * 60 * 1000);
+
+  const candidates = await db.redemption.findMany({
+    where: {
+      shop,
+      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
+      OR: [{ expiresAt: { lt: now } }, { expiresAt: null, issuedAt: { lt: cutoff } }],
+    },
+    select: { id: true, discountNodeId: true },
+    take: 500,
+  });
+
+  const token = await getOfflineAccessToken(shop);
+  let count = 0;
+
+  for (const r of candidates) {
+    try {
+      if (token && r.discountNodeId) await deactivateDiscountCode(shop, token, r.discountNodeId);
+
+      await db.redemption.update({
+        where: { id: r.id },
+        data: { status: RedemptionStatus.EXPIRED, expiredAt: now } as any,
+      });
+
+      count++;
+    } catch (e) {
+      console.error("expireRedemptionsForShop error:", shop, r.id, e);
+    }
+  }
+
+  return count;
+}
+
+async function expirePointsForShop(shop: string, now: Date, inactivityDays: number, jobKey: string) {
+  const cutoff = new Date(now.getTime() - inactivityDays * 24 * 60 * 60 * 1000);
+
+  const targets = await db.customerPointsBalance.findMany({
+    where: { shop, balance: { gt: 0 }, expiredAt: null, lastActivityAt: { lt: cutoff } },
+    select: { customerId: true, balance: true },
+    take: 1000,
+  });
+
+  let expired = 0;
+  for (const t of targets) {
+    const delta = -t.balance;
+    const sourceId = `${t.customerId}:${jobKey}`;
+
+    try {
+      await db.$transaction(async (tx) => {
+        await tx.pointsLedger.create({
+          data: {
+            shop,
+            customerId: t.customerId,
+            type: LedgerType.EXPIRE,
+            delta,
+            source: "EXPIRY",
+            sourceId,
+            description: `Expired ${t.balance} point(s) after ${inactivityDays} days of inactivity.`,
+          },
+        });
+
+        await tx.customerPointsBalance.update({
+          where: { shop_customerId: { shop, customerId: t.customerId } },
+          data: { balance: 0, expiredAt: now },
+        });
+      });
+
+      expired++;
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      if (msg.includes("Unique constraint failed") || msg.includes("UNIQUE constraint failed")) continue;
+      console.error("expirePointsForShop error:", shop, t.customerId, e);
+    }
+  }
+
+  return expired;
+}
+
+async function getOfflineAccessToken(shop: string) {
+  const offlineId = `offline_${shop}`;
+  const session = await db.session.findUnique({ where: { id: offlineId }, select: { accessToken: true } });
+  return session?.accessToken ?? null;
+}
+
+async function deactivateDiscountCode(shop: string, accessToken: string, discountNodeId: string) {
+  const mutation = `#graphql
+    mutation DeactivateDiscount($id: ID!) {
       discountCodeDeactivate(id: $id) {
         codeDiscountNode { id }
         userErrors { field message }
       }
     }
   `;
-  const data = await shopifyGraphql(shop, mutation, { id: discountNodeId });
-  const res = data?.discountCodeDeactivate;
-  const errs: any[] = res?.userErrors ?? [];
-  if (errs.length) throw new Error(`discountCodeDeactivate userErrors: ${JSON.stringify(errs)}`);
-  return String(res?.codeDiscountNode?.id ?? "");
+
+  const resp = await adminGraphql(shop, accessToken, mutation, { id: discountNodeId });
+  const errors = resp?.data?.discountCodeDeactivate?.userErrors ?? [];
+  if (errors.length) throw new Error(`discountCodeDeactivate userErrors: ${JSON.stringify(errors)}`);
 }
 
-async function deleteDiscountNode(shop: string, discountNodeId: string) {
-  const mutation = `
-    mutation Delete($id: ID!) {
-      discountCodeDelete(id: $id) {
-        deletedCodeDiscountId
-        userErrors { field message }
-      }
-    }
-  `;
-  const data = await shopifyGraphql(shop, mutation, { id: discountNodeId });
-  const res = data?.discountCodeDelete;
-  const errs: any[] = res?.userErrors ?? [];
-  if (errs.length) throw new Error(`discountCodeDelete userErrors: ${JSON.stringify(errs)}`);
-  return String(res?.deletedCodeDiscountId ?? "");
-}
+async function adminGraphql(shop: string, accessToken: string, query: string, variables?: any) {
+  const apiVersion = process.env.SHOPIFY_API_VERSION || "2026-01";
+  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
 
-function envBool(v: string | undefined, defaultValue = false) {
-  if (v == null) return defaultValue;
-  const s = v.trim().toLowerCase();
-  return ["1", "true", "yes", "y", "on"].includes(s);
-}
-
-export const action = async ({ request }: ActionFunctionArgs) => {
-  if (request.method !== "POST") return new Response("ok", { status: 200 });
-
-  const token = request.headers.get("X-Job-Token") ?? "";
-  if (!process.env.JOB_TOKEN || token !== process.env.JOB_TOKEN) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-
-  const jobKey = `expire:${new Date().toISOString().slice(0, 10)}`;
-
-  // Idempotent job lock (per day)
-  try {
-    await db.jobLock.create({ data: { key: jobKey, createdAt: new Date() } });
-  } catch {
-    return new Response(JSON.stringify({ ok: true, skipped: true, reason: "already-ran" }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  const ttlDays = Number(process.env.REDEMPTION_CODE_TTL_DAYS ?? "7") || 7;
-  const codeCutoff = new Date(Date.now() - ttlDays * 24 * 60 * 60 * 1000);
-  const maxCodesPerRun = Number(process.env.REDEMPTION_EXPIRE_BATCH ?? "250") || 250;
-  const deleteOnExpire = envBool(process.env.REDEMPTION_DELETE_ON_EXPIRE, false);
-
-  // ------------------------------------------------------------
-  // 1) Expire unused redemption codes
-  // ------------------------------------------------------------
-  const now = new Date();
-  const codesToExpire = await db.redemption.findMany({
-    where: {
-      status: { in: ["ISSUED", "APPLIED"] } as any,
-      OR: [{ expiresAt: { lt: now } }, { createdAt: { lt: codeCutoff } }],
-    },
-    orderBy: { createdAt: "asc" },
-    take: maxCodesPerRun,
-    select: {
-      id: true,
-      shop: true,
-      discountCode: true,
-      discountNodeId: true,
-      status: true,
-    },
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": accessToken },
+    body: JSON.stringify({ query, variables }),
   });
 
-  let redemptionExpiredCount = 0;
-  let redemptionDeactivatedCount = 0;
-  let redemptionDeletedCount = 0;
+  const text = await res.text();
+  const jsonResp = JSON.parse(text);
 
-  const cleanupErrors: Array<{ id: string; shop: string; mode: string; error: string }> = [];
-
-  for (const r of codesToExpire) {
-    // Attempt Shopify cleanup (best-effort)
-    if (r.discountNodeId) {
-      if (deleteOnExpire) {
-        try {
-          const deletedId = await deleteDiscountNode(r.shop, r.discountNodeId);
-          if (deletedId) redemptionDeletedCount += 1;
-        } catch (e: any) {
-          cleanupErrors.push({
-            id: r.id,
-            shop: r.shop,
-            mode: "delete",
-            error: String(e?.message ?? e),
-          });
-          // Fall back to deactivate if delete fails
-          try {
-            const deactivatedId = await deactivateDiscountNode(r.shop, r.discountNodeId);
-            if (deactivatedId) redemptionDeactivatedCount += 1;
-          } catch (e2: any) {
-            cleanupErrors.push({
-              id: r.id,
-              shop: r.shop,
-              mode: "deactivate-fallback",
-              error: String(e2?.message ?? e2),
-            });
-          }
-        }
-      } else {
-        try {
-          const deactivatedId = await deactivateDiscountNode(r.shop, r.discountNodeId);
-          if (deactivatedId) redemptionDeactivatedCount += 1;
-        } catch (e: any) {
-          cleanupErrors.push({
-            id: r.id,
-            shop: r.shop,
-            mode: "deactivate",
-            error: String(e?.message ?? e),
-          });
-        }
-      }
-    }
-
-    // Mark redemption expired in DB
-    await db.redemption.update({
-      where: { id: r.id },
-      data: {
-        status: "EXPIRED",
-        expiredAt: new Date(),
-      } as any,
-    });
-
-    redemptionExpiredCount += 1;
+  if (!res.ok || jsonResp.errors) {
+    throw new Error(`Shopify GraphQL error (${res.status}): ${JSON.stringify(jsonResp.errors ?? jsonResp)}`);
   }
-
-  // ------------------------------------------------------------
-  // 2) Expire points after 12 months inactivity
-  // ------------------------------------------------------------
-  const pointsCutoff = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
-
-  const targets = await db.customerPointsBalance.findMany({
-    where: {
-      balance: { gt: 0 },
-      lastActivityAt: { lt: pointsCutoff },
-    },
-    take: 5000,
-  });
-
-  let pointsExpiredCount = 0;
-
-  for (const t of targets) {
-    const pointsToExpire = t.balance;
-    if (pointsToExpire <= 0) continue;
-
-    await db.$transaction(async (tx) => {
-      await tx.pointsLedger.create({
-        data: {
-          shop: t.shop,
-          customerId: t.customerId,
-          type: "EXPIRE",
-          delta: -pointsToExpire,
-          source: "EXPIRY",
-          sourceId: jobKey,
-          description: "Expired points due to 12 months inactivity",
-          createdAt: new Date(),
-        },
-      });
-
-      await tx.customerPointsBalance.update({
-        where: { shop_customerId: { shop: t.shop, customerId: t.customerId } },
-        data: {
-          balance: 0,
-          expiredAt: new Date(),
-        },
-      });
-    });
-
-    pointsExpiredCount += 1;
-  }
-
-  return new Response(
-    JSON.stringify({
-      ok: true,
-      jobKey,
-      redemption: {
-        ttlDays,
-        cutoffIso: codeCutoff.toISOString(),
-        expireBatch: maxCodesPerRun,
-        deleteOnExpire,
-        expiredCount: redemptionExpiredCount,
-        deactivatedCount: redemptionDeactivatedCount,
-        deletedCount: redemptionDeletedCount,
-        cleanupErrors,
-      },
-      points: {
-        cutoffIso: pointsCutoff.toISOString(),
-        expiredCount: pointsExpiredCount,
-      },
-    }),
-    { status: 200, headers: { "Content-Type": "application/json" } },
-  );
-};
+  return jsonResp;
+}

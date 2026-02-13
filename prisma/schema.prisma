@@ -10,34 +10,31 @@ datasource db {
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String   @id
+  shop                String
+  state               String
+  isOnline            Boolean  @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean  @default(false)
+  locale              String?
+  collaborator        Boolean? @default(false)
+  emailVerified       Boolean? @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
-
-/// Lions Creek Rewards — v1.1
-/// SQLite note: lists/maps are stored as Json (backed by TEXT).
 
 enum LedgerType {
   EARN
   REVERSAL
   REDEEM
   ADJUST
-  EXPIRE
+  EXPIRY
 }
 
 enum RedemptionStatus {
@@ -49,7 +46,6 @@ enum RedemptionStatus {
   CANCELLED
 }
 
-/// Webhook processing outcomes (admin-visible logging)
 enum WebhookOutcome {
   RECEIVED
   PROCESSED
@@ -58,16 +54,19 @@ enum WebhookOutcome {
 }
 
 model ShopSettings {
-  shop                String   @id
-  earnRate             Int      @default(1)
-  redemptionMinOrder   Int      @default(0)
-  /// Arrays and maps (SQLite): store as Json (TEXT-backed).
-  excludedCustomerTags Json?
-  includeProductTags   Json?
-  excludeProductTags   Json?
-  redemptionSteps      Json?
-  redemptionValueMap   Json?
-  updatedAt            DateTime @default(now())
+  shop                     String   @id
+  earnRate                  Int      @default(1)
+  redemptionMinOrder        Int      @default(0)
+
+  eligibleCollectionHandle  String   @default("loyalty-eligible")
+  eligibleCollectionGid     String?
+
+  excludedCustomerTags      Json?
+  includeProductTags        Json?
+  excludeProductTags        Json?
+  redemptionSteps           Json?
+  redemptionValueMap        Json?
+  updatedAt                 DateTime @default(now())
 }
 
 model CustomerPointsBalance {
@@ -97,11 +96,7 @@ model PointsLedger {
 
   @@index([shop, customerId, createdAt])
 
-  /// Existing safety (event-level dedupe scoped to customer)
   @@unique([shop, customerId, type, source, sourceId], name: "ledger_dedupe")
-
-  /// NEW: refund/cancel reversal dedupe regardless of customerId
-  /// (matches your runtime check: shop+type+source+sourceId)
   @@unique([shop, type, source, sourceId], name: "ledger_refund_dedupe")
 }
 
@@ -111,70 +106,62 @@ model OrderPointsSnapshot {
   orderId                String
   orderName              String?
   customerId             String
-  eligibleNetMerchandise Float    @default(0)
+  eligibleNetMerchandise Float    @default(0) // stored as cents (integer-like float)
   pointsAwarded          Int      @default(0)
   pointsReversedToDate   Int      @default(0)
   paidAt                 DateTime
   cancelledAt            DateTime?
   currency               String   @default("CAD")
-
-  // For audit/debug: discount codes present on the order at the time points were captured.
-  discountCodesJson Json?
+  discountCodesJson      Json?
 
   @@unique([shop, orderId], name: "shop_orderId")
   @@index([shop, customerId])
 }
 
 model Redemption {
-  id          String           @id @default(cuid())
-  shop        String
-  customerId  String
-  // Points consumed to issue this redemption.
-  points      Int
-  value       Int
-  code        String
-
-  // GraphQL ID for the created CodeDiscountNode (used for deactivate/delete).
+  id             String           @id @default(cuid())
+  shop           String
+  customerId     String
+  points         Int
+  value          Int              // integer dollars (CAD)
+  code           String
   discountNodeId String?
+  idemKey        String?
 
-  // Client-provided idempotency key (prevents duplicate issuance).
-  idemKey String?
+  reissuedFromId String?
+  restoreReason  String?
+  restoredAt     DateTime?
 
-  status      RedemptionStatus @default(ISSUED)
-  createdAt   DateTime         @default(now())
-  issuedAt    DateTime?
-  appliedAt   DateTime?
-  expiresAt   DateTime?
-
-  // When this redemption was actually expired by a job.
-  expiredAt DateTime?
-
-  // When this redemption was consumed by an order.
-  consumedAt      DateTime?
+  status         RedemptionStatus @default(ISSUED)
+  createdAt      DateTime         @default(now())
+  issuedAt       DateTime?
+  appliedAt      DateTime?
+  expiresAt      DateTime?
+  expiredAt      DateTime?
+  consumedAt     DateTime?
   consumedOrderId String?
-
-  voidedAt    DateTime?
-  cancelledAt DateTime?
+  voidedAt       DateTime?
+  cancelledAt    DateTime?
 
   @@unique([shop, code], name: "shop_code")
   @@unique([shop, customerId, idemKey], name: "shop_customer_idemKey")
+  @@unique([shop, reissuedFromId], name: "shop_reissue_once")
+
   @@index([shop, customerId, createdAt])
   @@index([shop, status, createdAt])
 }
 
 model WebhookEvent {
-  id         String   @id @default(cuid())
-  shop       String
-  webhookId  String
-  topic      String
-  resourceId String
-  receivedAt DateTime @default(now())
-
-  /// NEW: outcome tracking fields
-  outcome        WebhookOutcome @default(RECEIVED)
-  outcomeCode    String?
+  id            String         @id @default(cuid())
+  shop          String
+  webhookId     String
+  topic         String
+  resourceId    String
+  receivedAt    DateTime       @default(now())
+  outcome       WebhookOutcome @default(RECEIVED)
+  outcomeCode   String?
   outcomeMessage String?
-  processedAt    DateTime?
+  processedAt   DateTime?
 
   @@unique([shop, webhookId], name: "shop_webhookId")
   @@index([shop, topic, receivedAt])
@@ -197,12 +184,13 @@ model PrivacyEvent {
   shop        String
   topic       String
   payloadJson String
-  createdAt   DateTime @default(now())
+  receivedAt  DateTime @default(now())
 
-  @@index([shop, createdAt])
+  @@index([shop, receivedAt])
 }
 
 model JobLock {
-  key       String   @id
-  createdAt DateTime @default(now())
+  name        String   @id
+  lockedAt    DateTime @default(now())
+  lockedUntil DateTime
 }

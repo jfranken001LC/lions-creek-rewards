@@ -1,378 +1,282 @@
-// app/routes/app.customers.tsx
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { data, Form, Link, useActionData, useLoaderData, useNavigation } from "react-router";
 import {
   Page,
+  Layout,
   Card,
   Text,
-  TextField,
+  IndexTable,
+  useIndexResourceState,
+  Badge,
   Button,
   InlineStack,
+  Modal,
+  TextField,
   BlockStack,
-  DataTable,
-  Banner,
-  Divider,
 } from "@shopify/polaris";
-import db from "../db.server";
+import crypto from "crypto";
+import { useMemo, useState } from "react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Form, json, useActionData, useLoaderData, useNavigation } from "react-router";
 import { authenticate } from "../shopify.server";
+import db from "../db.server";
+import { LedgerType } from "@prisma/client";
 
-type CustomerHit = {
-  id: string; // GID
-  customerId: string; // legacy numeric as string
-  displayName: string;
-  email?: string | null;
+type CustomerRow = {
+  id: string;
+  customerId: string;
+  balance: number;
+  lifetimeEarned: number;
+  lifetimeRedeemed: number;
+  lastActivityAt: string;
+  expiredAt: string | null;
 };
-
-function gidToLegacyId(gid: string): string {
-  const parts = String(gid).split("/");
-  return parts[parts.length - 1] ?? "";
-}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const url = new URL(request.url);
-  const customerId = url.searchParams.get("customerId")?.trim() ?? "";
+  const shop = session.shop;
 
-  if (!customerId) {
-    return data({
-      shop: session.shop,
-      selected: null as any,
-    });
-  }
-
-  const balance = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop: session.shop, customerId } },
-  });
-
-  const ledger = await db.pointsLedger.findMany({
-    where: { shop: session.shop, customerId },
-    orderBy: { createdAt: "desc" },
+  const rows = await db.customerPointsBalance.findMany({
+    where: { shop },
+    orderBy: { lastActivityAt: "desc" },
     take: 100,
-  });
-
-  const redemptions = await db.redemption.findMany({
-    where: { shop: session.shop, customerId },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-  });
-
-  return data({
-    shop: session.shop,
-    selected: {
-      customerId,
-      balance,
-      ledger,
-      redemptions,
+    select: {
+      id: true,
+      customerId: true,
+      balance: true,
+      lifetimeEarned: true,
+      lifetimeRedeemed: true,
+      lastActivityAt: true,
+      expiredAt: true,
     },
+  });
+
+  return json({
+    shop,
+    customers: rows.map(
+      (c): CustomerRow => ({
+        id: c.id,
+        customerId: c.customerId,
+        balance: c.balance,
+        lifetimeEarned: c.lifetimeEarned,
+        lifetimeRedeemed: c.lifetimeRedeemed,
+        lastActivityAt: c.lastActivityAt.toISOString(),
+        expiredAt: c.expiredAt ? c.expiredAt.toISOString() : null,
+      }),
+    ),
   });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
+  const shop = session.shop;
+
   const form = await request.formData();
-  const intent = String(form.get("_intent") ?? "");
+  const intent = String(form.get("intent") || "");
 
-  if (intent === "search") {
-    const query = String(form.get("query") ?? "").trim();
-    const customerId = String(form.get("customerId") ?? "").trim();
-
-    // Allow direct lookup by numeric customerId without Shopify search
-    if (customerId) {
-      return data({ ok: true, hits: [] as CustomerHit[], directCustomerId: customerId });
-    }
-
-    if (!query) return data({ ok: false, error: "Enter a name/email/customer id to search." }, { status: 400 });
-
-    // Shopify GraphQL customer search
-    const accessToken = await db.session.findFirst({
-      where: { shop: session.shop, isOnline: false },
-      orderBy: { createdAt: "desc" },
-      select: { accessToken: true },
-    });
-
-    if (!accessToken?.accessToken) {
-      return data({ ok: false, error: "Missing offline token; reinstall or re-auth the app." }, { status: 500 });
-    }
-
-    const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION ?? "2026-01";
-    const endpoint = `https://${session.shop}/admin/api/${apiVersion}/graphql.json`;
-
-    // Search by name/email; if numeric provided, try id:NNN
-    const looksNumeric = /^\d+$/.test(query);
-    const search = looksNumeric ? `id:${query}` : query;
-
-    const gql = `
-      query Customers($first: Int!, $query: String!) {
-        customers(first: $first, query: $query) {
-          edges {
-            node {
-              id
-              displayName
-              email
-            }
-          }
-        }
-      }
-    `;
-
-    const resp = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": accessToken.accessToken,
-      },
-      body: JSON.stringify({ query: gql, variables: { first: 20, query: search } }),
-    });
-
-    const json = (await resp.json()) as any;
-    if (!resp.ok || json?.errors) {
-      return data({ ok: false, error: json?.errors ? JSON.stringify(json.errors) : `HTTP ${resp.status}` }, { status: 500 });
-    }
-
-    const edges = json?.data?.customers?.edges ?? [];
-    const hits: CustomerHit[] = edges.map((e: any) => {
-      const gid = String(e?.node?.id ?? "");
-      return {
-        id: gid,
-        customerId: gidToLegacyId(gid),
-        displayName: String(e?.node?.displayName ?? ""),
-        email: e?.node?.email ?? null,
-      };
-    });
-
-    return data({ ok: true, hits, directCustomerId: null });
+  if (intent !== "adjust") {
+    return json({ ok: false, error: "Unknown intent" }, { status: 400 });
   }
 
-  if (intent === "adjust") {
-    const customerId = String(form.get("customerId") ?? "").trim();
-    const deltaRaw = String(form.get("delta") ?? "").trim();
-    const reason = String(form.get("reason") ?? "").trim();
+  const customerId = String(form.get("customerId") || "").trim();
+  const deltaRaw = String(form.get("pointsDelta") || "").trim();
 
-    if (!customerId) return data({ ok: false, error: "Missing customerId." }, { status: 400 });
-    if (!deltaRaw) return data({ ok: false, error: "Enter a delta (e.g., 50 or -50)." }, { status: 400 });
-    if (!reason) return data({ ok: false, error: "Reason is required." }, { status: 400 });
+  const delta = Math.trunc(Number(deltaRaw));
+  if (!customerId || !Number.isFinite(delta) || delta === 0) {
+    return json({ ok: false, error: "Invalid customerId or pointsDelta" }, { status: 400 });
+  }
 
-    const delta = Math.trunc(Number(deltaRaw));
-    if (!Number.isFinite(delta) || delta === 0) {
-      return data({ ok: false, error: "Delta must be a non-zero integer." }, { status: 400 });
-    }
+  const now = new Date();
+  const sourceId = `ADMIN_ADJUST:${crypto.randomUUID()}`;
 
+  try {
     await db.$transaction(async (tx) => {
-      const existing =
-        (await tx.customerPointsBalance.findUnique({
-          where: { shop_customerId: { shop: session.shop, customerId } },
-        })) ??
-        (await tx.customerPointsBalance.create({
-          data: {
-            shop: session.shop,
-            customerId,
-            balance: 0,
-            lifetimeEarned: 0,
-            lifetimeRedeemed: 0,
-            lastActivityAt: null,
-            expiredAt: null,
-          },
-        }));
-
-      const next = Math.max(0, existing.balance + delta);
-      const applied = next - existing.balance;
-      if (applied === 0) return;
-
       await tx.pointsLedger.create({
         data: {
-          shop: session.shop,
+          shop,
           customerId,
-          type: "ADJUST" as any,
-          delta: applied,
+          type: LedgerType.ADJUST,
+          delta,
           source: "ADMIN",
-          sourceId: crypto.randomUUID(),
-          description: reason,
+          sourceId,
+          description: `Admin adjustment: ${delta > 0 ? "+" : ""}${delta} point(s).`,
         },
       });
 
-      await tx.customerPointsBalance.update({
-        where: { shop_customerId: { shop: session.shop, customerId } },
-        data: {
-          balance: next,
-          lastActivityAt: new Date(),
-        },
+      // Upsert balance row. IMPORTANT: never null-out lastActivityAt.
+      const existing = await tx.customerPointsBalance.findUnique({
+        where: { shop_customerId: { shop, customerId } },
+        select: { id: true, balance: true },
       });
+
+      if (!existing) {
+        await tx.customerPointsBalance.create({
+          data: {
+            shop,
+            customerId,
+            balance: Math.max(0, delta),
+            lifetimeEarned: 0,
+            lifetimeRedeemed: 0,
+            lastActivityAt: now,
+            expiredAt: null,
+          },
+        });
+      } else {
+        await tx.customerPointsBalance.update({
+          where: { id: existing.id },
+          data: {
+            balance: Math.max(0, existing.balance + delta),
+            lastActivityAt: now,
+            expiredAt: null,
+          },
+        });
+      }
     });
 
-    return data({ ok: true, adjustedCustomerId: customerId });
+    return json({ ok: true });
+  } catch (e: any) {
+    return json({ ok: false, error: e?.message ?? "Adjustment failed" }, { status: 500 });
   }
-
-  return data({ ok: false, error: "Unsupported action." }, { status: 400 });
 };
 
-export default function CustomersAdmin() {
-  const ld = useLoaderData() as any;
-  const ad = useActionData() as any;
-  const nav = useNavigation();
+export default function CustomersAdminRoute() {
+  const { customers } = useLoaderData() as { customers: CustomerRow[] };
+  const actionData = useActionData() as { ok?: boolean; error?: string } | undefined;
+  const navigation = useNavigation();
 
-  const busy = nav.state !== "idle";
-  const selected = ld?.selected ?? null;
+  const resourceName = {
+    singular: "customer",
+    plural: "customers",
+  };
 
-  const hits: CustomerHit[] = ad?.hits ?? [];
-  const directCustomerId: string | null = ad?.directCustomerId ?? null;
+  const { selectedResources, allResourcesSelected, handleSelectionChange } = useIndexResourceState(customers);
+
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalCustomerId, setModalCustomerId] = useState<string>("");
+  const [deltaValue, setDeltaValue] = useState<string>("");
+
+  const isSubmitting = navigation.state === "submitting";
+
+  const rowsMarkup = useMemo(() => {
+    return customers.map((c, index) => {
+      const expired = Boolean(c.expiredAt);
+      return (
+        <IndexTable.Row id={c.id} key={c.id} position={index} selected={selectedResources.includes(c.id)}>
+          <IndexTable.Cell>
+            <Text as="span" variant="bodyMd" fontWeight="bold">
+              {c.customerId}
+            </Text>
+          </IndexTable.Cell>
+
+          <IndexTable.Cell>
+            <InlineStack gap="200" blockAlign="center">
+              <Text as="span">{c.balance}</Text>
+              {expired ? <Badge tone="warning">Expired</Badge> : <Badge tone="success">Active</Badge>}
+            </InlineStack>
+          </IndexTable.Cell>
+
+          <IndexTable.Cell>{c.lifetimeEarned}</IndexTable.Cell>
+          <IndexTable.Cell>{c.lifetimeRedeemed}</IndexTable.Cell>
+          <IndexTable.Cell>{new Date(c.lastActivityAt).toLocaleString()}</IndexTable.Cell>
+
+          <IndexTable.Cell>
+            <Button
+              size="slim"
+              onClick={() => {
+                setModalCustomerId(c.customerId);
+                setDeltaValue("");
+                setModalOpen(true);
+              }}
+            >
+              Adjust
+            </Button>
+          </IndexTable.Cell>
+        </IndexTable.Row>
+      );
+    });
+  }, [customers, selectedResources]);
 
   return (
-    <Page title="Customers (Loyalty)">
-      <BlockStack gap="400">
-        {ad?.error ? (
-          <Banner tone="critical">
-            <p>{ad.error}</p>
-          </Banner>
-        ) : null}
-
-        {ad?.ok && ad?.adjustedCustomerId ? (
-          <Banner tone="success">
-            <p>Adjustment applied for customerId {ad.adjustedCustomerId}.</p>
-          </Banner>
-        ) : null}
-
-        <Card>
-          <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              Lookup
-            </Text>
-
-            <Form method="post">
-              <input type="hidden" name="_intent" value="search" />
-              <InlineStack gap="300" wrap>
-                <TextField
-                  label="Search (name/email) OR leave blank and use Customer ID"
-                  name="query"
-                  autoComplete="off"
-                  disabled={busy}
-                />
-                <TextField
-                  label="Customer ID (numeric)"
-                  name="customerId"
-                  autoComplete="off"
-                  disabled={busy}
-                />
-                <Button submit variant="primary" disabled={busy}>
-                  Search
-                </Button>
-              </InlineStack>
-            </Form>
-
-            {directCustomerId ? (
-              <Banner tone="info">
-                <p>
-                  Direct lookup requested.{" "}
-                  <Link to={`/app/customers?customerId=${encodeURIComponent(directCustomerId)}`}>
-                    View customerId {directCustomerId}
-                  </Link>
-                </p>
-              </Banner>
-            ) : null}
-
-            {hits.length ? (
-              <>
-                <Divider />
-                <Text as="h3" variant="headingSm">
-                  Results
-                </Text>
-                <DataTable
-                  columnContentTypes={["text", "text", "text", "text"]}
-                  headings={["Customer ID", "Display Name", "Email", "Actions"]}
-                  rows={hits.map((h) => [
-                    h.customerId,
-                    h.displayName,
-                    h.email ?? "",
-                    <Link key={h.customerId} to={`/app/customers?customerId=${encodeURIComponent(h.customerId)}`}>
-                      View
-                    </Link>,
-                  ])}
-                />
-              </>
-            ) : null}
-          </BlockStack>
-        </Card>
-
-        {selected ? (
+    <Page title="Customers">
+      <Layout>
+        <Layout.Section>
           <Card>
             <BlockStack gap="300">
-              <Text as="h2" variant="headingMd">
-                Customer {selected.customerId}
-              </Text>
-
               <Text as="p" variant="bodyMd">
-                Balance: <b>{selected.balance?.balance ?? 0}</b> points · Lifetime earned:{" "}
-                <b>{selected.balance?.lifetimeEarned ?? 0}</b> · Lifetime redeemed:{" "}
-                <b>{selected.balance?.lifetimeRedeemed ?? 0}</b>
+                Admin-only view of loyalty balances. Adjustments update <strong>balance</strong> only (no change to
+                lifetime earned/redeemed).
               </Text>
-
-              <Divider />
-
-              <Text as="h3" variant="headingSm">
-                Manual adjustment (FR-4.3)
-              </Text>
-
-              <Form method="post">
-                <input type="hidden" name="_intent" value="adjust" />
-                <input type="hidden" name="customerId" value={selected.customerId} />
-                <InlineStack gap="300" wrap>
-                  <TextField
-                    label="Delta (positive or negative)"
-                    name="delta"
-                    autoComplete="off"
-                    disabled={busy}
-                    helpText="Example: 50 adds 50 points, -50 removes 50 points. Balance will never go below 0."
-                  />
-                  <TextField
-                    label="Reason"
-                    name="reason"
-                    autoComplete="off"
-                    disabled={busy}
-                  />
-                  <Button submit variant="primary" disabled={busy}>
-                    Apply
-                  </Button>
-                </InlineStack>
-              </Form>
-
-              <Divider />
-
-              <Text as="h3" variant="headingSm">
-                Ledger (last 100) (FR-4.4)
-              </Text>
-
-              <DataTable
-                columnContentTypes={["text", "text", "numeric", "text", "text"]}
-                headings={["When", "Type", "Delta", "Source", "Description"]}
-                rows={(selected.ledger ?? []).map((l: any) => [
-                  new Date(l.createdAt).toLocaleString(),
-                  String(l.type),
-                  String(l.delta),
-                  `${l.source}:${l.sourceId}`,
-                  l.description,
-                ])}
-              />
-
-              <Divider />
-
-              <Text as="h3" variant="headingSm">
-                Redemptions (last 50)
-              </Text>
-
-              <DataTable
-                columnContentTypes={["text", "text", "numeric", "numeric", "text"]}
-                headings={["Issued", "Code", "Value", "Points", "Status"]}
-                rows={(selected.redemptions ?? []).map((r: any) => [
-                  new Date(r.createdAt).toLocaleString(),
-                  r.code,
-                  String(r.value),
-                  String(r.points),
-                  String(r.status),
-                ])}
-              />
+              {actionData?.error ? (
+                <Text as="p" variant="bodyMd" tone="critical">
+                  {actionData.error}
+                </Text>
+              ) : null}
             </BlockStack>
           </Card>
-        ) : null}
-      </BlockStack>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card padding="0">
+            <IndexTable
+              resourceName={resourceName}
+              itemCount={customers.length}
+              selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
+              onSelectionChange={handleSelectionChange}
+              headings={[
+                { title: "Customer ID" },
+                { title: "Balance" },
+                { title: "Lifetime Earned" },
+                { title: "Lifetime Redeemed" },
+                { title: "Last Activity" },
+                { title: "Actions" },
+              ]}
+            >
+              {rowsMarkup}
+            </IndexTable>
+          </Card>
+        </Layout.Section>
+      </Layout>
+
+      <Modal
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        title={`Adjust points — Customer ${modalCustomerId}`}
+        primaryAction={
+          <Button
+            variant="primary"
+            loading={isSubmitting}
+            disabled={isSubmitting || !deltaValue.trim()}
+            onClick={() => {
+              const form = document.getElementById("adjust-form") as HTMLFormElement | null;
+              form?.requestSubmit();
+            }}
+          >
+            Apply
+          </Button>
+        }
+        secondaryActions={[{ content: "Cancel", onAction: () => setModalOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <Text as="p" variant="bodyMd">
+              Enter a positive or negative integer. Example: <code>50</code> adds 50 points; <code>-50</code> removes 50
+              points (floor at 0).
+            </Text>
+
+            <Form method="post" id="adjust-form" onSubmit={() => setModalOpen(false)}>
+              <input type="hidden" name="intent" value="adjust" />
+              <input type="hidden" name="customerId" value={modalCustomerId} />
+
+              <TextField
+                label="Points delta"
+                name="pointsDelta"
+                value={deltaValue}
+                onChange={setDeltaValue}
+                autoComplete="off"
+                helpText="Use whole numbers only"
+              />
+            </Form>
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }

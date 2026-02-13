@@ -1,0 +1,14 @@
+{
+  "name": "lcr-loyalty-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "shopify app build"
+  },
+  "dependencies": {
+    "@shopify/ui-extensions": "^2026.1.0",
+    "@shopify/ui-extensions-react": "^2026.1.0",
+    "react": "^18.2.0"
+  }
+}
