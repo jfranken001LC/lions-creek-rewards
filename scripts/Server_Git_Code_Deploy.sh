@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # ==============================================================================
 # Loyalty - Production Deploy (Git + Build + Prisma + Systemd restart)
-# Based on BasketBooster deploy script, tuned for loyalty.basketbooster.ca
+# Tuned for loyalty.basketbooster.ca
 # ==============================================================================
 
 # -------- Config (override via env vars) --------------------------------------
@@ -16,13 +16,12 @@ LOCK_FILE="${LOCK_FILE:-/var/lock/${SERVICE_NAME}.deploy.lock}"
 
 say() { printf "\n==== %s ====\n" "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
 load_env() {
   [[ -f "$ENV_FILE" ]] || die "Env file not found: $ENV_FILE"
-  # shellcheck disable=SC1090
   set -a
+  # shellcheck disable=SC1090
   source <(sudo -n cat "$ENV_FILE")
   set +a
 }
@@ -36,11 +35,42 @@ if [[ "${DEPLOY_REEXEC:-0}" != "1" ]] && [[ "$SELF" == "$REPO_DIR"* ]]; then
   DEPLOY_REEXEC=1 exec "$TMP" "$@"
 fi
 
+run_prisma() {
+  local prisma_bin="$REPO_DIR/node_modules/.bin/prisma"
+  [[ -x "$prisma_bin" ]] || die "Prisma binary not found at $prisma_bin (did npm install succeed?)"
+  cd "$REPO_DIR"
+  "$prisma_bin" "$@"
+}
+
+install_deps() {
+  cd "$REPO_DIR"
+
+  # Make npm more forgiving with Shopify peer dependencies / workspace churn
+  export npm_config_legacy_peer_deps="true"
+  export npm_config_audit="false"
+  export npm_config_fund="false"
+
+  if [[ -f package-lock.json ]]; then
+    say "Install dependencies (prefer npm ci; fallback to npm install if lock mismatch)"
+    if npm ci --include=dev --no-audit --no-fund; then
+      return 0
+    fi
+
+    echo "npm ci failed (lock out of sync). Falling back to npm install..."
+    npm install --include=dev --no-audit --no-fund
+    return 0
+  fi
+
+  say "Install dependencies (npm install)"
+  npm install --include=dev --no-audit --no-fund
+}
+
 # -------- Preflight ------------------------------------------------------------
 need_cmd git
 need_cmd sudo
 need_cmd node
 need_cmd npm
+need_cmd flock
 
 say "Preflight"
 echo "Repo: $REPO_DIR"
@@ -70,7 +100,16 @@ git reset --hard "${REMOTE}/${BRANCH}"
 
 # -------- Clean build artifacts (preserve env + sqlite DB) ---------------------
 say "Clean ignored/untracked build artifacts (preserve env + sqlite DB)"
-git clean -ffdx -e ".env" -e ".env.*" -e "prisma/prod.sqlite" || true
+# Preserve common sqlite/db locations regardless of accidental nesting
+git clean -ffdx \
+  -e ".env" \
+  -e ".env.*" \
+  -e "prisma/**/prod.sqlite" \
+  -e "prisma/**/*.sqlite" \
+  -e "prisma/**/*.db" \
+  -e "prisma/*.sqlite" \
+  -e "prisma/*.db" \
+  || true
 
 # -------- Show current revision ------------------------------------------------
 say "Show current revision"
@@ -95,17 +134,21 @@ if (( ${#missing[@]} > 0 )); then
 fi
 
 # -------- Install dependencies -------------------------------------------------
-say "Install dependencies (include dev deps for build)"
-if [[ -f package-lock.json ]]; then
-  npm ci --include=dev
-else
-  npm install
-fi
+install_deps
 
 # -------- Prisma migrate + generate -------------------------------------------
 say "Prisma deploy"
-npx prisma migrate deploy
-npx prisma generate
+# Silence Prisma’s “update available” nag in logs
+export PRISMA_HIDE_UPDATE_MESSAGE=1
+
+run_prisma generate
+
+if [[ -d "$REPO_DIR/prisma/migrations" ]] && [[ -n "$(ls -A "$REPO_DIR/prisma/migrations" 2>/dev/null || true)" ]]; then
+  run_prisma migrate deploy
+else
+  echo "No prisma/migrations found -> using prisma db push (development-safe)"
+  run_prisma db push
+fi
 
 # -------- Build extensions (only if present) ----------------------------------
 say "Build extension(s) if configured"
@@ -152,17 +195,22 @@ done
 echo "Listening sockets (filtered):"
 ss -ltnp 2>/dev/null | grep -E ":${PORT}\b" || true
 
-curl -fsS "http://${HOST}:${PORT}/" >/dev/null 2>&1 || curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1 || curl -fsS "http://[::1]:${PORT}/" >/dev/null 2>&1 || {
-  echo "Health check failed (no response on ${PORT}). Dumping recent logs:"
-  sudo systemctl status "$SERVICE_NAME" -l --no-pager || true
-  sudo journalctl -u "$SERVICE_NAME" -n 200 -l --no-pager || true
-  exit 4
-}
+curl -fsS "http://${HOST}:${PORT}/" >/dev/null 2>&1 \
+  || curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1 \
+  || curl -fsS "http://[::1]:${PORT}/" >/dev/null 2>&1 \
+  || {
+    echo "Health check failed (no response on ${PORT}). Dumping recent logs:"
+    sudo systemctl status "$SERVICE_NAME" -l --no-pager || true
+    sudo journalctl -u "$SERVICE_NAME" -n 200 -l --no-pager || true
+    exit 4
+  }
 
 echo "OK: app is responding on localhost:${PORT}"
-say "Setting exec status for upgrade file for next iteration"
+
+say "Ensure scripts are executable"
 cd "$REPO_DIR"
-sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh
-sudo chmod +x ./scripts/Server_Git_Only.sh
-sudo chmod +x ./scripts/Prisma_Reset_DB.sh
+sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh || true
+sudo chmod +x ./scripts/Server_Git_Only.sh || true
+sudo chmod +x ./scripts/Prisma_Reset_DB.sh || true
+
 say "Done"
