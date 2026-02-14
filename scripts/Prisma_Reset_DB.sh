@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 REPO_DIR="${REPO_DIR:-/var/www/lions-creek-rewards}"
-BRANCH="${BRANCH:-main}"
-REMOTE="${REMOTE:-origin}"
 SERVICE_NAME="${SERVICE_NAME:-lions-creek-rewards}"
 ENV_FILE="${ENV_FILE:-/etc/lions-creek-rewards/lions-creek-rewards.env}"
-LOCK_FILE="${LOCK_FILE:-/var/lock/${SERVICE_NAME}.deploy.lock}"
-PRISMA_VER="${PRISMA_VER:-6.16.3}"
 
 say() { printf "\n==== %s ====\n" "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -15,115 +11,103 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $
 
 load_env() {
   [[ -f "$ENV_FILE" ]] || die "Env file not found: $ENV_FILE"
-
   set -a
-  if [[ -r "$ENV_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
-  else
-    # shellcheck disable=SC1090
-    source <(sudo -n cat "$ENV_FILE")
-  fi
+  # shellcheck disable=SC1090
+  source <(sudo -n cat "$ENV_FILE")
   set +a
-
-  [[ -n "${DATABASE_URL:-}" ]] || die "DATABASE_URL is not set (expected in $ENV_FILE)"
 }
 
-resolve_sqlite_path() {
-  local url="$1"
-  local p="${url#file:}"
-  p="${p%%\?*}"
-  if [[ "$p" == /* ]]; then
-    echo "$p"
+resolve_sqlite_path_from_database_url() {
+  local url="${DATABASE_URL:-}"
+  [[ -n "$url" ]] || die "DATABASE_URL is not set (check $ENV_FILE)"
+
+  # Prisma SQLite URLs are typically: file:./prisma/prod.sqlite OR file:/abs/path.db
+  if [[ "$url" =~ ^file:(.*)$ ]]; then
+    local p="${BASH_REMATCH[1]}"
+    if [[ "$p" =~ ^/ ]]; then
+      echo "$p"
+    else
+      # relative to repo root
+      echo "$REPO_DIR/$p"
+    fi
   else
-    echo "$REPO_DIR/$p"
+    die "This reset script currently supports SQLite DATABASE_URLs only. Got: $url"
   fi
 }
 
-# Re-exec from /tmp so git operations never clobber the running script
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-if [[ "${DEPLOY_REEXEC:-0}" != "1" ]] && [[ "$SELF" == "$REPO_DIR"* ]]; then
-  TMP="/tmp/$(basename "$SELF").$$"
-  cp -f "$SELF" "$TMP"
-  chmod +x "$TMP"
-  DEPLOY_REEXEC=1 exec "$TMP" "$@"
-fi
+ensure_node_deps() {
+  if [[ -x "$REPO_DIR/node_modules/.bin/prisma" ]]; then
+    return 0
+  fi
 
-need_cmd git
-need_cmd sudo
-need_cmd node
-need_cmd npm
+  say "Dependencies missing (no local prisma). Installing dependencies"
+  cd "$REPO_DIR"
 
-say "Preflight"
-echo "Repo: $REPO_DIR"
-echo "User: $(whoami)"
-echo "Node: $(node -v)"
-echo "NPM:  $(npm -v)"
-echo "Branch: $BRANCH"
-echo "Service: $SERVICE_NAME"
-echo "Env file: $ENV_FILE"
-echo "Prisma: $PRISMA_VER"
+  if [[ -f package-lock.json ]]; then
+    npm ci --no-audit --no-fund
+  else
+    npm install --no-audit --no-fund
+  fi
 
-# Lock
-exec 9>"$LOCK_FILE" || die "Cannot open lock file: $LOCK_FILE"
-if command -v flock >/dev/null 2>&1; then
-  flock -n 9 || die "Another reset/deploy appears to be running (lock: $LOCK_FILE)"
-else
-  say "WARN: 'flock' not found; continuing without a hard lock"
-fi
-
-say "Load environment"
-load_env
-echo "DATABASE_URL=$DATABASE_URL"
-
-say "Stop service (if running)"
-sudo systemctl stop "$SERVICE_NAME" || true
-
-say "Database reset"
-cd "$REPO_DIR"
-
-if [[ "${DATABASE_URL}" == file:* ]]; then
-  DB_FILE="$(resolve_sqlite_path "$DATABASE_URL")"
-  say "Deleting SQLite DB"
-  echo "DB file: $DB_FILE"
-  rm -f "$DB_FILE" "${DB_FILE}-wal" "${DB_FILE}-shm" || true
-else
-  say "Non-SQLite DATABASE_URL detected"
-  echo "DATABASE_URL=$DATABASE_URL"
-  echo "Skipping file deletion. Prisma migrations will still run."
-fi
-
-# Ensure we can see install errors (and avoid engine-strict surprises)
-export npm_config_engine_strict="${npm_config_engine_strict:-false}"
-export npm_config_fund="${npm_config_fund:-false}"
-export npm_config_audit="${npm_config_audit:-false}"
-
-say "Ensure Prisma tooling installed locally (no npx silent installs)"
-if [[ ! -x "./node_modules/.bin/prisma" ]]; then
-  echo "Local prisma not found -> installing prisma@${PRISMA_VER} (devDependency) with visible logs"
-  npm install --save-dev --save-exact "prisma@${PRISMA_VER}"
-fi
-
-# @prisma/client should exist for runtime. If missing, install it pinned to the same version.
-node -e "require('@prisma/client')" >/dev/null 2>&1 || {
-  echo "@prisma/client not found -> installing @prisma/client@${PRISMA_VER} with visible logs"
-  npm install --save-exact "@prisma/client@${PRISMA_VER}"
+  [[ -x "$REPO_DIR/node_modules/.bin/prisma" ]] || die "Prisma still not available after install"
 }
 
-say "Prisma version check"
-./node_modules/.bin/prisma -v || true
+run_prisma() {
+  local prisma_bin="$REPO_DIR/node_modules/.bin/prisma"
+  [[ -x "$prisma_bin" ]] || die "Prisma binary not found at $prisma_bin"
+  cd "$REPO_DIR"
+  "$prisma_bin" "$@"
+}
 
-say "Prisma generate (local prisma v${PRISMA_VER})"
-./node_modules/.bin/prisma generate
+main() {
+  need_cmd sudo
+  need_cmd node
+  need_cmd npm
 
-say "Prisma migrate deploy (local prisma v${PRISMA_VER})"
-./node_modules/.bin/prisma migrate deploy
+  say "Preflight"
+  echo "Repo: $REPO_DIR"
+  echo "User: $(whoami)"
+  echo "Node: $(node -v)"
+  echo "NPM:  $(npm -v)"
+  echo "Service: $SERVICE_NAME"
+  echo "Env file: $ENV_FILE"
 
-say "Start service"
-sudo systemctl start "$SERVICE_NAME" || true
+  say "Load environment"
+  load_env
+  echo "DATABASE_URL=${DATABASE_URL:-<unset>}"
 
-say "Status / logs"
-sudo systemctl status "$SERVICE_NAME" --no-pager || true
-sudo journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
+  say "Stop service (if running)"
+  sudo systemctl stop "$SERVICE_NAME" || true
 
-say "Done"
+  local db_path
+  db_path="$(resolve_sqlite_path_from_database_url)"
+
+  say "Delete SQLite DB (development reset)"
+  echo "DB file: $db_path"
+  if [[ -f "$db_path" ]]; then
+    sudo rm -f "$db_path"
+  fi
+  sudo mkdir -p "$(dirname "$db_path")"
+  sudo chown -R "$(whoami):$(whoami)" "$(dirname "$db_path")" || true
+
+  say "Ensure node deps (no ad-hoc prisma installs)"
+  ensure_node_deps
+
+  say "Prisma generate"
+  run_prisma generate
+
+  if [[ -d "$REPO_DIR/prisma/migrations" ]] && [[ -n "$(ls -A "$REPO_DIR/prisma/migrations" 2>/dev/null || true)" ]]; then
+    say "Prisma migrate deploy"
+    run_prisma migrate deploy
+  else
+    say "No prisma/migrations found -> prisma db push (development-safe)"
+    run_prisma db push
+  fi
+
+  say "Start service"
+  sudo systemctl start "$SERVICE_NAME" || true
+
+  say "Done"
+}
+
+main "$@"
