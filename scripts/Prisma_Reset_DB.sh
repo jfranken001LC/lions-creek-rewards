@@ -15,23 +15,18 @@ load_env() {
   # shellcheck disable=SC1090
   source <(sudo -n cat "$ENV_FILE")
   set +a
+  [[ -n "${DATABASE_URL:-}" ]] || die "DATABASE_URL is not set (check $ENV_FILE)"
 }
 
 resolve_sqlite_path_from_database_url() {
   local url="${DATABASE_URL:-}"
-  [[ -n "$url" ]] || die "DATABASE_URL is not set (check $ENV_FILE)"
-
-  # Prisma SQLite URLs are typically: file:./prisma/prod.sqlite OR file:/abs/path.db
-  if [[ "$url" =~ ^file:(.*)$ ]]; then
-    local p="${BASH_REMATCH[1]}"
-    if [[ "$p" =~ ^/ ]]; then
-      echo "$p"
-    else
-      # relative to repo root
-      echo "$REPO_DIR/$p"
-    fi
+  [[ "$url" =~ ^file:(.*)$ ]] || die "This reset script supports SQLite DATABASE_URLs only. Got: $url"
+  local p="${BASH_REMATCH[1]}"
+  p="${p%%\?*}"
+  if [[ "$p" =~ ^/ ]]; then
+    echo "$p"
   else
-    die "This reset script currently supports SQLite DATABASE_URLs only. Got: $url"
+    echo "$REPO_DIR/$p"
   fi
 }
 
@@ -43,13 +38,22 @@ ensure_node_deps() {
   say "Dependencies missing (no local prisma). Installing dependencies"
   cd "$REPO_DIR"
 
+  # Make installs more forgiving for Shopify peer-dep drift
+  export npm_config_legacy_peer_deps="true"
+  export npm_config_audit="false"
+  export npm_config_fund="false"
+
   if [[ -f package-lock.json ]]; then
-    npm ci --no-audit --no-fund
+    # Try CI first (fast, deterministic) …
+    npm ci --no-audit --no-fund || {
+      say "npm ci failed (likely lock mismatch). Falling back to npm install"
+      npm install --no-audit --no-fund
+    }
   else
     npm install --no-audit --no-fund
   fi
 
-  [[ -x "$REPO_DIR/node_modules/.bin/prisma" ]] || die "Prisma still not available after install"
+  [[ -x "$REPO_DIR/node_modules/.bin/prisma" ]] || die "Prisma still not available after dependency install"
 }
 
 run_prisma() {
@@ -74,7 +78,7 @@ main() {
 
   say "Load environment"
   load_env
-  echo "DATABASE_URL=${DATABASE_URL:-<unset>}"
+  echo "DATABASE_URL=$DATABASE_URL"
 
   say "Stop service (if running)"
   sudo systemctl stop "$SERVICE_NAME" || true
@@ -84,13 +88,11 @@ main() {
 
   say "Delete SQLite DB (development reset)"
   echo "DB file: $db_path"
-  if [[ -f "$db_path" ]]; then
-    sudo rm -f "$db_path"
-  fi
+  sudo rm -f "$db_path" "${db_path}-wal" "${db_path}-shm" || true
   sudo mkdir -p "$(dirname "$db_path")"
   sudo chown -R "$(whoami):$(whoami)" "$(dirname "$db_path")" || true
 
-  say "Ensure node deps (no ad-hoc prisma installs)"
+  say "Ensure node deps"
   ensure_node_deps
 
   say "Prisma generate"
@@ -106,6 +108,10 @@ main() {
 
   say "Start service"
   sudo systemctl start "$SERVICE_NAME" || true
+
+  say "Status / logs"
+  sudo systemctl status "$SERVICE_NAME" --no-pager || true
+  sudo journalctl -u "$SERVICE_NAME" -n 80 --no-pager || true
 
   say "Done"
 }
