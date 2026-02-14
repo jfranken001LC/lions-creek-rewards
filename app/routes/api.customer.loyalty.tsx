@@ -1,8 +1,10 @@
+// app/routes/api.customer.loyalty.tsx
 import { json, type ActionFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 import { getShopSettings } from "../lib/shopSettings.server";
 import { RedemptionStatus } from "@prisma/client";
+import { normalizeCustomerId } from "../lib/redemption.server";
 
 /**
  * Customer Account UI Extension endpoint.
@@ -18,8 +20,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   const shop = sessionToken?.dest?.replace(/^https:\/\//, "") ?? "";
-  const customerGid = sessionToken?.sub ?? "";
-  const customerId = customerGid.replace(/^gid:\/\/shopify\/Customer\//, "");
+  const customerGid = String(sessionToken?.sub ?? "");
+  const customerId = normalizeCustomerId(customerGid);
 
   if (!shop || !customerId) {
     return cors(json({ ok: false, error: "Missing shop or customer identity" }, { status: 401 }));
@@ -67,17 +69,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     select: {
       id: true,
       code: true,
-      value: true,
+      value: true, // dollars (int)
       points: true,
       status: true,
       expiresAt: true,
     },
   });
 
-  const catalog = (settings.redemptionSteps ?? [])
-    .map((step) => {
-      const points = Number(step.points);
-      const valueDollars = Number(settings.redemptionValueMap?.[points] ?? 0);
+  // FIX: redemptionSteps is number[]; do NOT use step.points
+  const steps = (settings.redemptionSteps ?? []).map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0);
+
+  const catalog = steps
+    .map((points) => {
+      const valueDollars = Number(settings.redemptionValueMap?.[String(points)] ?? 0);
       return {
         points,
         valueDollars,

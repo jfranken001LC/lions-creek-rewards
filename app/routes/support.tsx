@@ -1,3 +1,4 @@
+// app/routes/support.tsx
 export default function Support() {
   return (
     <main style={{ fontFamily: "system-ui", padding: 24, maxWidth: 900, margin: "0 auto" }}>
@@ -8,64 +9,97 @@ export default function Support() {
         <a href="mailto:Support@TwoMenOnAYellowCouch.com">Support@TwoMenOnAYellowCouch.com</a>.
       </p>
 
-      <h2>How it works (v1.1)</h2>
+      <h2>How it works (v1.2)</h2>
       <ul>
         <li>
-          <strong>Earn:</strong> Points are awarded on <code>orders/paid</code> webhooks based on eligible net merchandise.
+          <strong>Earn:</strong> Points are awarded from Shopify order events (via webhooks), based on eligible net
+          merchandise value after discounts.
         </li>
         <li>
-          <strong>Reverse:</strong> <code>refunds/create</code> reverses points proportionally; <code>orders/cancelled</code>{" "}
-          reverses remaining points awarded for that order.
+          <strong>Reverse:</strong> Refunds and cancellations reverse points proportionally based on prior order snapshots
+          so points don’t drift.
         </li>
         <li>
-          <strong>Redeem:</strong> Customers can generate a reward via the customer dashboard (App Proxy). (In v1.1 this
-          issues a tracked code; issuing a real Shopify discount code is the next increment.)
+          <strong>Redeem:</strong> Customers generate a <em>real Shopify discount code</em> (single-use) from the Customer
+          Account dashboard. One active code per customer at a time.
         </li>
         <li>
-          <strong>Expiry:</strong> Points expire after 12 months of inactivity, enforced by a daily job endpoint.
+          <strong>Expiry:</strong> Unused codes expire and points are restored. Points also expire after 12 months of
+          inactivity (enforced by a scheduled job).
+        </li>
+      </ul>
+
+      <h2>Customer experience</h2>
+      <ul>
+        <li>
+          <strong>Primary UI:</strong> Shopify <em>Customer Account UI Extension</em> (“Lions Creek Rewards” page in the
+          customer account).
+        </li>
+        <li>
+          <strong>Optional / legacy:</strong> Storefront App Proxy endpoints for backwards compatibility:
+          <ul>
+            <li>
+              <code>/loyalty</code> (HTML route; used by older proxy-based flows)
+            </li>
+            <li>
+              <code>/loyalty.json</code> (JSON endpoint for proxy/debug tooling)
+            </li>
+          </ul>
+        </li>
+      </ul>
+
+      <h2>Operational endpoints</h2>
+      <ul>
+        <li>
+          <strong>Webhooks:</strong> <code>/webhooks</code>
+        </li>
+        <li>
+          <strong>Expiry job:</strong> <code>POST /jobs/expire</code> (use <code>X-Job-Token</code> or{" "}
+          <code>Authorization: Bearer</code> if <code>JOB_TOKEN</code> is set)
+        </li>
+        <li>
+          <strong>Customer Account API:</strong> <code>POST /api/customer/loyalty</code> and{" "}
+          <code>POST /api/customer/redeem</code> (requires customer account session token)
         </li>
       </ul>
 
       <h2>Setup checklist</h2>
       <ol>
         <li>
-          <strong>Webhooks:</strong> In Shopify Admin, register webhooks to your app’s <code>/webhooks</code> endpoint:
-          <ul>
-            <li><code>orders/paid</code></li>
-            <li><code>refunds/create</code></li>
-            <li><code>orders/cancelled</code></li>
-            <li><code>customers/data_request</code></li>
-            <li><code>customers/redact</code></li>
-            <li><code>shop/redact</code></li>
-          </ul>
+          <strong>Admin settings:</strong> Open the app in Shopify Admin → configure earn rate, eligible collection
+          handle, redemption mapping (points → $ value), and exclusions (tags).
         </li>
         <li>
-          <strong>App Proxy:</strong> Configure Shopify App Proxy to route a storefront URL (e.g.{" "}
-          <code>/apps/rewards</code>) to your app route <code>/loyalty</code>. The dashboard validates the App Proxy HMAC.
+          <strong>Customer Account page:</strong> Ensure the Customer Account UI extension is deployed and enabled in the
+          store’s customer account.
         </li>
         <li>
-          <strong>Admin settings:</strong> Open the app in Shopify Admin → Apps and configure:
-          earn rate, minimum order subtotal to redeem, and any customer/product tag exclusions.
+          <strong>Webhooks:</strong> Confirm required webhooks are registered (orders paid, refunds, cancellations, and
+          Shopify privacy topics). The app’s webhook handler is <code>/webhooks</code>.
         </li>
         <li>
-          <strong>Expiry job:</strong> Schedule a daily POST to <code>/jobs/expire</code> with header{" "}
-          <code>X-Job-Token</code> to enforce inactivity expiry.
+          <strong>Expiry job:</strong> Schedule a daily <code>POST</code> to <code>/jobs/expire</code>. If{" "}
+          <code>JOB_TOKEN</code> is configured on the server, include <code>X-Job-Token</code> (or Bearer auth).
         </li>
       </ol>
 
       <h2>Common issues</h2>
       <ul>
         <li>
-          <strong>No points awarded:</strong> ensure the order has a customer (not guest checkout) and the customer is not
-          excluded by tag (e.g. Wholesale).
+          <strong>Redemption fails:</strong> Common causes are insufficient points, a missing eligible collection handle,
+          or a points amount that isn’t in the configured redemption steps.
         </li>
         <li>
-          <strong>Duplicate points:</strong> should not happen—webhook idempotency uses webhook IDs and order snapshots.
-          If it does, inspect <code>WebhookEvent</code> and the unique constraints.
+          <strong>“I already have a code”:</strong> The system enforces one active code at a time. Use the existing code
+          before creating a new one.
         </li>
         <li>
-          <strong>Customer dashboard unauthorized:</strong> App Proxy HMAC verification failed—confirm App Proxy is enabled
-          and Shopify is passing <code>shop</code>, <code>logged_in_customer_id</code>, and <code>hmac</code>.
+          <strong>No points awarded:</strong> The order must have a customer (not guest), and the customer/products must
+          not be excluded by configured tags.
+        </li>
+        <li>
+          <strong>Code doesn’t apply at checkout:</strong> Ensure the cart contains eligible products (in the configured
+          eligible collection) and meets any minimum order requirement.
         </li>
       </ul>
     </main>

@@ -1,182 +1,302 @@
-import { json, type ActionFunctionArgs } from "react-router";
+// app/routes/jobs.expire.tsx
+import type { ActionFunctionArgs } from "react-router";
+import { json } from "react-router";
 import db from "../db.server";
 import { LedgerType, RedemptionStatus } from "@prisma/client";
+import { authenticate } from "../shopify.server";
 
-const DEFAULT_REDEMPTION_TTL_HOURS = 72;
-const DEFAULT_POINTS_INACTIVITY_DAYS = 365;
+const INACTIVITY_DAYS = 365;
+const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const BATCH_SIZE = 200;
 
-/**
- * Cron/job endpoint to:
- *  - expire unused reward discount codes (72h TTL)
- *  - expire points after 12 months of inactivity
- *
- * Security: requires X-Job-Secret header matching JOB_SECRET env var.
- */
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const secret = request.headers.get("X-Job-Secret") ?? "";
-  const expected = process.env.JOB_SECRET ?? "";
-
-  if (!expected || secret !== expected) {
-    return json({ ok: false, error: "Unauthorized" }, { status: 401 });
-  }
-
-  const now = new Date();
-  const jobKey = `expire-${now.toISOString().slice(0, 10)}`; // YYYY-MM-DD
-
-  // Ensure once per day (best-effort).
-  const acquired = await tryAcquireJobLock(jobKey);
-  if (!acquired) {
-    return json({ ok: true, skipped: true, message: "Already executed today." });
-  }
-
-  const ttlHours = Number(process.env.REDEMPTION_CODE_TTL_HOURS ?? DEFAULT_REDEMPTION_TTL_HOURS);
-  const inactivityDays = Number(process.env.POINTS_INACTIVITY_DAYS ?? DEFAULT_POINTS_INACTIVITY_DAYS);
-
-  const shops = await listShops();
-
-  let expiredRedemptions = 0;
-  let expiredPointBalances = 0;
-
-  for (const shop of shops) {
-    expiredRedemptions += await expireRedemptionsForShop(shop, now, ttlHours);
-    expiredPointBalances += await expirePointsForShop(shop, now, inactivityDays, jobKey);
-  }
-
-  return json({ ok: true, expiredRedemptions, expiredPointBalances });
-};
-
-async function listShops() {
-  const [a, b] = await Promise.all([
-    db.redemption.findMany({ distinct: ["shop"], select: { shop: true } }),
-    db.customerPointsBalance.findMany({ distinct: ["shop"], select: { shop: true } }),
-  ]);
-  return Array.from(new Set([...a.map((x) => x.shop), ...b.map((x) => x.shop)])).filter(Boolean);
+function daysAgo(d: number) {
+  return new Date(Date.now() - d * 24 * 60 * 60 * 1000);
 }
 
-async function tryAcquireJobLock(name: string) {
+function getProvidedJobToken(request: Request): string | null {
+  const h = request.headers;
+  const direct = h.get("x-job-token") || h.get("X-Job-Token");
+  if (direct?.trim()) return direct.trim();
+
+  const auth = h.get("authorization") || h.get("Authorization");
+  if (!auth) return null;
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  return m?.[1]?.trim() || null;
+}
+
+async function isAuthorized(request: Request): Promise<boolean> {
+  const expected = (process.env.JOB_TOKEN ?? "").trim();
+  const provided = getProvidedJobToken(request);
+
+  if (expected && provided && provided === expected) return true;
+
+  // Allow an authenticated admin session as a fallback
   try {
-    await db.jobLock.create({ data: { key: name } as any });
+    await authenticate.admin(request);
     return true;
   } catch {
     return false;
   }
 }
 
-async function expireRedemptionsForShop(shop: string, now: Date, ttlHours: number) {
-  const cutoff = new Date(now.getTime() - ttlHours * 60 * 60 * 1000);
+async function acquireLock(name: string) {
+  const now = new Date();
+  const lockedUntil = new Date(now.getTime() + LOCK_TTL_MS);
 
-  const candidates = await db.redemption.findMany({
-    where: {
-      shop,
-      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      OR: [{ expiresAt: { lt: now } }, { expiresAt: null, issuedAt: { lt: cutoff } }],
-    },
-    select: { id: true, discountNodeId: true },
-    take: 500,
+  return db.$transaction(async (tx) => {
+    const existing = await tx.jobLock.findUnique({ where: { name } });
+    if (existing && existing.lockedUntil > now) {
+      return { acquired: false, lockedUntil: existing.lockedUntil };
+    }
+
+    const up = await tx.jobLock.upsert({
+      where: { name },
+      create: { name, lockedAt: now, lockedUntil },
+      update: { lockedAt: now, lockedUntil },
+    });
+
+    return { acquired: true, lockedUntil: up.lockedUntil };
   });
+}
 
-  const token = await getOfflineAccessToken(shop);
-  let count = 0;
+async function releaseLock(name: string) {
+  const now = new Date();
+  await db.jobLock
+    .update({ where: { name }, data: { lockedUntil: now } })
+    .catch(() => null);
+}
 
-  for (const r of candidates) {
-    try {
-      if (token && r.discountNodeId) await deactivateDiscountCode(shop, token, r.discountNodeId);
+async function expireUnusedRedemptions(now: Date) {
+  let processed = 0;
+  let restoredPoints = 0;
 
-      await db.redemption.update({
-        where: { id: r.id },
-        data: { status: RedemptionStatus.EXPIRED, expiredAt: now } as any,
+  while (true) {
+    const batch = await db.redemption.findMany({
+      where: {
+        status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
+        expiresAt: { lt: now },
+      },
+      orderBy: { createdAt: "asc" },
+      take: BATCH_SIZE,
+      select: { id: true },
+    });
+
+    if (!batch.length) break;
+
+    for (const r of batch) {
+      const did = await db.$transaction(async (tx) => {
+        const redemption = await tx.redemption.findUnique({
+          where: { id: r.id },
+          select: {
+            id: true,
+            shop: true,
+            customerId: true,
+            points: true,
+            status: true,
+            expiresAt: true,
+            restoredAt: true,
+          },
+        });
+
+        if (!redemption) return { restored: false, points: 0 };
+        if (redemption.status !== RedemptionStatus.ISSUED && redemption.status !== RedemptionStatus.APPLIED) {
+          return { restored: false, points: 0 };
+        }
+
+        // Idempotency guard: if ledger already exists for this redemption expiry, only mark redemption expired.
+        const existingLedger = await tx.pointsLedger.findFirst({
+          where: {
+            shop: redemption.shop,
+            customerId: redemption.customerId,
+            type: LedgerType.ADJUST,
+            source: "REDEMPTION_EXPIRE",
+            sourceId: redemption.id,
+          },
+          select: { id: true },
+        });
+
+        if (existingLedger) {
+          await tx.redemption.update({
+            where: { id: redemption.id },
+            data: {
+              status: RedemptionStatus.EXPIRED,
+              expiredAt: now,
+              restoredAt: redemption.restoredAt ?? now,
+              restoreReason: "EXPIRED_UNUSED",
+            },
+          });
+          return { restored: false, points: 0 };
+        }
+
+        // Ensure balance row exists (rare, but safe)
+        const bal = await tx.customerPointsBalance.upsert({
+          where: {
+            shop_customerId: {
+              shop: redemption.shop,
+              customerId: redemption.customerId,
+            },
+          },
+          create: {
+            shop: redemption.shop,
+            customerId: redemption.customerId,
+            balance: 0,
+            lifetimeEarned: 0,
+            lifetimeRedeemed: 0,
+            lastActivityAt: now,
+            expiredAt: null,
+          },
+          update: {},
+          select: { lifetimeRedeemed: true },
+        });
+
+        const nextLifetimeRedeemed = Math.max(0, (bal?.lifetimeRedeemed ?? 0) - redemption.points);
+
+        // 1) Mark redemption expired + restored
+        await tx.redemption.update({
+          where: { id: redemption.id },
+          data: {
+            status: RedemptionStatus.EXPIRED,
+            expiredAt: now,
+            restoredAt: now,
+            restoreReason: "EXPIRED_UNUSED",
+          },
+        });
+
+        // 2) Ledger entry
+        await tx.pointsLedger.create({
+          data: {
+            shop: redemption.shop,
+            customerId: redemption.customerId,
+            type: LedgerType.ADJUST,
+            delta: redemption.points,
+            source: "REDEMPTION_EXPIRE",
+            sourceId: redemption.id,
+            description: `Restore ${redemption.points} pts (redemption expired unused)`,
+          },
+        });
+
+        // 3) Restore balance + adjust lifetimeRedeemed downward
+        await tx.customerPointsBalance.update({
+          where: {
+            shop_customerId: { shop: redemption.shop, customerId: redemption.customerId },
+          },
+          data: {
+            balance: { increment: redemption.points },
+            lifetimeRedeemed: nextLifetimeRedeemed,
+            expiredAt: null,
+          },
+        });
+
+        return { restored: true, points: redemption.points };
       });
 
-      count++;
-    } catch (e) {
-      console.error("expireRedemptionsForShop error:", shop, r.id, e);
+      processed += 1;
+      if (did.restored) restoredPoints += did.points;
     }
   }
 
-  return count;
+  return { processed, restoredPoints };
 }
 
-async function expirePointsForShop(shop: string, now: Date, inactivityDays: number, jobKey: string) {
-  const cutoff = new Date(now.getTime() - inactivityDays * 24 * 60 * 60 * 1000);
+async function expireInactivePoints(now: Date) {
+  const cutoff = daysAgo(INACTIVITY_DAYS);
 
-  const targets = await db.customerPointsBalance.findMany({
-    where: { shop, balance: { gt: 0 }, expiredAt: null, lastActivityAt: { lt: cutoff } },
-    select: { customerId: true, balance: true },
-    take: 1000,
-  });
+  let customersExpired = 0;
+  let pointsExpired = 0;
 
-  let expired = 0;
-  for (const t of targets) {
-    const delta = -t.balance;
-    const sourceId = `${t.customerId}:${jobKey}`;
+  while (true) {
+    const batch = await db.customerPointsBalance.findMany({
+      where: {
+        balance: { gt: 0 },
+        lastActivityAt: { lt: cutoff },
+        expiredAt: null,
+      },
+      orderBy: { lastActivityAt: "asc" },
+      take: BATCH_SIZE,
+      select: { id: true, shop: true, customerId: true, balance: true },
+    });
 
-    try {
+    if (!batch.length) break;
+
+    for (const row of batch) {
       await db.$transaction(async (tx) => {
+        const fresh = await tx.customerPointsBalance.findUnique({
+          where: { id: row.id },
+          select: { shop: true, customerId: true, balance: true, expiredAt: true, lastActivityAt: true },
+        });
+        if (!fresh) return;
+        if (fresh.expiredAt) return;
+        if (!fresh.balance || fresh.balance <= 0) return;
+
+        // Ledger idempotency via (shop, customerId, type, source, sourceId)
+        // Use sourceId = balanceRow.id so it can only happen once.
         await tx.pointsLedger.create({
           data: {
-            shop,
-            customerId: t.customerId,
-            type: LedgerType.EXPIRE,
-            delta,
-            source: "EXPIRY",
-            sourceId,
-            description: `Expired ${t.balance} point(s) after ${inactivityDays} days of inactivity.`,
+            shop: fresh.shop,
+            customerId: fresh.customerId,
+            type: LedgerType.EXPIRY,
+            delta: -fresh.balance,
+            source: "INACTIVITY",
+            sourceId: row.id,
+            description: `Expired ${fresh.balance} pts due to ${INACTIVITY_DAYS} days inactivity.`,
           },
         });
 
         await tx.customerPointsBalance.update({
-          where: { shop_customerId: { shop, customerId: t.customerId } },
-          data: { balance: 0, expiredAt: now },
+          where: { id: row.id },
+          data: {
+            balance: 0,
+            expiredAt: now,
+          },
         });
+
+        customersExpired += 1;
+        pointsExpired += fresh.balance;
+      }).catch((e: any) => {
+        // If ledger uniqueness trips (race), don't fail the whole job.
+        const msg = String(e?.message ?? "");
+        if (msg.toLowerCase().includes("unique constraint")) return;
+        throw e;
       });
-
-      expired++;
-    } catch (e: any) {
-      const msg = String(e?.message ?? "");
-      if (msg.includes("Unique constraint failed") || msg.includes("UNIQUE constraint failed")) continue;
-      console.error("expirePointsForShop error:", shop, t.customerId, e);
     }
   }
 
-  return expired;
+  return { customersExpired, pointsExpired };
 }
 
-async function getOfflineAccessToken(shop: string) {
-  const offlineId = `offline_${shop}`;
-  const session = await db.session.findUnique({ where: { id: offlineId }, select: { accessToken: true } });
-  return session?.accessToken ?? null;
-}
-
-async function deactivateDiscountCode(shop: string, accessToken: string, discountNodeId: string) {
-  const mutation = `#graphql
-    mutation DeactivateDiscount($id: ID!) {
-      discountCodeDeactivate(id: $id) {
-        codeDiscountNode { id }
-        userErrors { field message }
-      }
-    }
-  `;
-
-  const resp = await adminGraphql(shop, accessToken, mutation, { id: discountNodeId });
-  const errors = resp?.data?.discountCodeDeactivate?.userErrors ?? [];
-  if (errors.length) throw new Error(`discountCodeDeactivate userErrors: ${JSON.stringify(errors)}`);
-}
-
-async function adminGraphql(shop: string, accessToken: string, query: string, variables?: any) {
-  const apiVersion = process.env.SHOPIFY_API_VERSION || "2026-01";
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": accessToken },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await res.text();
-  const jsonResp = JSON.parse(text);
-
-  if (!res.ok || jsonResp.errors) {
-    throw new Error(`Shopify GraphQL error (${res.status}): ${JSON.stringify(jsonResp.errors ?? jsonResp)}`);
+export const action = async ({ request }: ActionFunctionArgs) => {
+  if (request.method !== "POST") {
+    return json({ ok: false, error: "Method not allowed" }, { status: 405 });
   }
-  return jsonResp;
-}
+
+  const ok = await isAuthorized(request);
+  if (!ok) return json({ ok: false, error: "Unauthorized" }, { status: 401 });
+
+  const lockName = "jobs.expire";
+  const lock = await acquireLock(lockName);
+  if (!lock.acquired) {
+    return json(
+      { ok: true, skipped: true, reason: "locked", lockedUntil: lock.lockedUntil.toISOString() },
+      { status: 200 },
+    );
+  }
+
+  const now = new Date();
+
+  try {
+    const redemptions = await expireUnusedRedemptions(now);
+    const inactivity = await expireInactivePoints(now);
+
+    return json(
+      {
+        ok: true,
+        ranAt: now.toISOString(),
+        redemptions,
+        inactivity,
+      },
+      { status: 200 },
+    );
+  } finally {
+    await releaseLock(lockName);
+  }
+};
