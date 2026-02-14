@@ -163,4 +163,6 @@ echo "OK: app is responding on localhost:${PORT}"
 say "Setting exec status for upgrade file for next iteration"
 cd "$REPO_DIR"
 sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh
+sudo chmod +x ./scripts/Server_Git_Only.sh
+sudo chmod +x ./scripts/Prisma_Reset_DB.sh
 say "Done"
