@@ -1,68 +1,39 @@
 import type { ActionFunctionArgs } from "react-router";
-import { json } from "react-router";
-import { authenticate } from "../shopify.server";
-import { getShopSettings } from "../lib/shopSettings.server";
-import { issueRedemptionCode } from "../lib/redemption.server";
-import { customerAccountPreflight, withCustomerAccountCors } from "../lib/customerAccountCors.server";
+import { prisma } from "../lib/prisma.server";
+import { verifyAppProxy } from "../lib/proxy.server";
+import { applyRedemption } from "../lib/redemption.server";
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  if (request.method.toUpperCase() === "OPTIONS") {
-    return customerAccountPreflight();
+export async function action({ request }: ActionFunctionArgs) {
+  const proxy = await verifyAppProxy(request);
+
+  const customerId = proxy.customerId;
+  if (!customerId) {
+    return Response.json({ ok: false, error: "Missing customer" }, { status: 400 });
   }
 
-  if (request.method.toUpperCase() !== "POST") {
-    return withCustomerAccountCors(new Response("Method Not Allowed", { status: 405 }));
+  const shop = proxy.shop;
+
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
   }
 
-  try {
-    const { sessionToken, customerAccount, shop, admin } = await authenticate.public.customerAccount(request);
+  const rewardType = (body as any).rewardType;
+  const rewardValue = (body as any).rewardValue;
 
-    const customerId = String(customerAccount.id);
-    const settings = await getShopSettings(shop);
-
-    const body = await request.json().catch(() => ({}));
-    const pointsRequested = Number(body?.points ?? 0);
-    const forceNew = Boolean(body?.forceNew);
-
-    if (!Number.isInteger(pointsRequested) || pointsRequested <= 0) {
-      return withCustomerAccountCors(
-        json({ ok: false, error: "Invalid points amount." }, { status: 400 })
-      );
-    }
-
-    if (!settings.redemptionSteps.includes(pointsRequested)) {
-      return withCustomerAccountCors(
-        json(
-          {
-            ok: false,
-            error: `Invalid redemption step. Allowed: ${settings.redemptionSteps.join(", ")}`
-          },
-          { status: 400 }
-        )
-      );
-    }
-
-    const result = await issueRedemptionCode({
-      shop,
-      admin,
-      customerId,
-      pointsRequested,
-      idemKey: forceNew ? null : undefined
-    });
-
-    return withCustomerAccountCors(
-      json({
-        ok: true,
-        code: result.code,
-        expiresAt: result.expiresAt,
-        points: result.points,
-        valueDollars: result.valueDollars,
-        redemptionId: result.redemptionId
-      })
-    );
-  } catch (e: any) {
-    return withCustomerAccountCors(
-      json({ ok: false, error: String(e?.message ?? e ?? "Redeem failed") }, { status: 400 })
+  if (!rewardType || !rewardValue) {
+    return Response.json(
+      { ok: false, error: "Missing rewardType/rewardValue" },
+      { status: 400 },
     );
   }
-};
+
+  const result = await applyRedemption({
+    shop,
+    customerId,
+    rewardType,
+    rewardValue,
+  });
+
+  return Response.json({ ok: true, result });
+}

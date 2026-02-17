@@ -1,282 +1,333 @@
+import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
+import { data, Form, useLoaderData, useNavigation } from "react-router";
 import {
   Page,
-  Layout,
   Card,
-  Text,
-  IndexTable,
-  useIndexResourceState,
-  Badge,
-  Button,
-  InlineStack,
-  Modal,
-  TextField,
   BlockStack,
+  InlineStack,
+  Text,
+  TextField,
+  Button,
+  IndexTable,
+  Badge,
+  Tooltip,
+  Modal,
 } from "@shopify/polaris";
-import crypto from "crypto";
-import { useMemo, useState } from "react";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { Form, json, useActionData, useLoaderData, useNavigation } from "react-router";
-import { authenticate } from "../shopify.server";
-import db from "../db.server";
-import { LedgerType } from "@prisma/client";
+import { useEffect, useMemo, useState } from "react";
+import { prisma } from "../lib/prisma.server";
+import { requireAdmin } from "../lib/shopify.server";
+import { formatIsoDateTimeLocal } from "../lib/time";
 
 type CustomerRow = {
   id: string;
+  shop: string;
   customerId: string;
-  balance: number;
-  lifetimeEarned: number;
-  lifetimeRedeemed: number;
-  lastActivityAt: string;
-  expiredAt: string | null;
+  email: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  pointsBalance: number;
+  lifetimePointsEarned: number;
+  lifetimePointsRedeemed: number;
+  createdAt: string;
+  updatedAt: string;
 };
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  const shop = session.shop;
+export async function loader({ request }: LoaderFunctionArgs) {
+  await requireAdmin(request);
 
-  const rows = await db.customerPointsBalance.findMany({
-    where: { shop },
-    orderBy: { lastActivityAt: "desc" },
-    take: 100,
-    select: {
-      id: true,
-      customerId: true,
-      balance: true,
-      lifetimeEarned: true,
-      lifetimeRedeemed: true,
-      lastActivityAt: true,
-      expiredAt: true,
-    },
+  const url = new URL(request.url);
+  const q = url.searchParams.get("q")?.trim() ?? "";
+
+  const where =
+    q.length > 0
+      ? {
+          OR: [
+            { email: { contains: q, mode: "insensitive" as const } },
+            { firstName: { contains: q, mode: "insensitive" as const } },
+            { lastName: { contains: q, mode: "insensitive" as const } },
+            { customerId: { contains: q, mode: "insensitive" as const } },
+          ],
+        }
+      : {};
+
+  const customers = await prisma.customer.findMany({
+    where,
+    orderBy: { updatedAt: "desc" },
+    take: 250,
   });
 
-  return json({
-    shop,
-    customers: rows.map(
-      (c): CustomerRow => ({
-        id: c.id,
-        customerId: c.customerId,
-        balance: c.balance,
-        lifetimeEarned: c.lifetimeEarned,
-        lifetimeRedeemed: c.lifetimeRedeemed,
-        lastActivityAt: c.lastActivityAt.toISOString(),
-        expiredAt: c.expiredAt ? c.expiredAt.toISOString() : null,
-      }),
-    ),
-  });
-};
+  const rows: CustomerRow[] = customers.map((c) => ({
+    id: c.id,
+    shop: c.shop,
+    customerId: c.customerId,
+    email: c.email,
+    firstName: c.firstName,
+    lastName: c.lastName,
+    pointsBalance: c.pointsBalance,
+    lifetimePointsEarned: c.lifetimePointsEarned,
+    lifetimePointsRedeemed: c.lifetimePointsRedeemed,
+    createdAt: c.createdAt.toISOString(),
+    updatedAt: c.updatedAt.toISOString(),
+  }));
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  const shop = session.shop;
+  return data({ q, rows });
+}
 
-  const form = await request.formData();
-  const intent = String(form.get("intent") || "");
+export async function action({ request }: ActionFunctionArgs) {
+  await requireAdmin(request);
 
-  if (intent !== "adjust") {
-    return json({ ok: false, error: "Unknown intent" }, { status: 400 });
-  }
+  const formData = await request.formData();
+  const intent = String(formData.get("intent") || "");
 
-  const customerId = String(form.get("customerId") || "").trim();
-  const deltaRaw = String(form.get("pointsDelta") || "").trim();
+  if (intent === "adjust_points") {
+    const id = String(formData.get("id") || "");
+    const delta = Number(formData.get("delta") || 0);
+    const reason = String(formData.get("reason") || "").trim();
 
-  const delta = Math.trunc(Number(deltaRaw));
-  if (!customerId || !Number.isFinite(delta) || delta === 0) {
-    return json({ ok: false, error: "Invalid customerId or pointsDelta" }, { status: 400 });
-  }
+    if (!id || !Number.isFinite(delta) || delta === 0) {
+      return data({ ok: false, error: "Invalid request" }, { status: 400 });
+    }
 
-  const now = new Date();
-  const sourceId = `ADMIN_ADJUST:${crypto.randomUUID()}`;
+    const customer = await prisma.customer.findUnique({ where: { id } });
+    if (!customer) {
+      return data({ ok: false, error: "Customer not found" }, { status: 404 });
+    }
 
-  try {
-    await db.$transaction(async (tx) => {
-      await tx.pointsLedger.create({
-        data: {
-          shop,
-          customerId,
-          type: LedgerType.ADJUST,
-          delta,
-          source: "ADMIN",
-          sourceId,
-          description: `Admin adjustment: ${delta > 0 ? "+" : ""}${delta} point(s).`,
-        },
-      });
-
-      // Upsert balance row. IMPORTANT: never null-out lastActivityAt.
-      const existing = await tx.customerPointsBalance.findUnique({
-        where: { shop_customerId: { shop, customerId } },
-        select: { id: true, balance: true },
-      });
-
-      if (!existing) {
-        await tx.customerPointsBalance.create({
-          data: {
-            shop,
-            customerId,
-            balance: Math.max(0, delta),
-            lifetimeEarned: 0,
-            lifetimeRedeemed: 0,
-            lastActivityAt: now,
-            expiredAt: null,
-          },
-        });
-      } else {
-        await tx.customerPointsBalance.update({
-          where: { id: existing.id },
-          data: {
-            balance: Math.max(0, existing.balance + delta),
-            lastActivityAt: now,
-            expiredAt: null,
-          },
-        });
-      }
+    // Adjust points
+    const updated = await prisma.customer.update({
+      where: { id },
+      data: {
+        pointsBalance: customer.pointsBalance + delta,
+        lifetimePointsEarned:
+          delta > 0 ? customer.lifetimePointsEarned + delta : undefined,
+        lifetimePointsRedeemed:
+          delta < 0 ? customer.lifetimePointsRedeemed + Math.abs(delta) : undefined,
+      },
     });
 
-    return json({ ok: true });
-  } catch (e: any) {
-    return json({ ok: false, error: e?.message ?? "Adjustment failed" }, { status: 500 });
-  }
-};
+    // Audit
+    await prisma.pointsEvent.create({
+      data: {
+        shop: updated.shop,
+        customerId: updated.customerId,
+        type: delta > 0 ? "MANUAL_AWARD" : "MANUAL_DEDUCT",
+        points: Math.abs(delta),
+        source: "ADMIN",
+        reason: reason || null,
+        createdAt: new Date(),
+      },
+    });
 
-export default function CustomersAdminRoute() {
-  const { customers } = useLoaderData() as { customers: CustomerRow[] };
-  const actionData = useActionData() as { ok?: boolean; error?: string } | undefined;
+    return data({ ok: true });
+  }
+
+  return data({ ok: false, error: "Unsupported intent" }, { status: 400 });
+}
+
+export default function CustomersPage() {
+  const { q, rows } = useLoaderData<typeof loader>();
   const navigation = useNavigation();
 
-  const resourceName = {
-    singular: "customer",
-    plural: "customers",
-  };
-
-  const { selectedResources, allResourcesSelected, handleSelectionChange } = useIndexResourceState(customers);
-
+  const [query, setQuery] = useState(q);
   const [modalOpen, setModalOpen] = useState(false);
-  const [modalCustomerId, setModalCustomerId] = useState<string>("");
-  const [deltaValue, setDeltaValue] = useState<string>("");
+  const [selectedCustomer, setSelectedCustomer] = useState<CustomerRow | null>(
+    null,
+  );
+  const [delta, setDelta] = useState("0");
+  const [reason, setReason] = useState("");
 
-  const isSubmitting = navigation.state === "submitting";
+  useEffect(() => {
+    setQuery(q);
+  }, [q]);
 
-  const rowsMarkup = useMemo(() => {
-    return customers.map((c, index) => {
-      const expired = Boolean(c.expiredAt);
-      return (
-        <IndexTable.Row id={c.id} key={c.id} position={index} selected={selectedResources.includes(c.id)}>
-          <IndexTable.Cell>
-            <Text as="span" variant="bodyMd" fontWeight="bold">
-              {c.customerId}
-            </Text>
-          </IndexTable.Cell>
+  const isSubmitting = navigation.state !== "idle";
 
-          <IndexTable.Cell>
-            <InlineStack gap="200" blockAlign="center">
-              <Text as="span">{c.balance}</Text>
-              {expired ? <Badge tone="warning">Expired</Badge> : <Badge tone="success">Active</Badge>}
-            </InlineStack>
-          </IndexTable.Cell>
+  const resourceName = useMemo(
+    () => ({ singular: "customer", plural: "customers" }),
+    [],
+  );
 
-          <IndexTable.Cell>{c.lifetimeEarned}</IndexTable.Cell>
-          <IndexTable.Cell>{c.lifetimeRedeemed}</IndexTable.Cell>
-          <IndexTable.Cell>{new Date(c.lastActivityAt).toLocaleString()}</IndexTable.Cell>
-
-          <IndexTable.Cell>
-            <Button
-              size="slim"
-              onClick={() => {
-                setModalCustomerId(c.customerId);
-                setDeltaValue("");
-                setModalOpen(true);
-              }}
-            >
-              Adjust
-            </Button>
-          </IndexTable.Cell>
-        </IndexTable.Row>
+  const rowMarkup = rows.map((r, index) => {
+    const name = `${r.firstName ?? ""} ${r.lastName ?? ""}`.trim() || "(no name)";
+    const pointsBadge =
+      r.pointsBalance >= 0 ? (
+        <Badge tone="success">{r.pointsBalance}</Badge>
+      ) : (
+        <Badge tone="critical">{r.pointsBalance}</Badge>
       );
-    });
-  }, [customers, selectedResources]);
+
+    return (
+      <IndexTable.Row id={r.id} key={r.id} position={index}>
+        <IndexTable.Cell>
+          <BlockStack gap="050">
+            <Text as="span" variant="bodyMd" fontWeight="semibold">
+              {name}
+            </Text>
+            <Text as="span" tone="subdued" variant="bodySm">
+              {r.email ?? "(no email)"}
+            </Text>
+          </BlockStack>
+        </IndexTable.Cell>
+
+        <IndexTable.Cell>
+          <Text as="span" variant="bodySm">
+            {r.customerId}
+          </Text>
+        </IndexTable.Cell>
+
+        <IndexTable.Cell>{pointsBadge}</IndexTable.Cell>
+
+        <IndexTable.Cell>
+          <Tooltip content={`Earned: ${r.lifetimePointsEarned} • Redeemed: ${r.lifetimePointsRedeemed}`}>
+            <Text as="span" variant="bodySm">
+              {r.lifetimePointsEarned} / {r.lifetimePointsRedeemed}
+            </Text>
+          </Tooltip>
+        </IndexTable.Cell>
+
+        <IndexTable.Cell>
+          <Text as="span" variant="bodySm">
+            {formatIsoDateTimeLocal(r.updatedAt)}
+          </Text>
+        </IndexTable.Cell>
+
+        <IndexTable.Cell>
+          <Button
+            size="slim"
+            onClick={() => {
+              setSelectedCustomer(r);
+              setDelta("0");
+              setReason("");
+              setModalOpen(true);
+            }}
+          >
+            Adjust points
+          </Button>
+        </IndexTable.Cell>
+      </IndexTable.Row>
+    );
+  });
 
   return (
     <Page title="Customers">
-      <Layout>
-        <Layout.Section>
-          <Card>
-            <BlockStack gap="300">
-              <Text as="p" variant="bodyMd">
-                Admin-only view of loyalty balances. Adjustments update <strong>balance</strong> only (no change to
-                lifetime earned/redeemed).
-              </Text>
-              {actionData?.error ? (
-                <Text as="p" variant="bodyMd" tone="critical">
-                  {actionData.error}
-                </Text>
-              ) : null}
-            </BlockStack>
-          </Card>
-        </Layout.Section>
+      <BlockStack gap="400">
+        <Card>
+          <Form method="get">
+            <InlineStack gap="200" align="start" blockAlign="center">
+              <div style={{ minWidth: 340 }}>
+                <TextField
+                  label="Search"
+                  labelHidden
+                  value={query}
+                  onChange={setQuery}
+                  placeholder="Email, name, or customer ID…"
+                  autoComplete="off"
+                  name="q"
+                />
+              </div>
+              <Button submit disabled={isSubmitting}>
+                Search
+              </Button>
+              <Button
+                onClick={() => {
+                  setQuery("");
+                  // Navigate by submitting empty
+                  const f = document.createElement("form");
+                  f.method = "get";
+                  f.action = window.location.pathname;
+                  document.body.appendChild(f);
+                  f.submit();
+                }}
+              >
+                Clear
+              </Button>
+            </InlineStack>
+          </Form>
+        </Card>
 
-        <Layout.Section>
-          <Card padding="0">
-            <IndexTable
-              resourceName={resourceName}
-              itemCount={customers.length}
-              selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
-              onSelectionChange={handleSelectionChange}
-              headings={[
-                { title: "Customer ID" },
-                { title: "Balance" },
-                { title: "Lifetime Earned" },
-                { title: "Lifetime Redeemed" },
-                { title: "Last Activity" },
-                { title: "Actions" },
-              ]}
-            >
-              {rowsMarkup}
-            </IndexTable>
-          </Card>
-        </Layout.Section>
-      </Layout>
-
-      <Modal
-        open={modalOpen}
-        onClose={() => setModalOpen(false)}
-        title={`Adjust points — Customer ${modalCustomerId}`}
-        primaryAction={
-          <Button
-            variant="primary"
-            loading={isSubmitting}
-            disabled={isSubmitting || !deltaValue.trim()}
-            onClick={() => {
-              const form = document.getElementById("adjust-form") as HTMLFormElement | null;
-              form?.requestSubmit();
-            }}
+        <Card padding="0">
+          <IndexTable
+            resourceName={resourceName}
+            itemCount={rows.length}
+            selectable={false}
+            headings={[
+              { title: "Customer" },
+              { title: "Customer ID" },
+              { title: "Points" },
+              { title: "Lifetime (E/R)" },
+              { title: "Updated" },
+              { title: "" },
+            ]}
           >
-            Apply
-          </Button>
-        }
-        secondaryActions={[{ content: "Cancel", onAction: () => setModalOpen(false) }]}
-      >
-        <Modal.Section>
-          <BlockStack gap="300">
-            <Text as="p" variant="bodyMd">
-              Enter a positive or negative integer. Example: <code>50</code> adds 50 points; <code>-50</code> removes 50
-              points (floor at 0).
-            </Text>
+            {rowMarkup}
+          </IndexTable>
+        </Card>
 
-            <Form method="post" id="adjust-form" onSubmit={() => setModalOpen(false)}>
-              <input type="hidden" name="intent" value="adjust" />
-              <input type="hidden" name="customerId" value={modalCustomerId} />
+        <Modal
+          open={modalOpen}
+          onClose={() => setModalOpen(false)}
+          title="Adjust points"
+          primaryAction={{
+            content: "Apply",
+            onAction: () => {
+              if (!selectedCustomer) return;
 
+              const form = document.createElement("form");
+              form.method = "post";
+              form.style.display = "none";
+
+              const fields: Array<[string, string]> = [
+                ["intent", "adjust_points"],
+                ["id", selectedCustomer.id],
+                ["delta", delta],
+                ["reason", reason],
+              ];
+
+              for (const [k, v] of fields) {
+                const input = document.createElement("input");
+                input.type = "hidden";
+                input.name = k;
+                input.value = v;
+                form.appendChild(input);
+              }
+
+              document.body.appendChild(form);
+              form.submit();
+            },
+            disabled:
+              !selectedCustomer ||
+              !Number.isFinite(Number(delta)) ||
+              Number(delta) === 0 ||
+              isSubmitting,
+          }}
+          secondaryActions={[
+            {
+              content: "Cancel",
+              onAction: () => setModalOpen(false),
+            },
+          ]}
+        >
+          <Modal.Section>
+            <BlockStack gap="200">
+              <Text as="p" tone="subdued">
+                Enter a positive number to award points, negative to deduct.
+              </Text>
               <TextField
-                label="Points delta"
-                name="pointsDelta"
-                value={deltaValue}
-                onChange={setDeltaValue}
+                label="Delta"
+                value={delta}
+                onChange={setDelta}
                 autoComplete="off"
-                helpText="Use whole numbers only"
               />
-            </Form>
-          </BlockStack>
-        </Modal.Section>
-      </Modal>
+              <TextField
+                label="Reason (optional)"
+                value={reason}
+                onChange={setReason}
+                autoComplete="off"
+              />
+            </BlockStack>
+          </Modal.Section>
+        </Modal>
+      </BlockStack>
     </Page>
   );
 }

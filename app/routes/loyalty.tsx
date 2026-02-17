@@ -1,227 +1,116 @@
-// app/routes/loyalty.tsx
-import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
-import { json } from "react-router";
-import { authenticate } from "../shopify.server";
-import db from "../db.server";
-import { getShopSettings } from "../lib/shopSettings.server";
-import { issueRedemptionCode, normalizeCustomerId } from "../lib/redemption.server";
-import { RedemptionStatus } from "@prisma/client";
+import type { LoaderFunctionArgs } from "react-router";
+import { Form, Link, Outlet, data, useLoaderData } from "react-router";
+import {
+  Page,
+  Card,
+  BlockStack,
+  InlineStack,
+  Text,
+  Button,
+  Badge,
+} from "@shopify/polaris";
+import { verifyAppProxy } from "../lib/proxy.server";
+import { computeCustomerLoyalty } from "../lib/loyalty.server";
 
-type LedgerRow = {
-  id: string;
-  type: string;
-  delta: number;
-  description: string;
-  createdAt: string;
-};
+export async function loader({ request }: LoaderFunctionArgs) {
+  const proxy = await verifyAppProxy(request);
 
-function toInt(n: any, fallback = 0): number {
-  const x = Math.floor(Number(n));
-  return Number.isFinite(x) ? x : fallback;
-}
-
-function dollarsToCents(dollars: number): number {
-  return Math.round(Number(dollars || 0) * 100);
-}
-
-/**
- * Storefront App Proxy endpoint (optional).
- *
- * GET: returns customer balance + ledger + active redemption
- * POST: issues a redemption code (uses the same canonical service as Customer Accounts)
- *
- * NOTE: This route is kept mainly for backwards compatibility while your primary UI
- * is the Customer Accounts UI extension. It must remain schema-consistent.
- */
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session, appProxy } = await authenticate.public.appProxy(request);
-
-  const shop = session.shop;
-
-  // App Proxy customer_id is numeric; normalize anyway for safety
-  const customerId = appProxy.customerId ? normalizeCustomerId(String(appProxy.customerId)) : null;
-
-  const settings = await getShopSettings(shop);
-
+  const customerId = proxy.customerId;
   if (!customerId) {
-    return json({
-      ok: true,
-      mode: "app_proxy",
-      shop,
-      customerId: null,
-      message: "Not logged in.",
-      settings: {
-        earnRate: settings.earnRate,
-        redemptionMinOrder: settings.redemptionMinOrder,
-        eligibleCollectionHandle: settings.eligibleCollectionHandle,
-        redemptionSteps: settings.redemptionSteps,
-        redemptionValueMap: settings.redemptionValueMap,
-        codeExpiryHours: 72,
-      },
-      balance: null,
-      ledger: [],
-      redemptionActive: null,
-    });
+    return data({ ok: false, error: "Missing customer" }, { status: 400 });
   }
 
-  const balanceRow =
-    (await db.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop, customerId } },
-    })) ??
-    (await db.customerPointsBalance.create({
-      data: { shop, customerId, balance: 0, lifetimeEarned: 0, lifetimeRedeemed: 0 },
-    }));
+  const shop = proxy.shop;
+  const loyalty = await computeCustomerLoyalty({ shop, customerId });
 
-  const ledgerRaw = await db.pointsLedger.findMany({
-    where: { shop, customerId },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-    select: {
-      id: true,
-      type: true,
-      delta: true,
-      description: true,
-      createdAt: true,
-    },
-  });
-
-  const ledger: LedgerRow[] = ledgerRaw.map((r) => ({
-    id: r.id,
-    type: String(r.type),
-    delta: r.delta,
-    description: r.description ?? "",
-    createdAt: r.createdAt.toISOString(),
-  }));
-
-  const now = new Date();
-  const redemptionActive = await db.redemption.findFirst({
-    where: {
-      shop,
-      customerId,
-      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-    },
-    orderBy: { issuedAt: "desc" },
-    select: {
-      id: true,
-      code: true,
-      points: true,
-      value: true, // dollars (int)
-      status: true,
-      expiresAt: true,
-    },
-  });
-
-  return json({
+  return data({
     ok: true,
-    mode: "app_proxy",
-    shop,
     customerId,
-    settings: {
-      earnRate: settings.earnRate,
-      redemptionMinOrder: settings.redemptionMinOrder,
-      eligibleCollectionHandle: settings.eligibleCollectionHandle,
-      redemptionSteps: settings.redemptionSteps,
-      redemptionValueMap: settings.redemptionValueMap,
-      codeExpiryHours: 72,
-    },
-    balance: {
-      pointsBalance: balanceRow.balance,
-      pointsLifetimeEarned: balanceRow.lifetimeEarned,
-      pointsLifetimeRedeemed: balanceRow.lifetimeRedeemed,
-      pointsLastActivityAt: balanceRow.lastActivityAt?.toISOString?.() ?? null,
-      expiredAt: balanceRow.expiredAt ? balanceRow.expiredAt.toISOString() : null,
-    },
-    ledger,
-    redemptionActive: redemptionActive
-      ? {
-          id: redemptionActive.id,
-          code: redemptionActive.code,
-          points: redemptionActive.points,
-          valueDollars: redemptionActive.value,
-          valueCents: dollarsToCents(redemptionActive.value),
-          minimumSubtotalCents: dollarsToCents(settings.redemptionMinOrder),
-          status: redemptionActive.status,
-          expiresAt: (redemptionActive.expiresAt ?? now).toISOString(),
-        }
-      : null,
+    shop,
+    loyalty,
   });
-};
+}
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session, appProxy } = await authenticate.public.appProxy(request);
+export default function LoyaltyPage() {
+  const result = useLoaderData<typeof loader>();
 
-  const shop = session.shop;
-  const customerId = appProxy.customerId ? normalizeCustomerId(String(appProxy.customerId)) : null;
-
-  if (!customerId) {
-    return json({ ok: false, error: "Not authenticated." }, { status: 401 });
+  if (!result.ok) {
+    return (
+      <Page title="Loyalty">
+        <Card>
+          <Text as="p" tone="critical">
+            {result.error}
+          </Text>
+        </Card>
+      </Page>
+    );
   }
 
-  const settings = await getShopSettings(shop);
+  const { customerId, loyalty } = result;
 
-  // If there is already an active code, return it (single-active-code policy).
-  const now = new Date();
-  const existingActive = await db.redemption.findFirst({
-    where: {
-      shop,
-      customerId,
-      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-    },
-    orderBy: { issuedAt: "desc" },
-    select: { id: true, code: true, points: true, value: true, expiresAt: true },
-  });
+  return (
+    <Page title="Loyalty">
+      <BlockStack gap="400">
+        <Card>
+          <BlockStack gap="200">
+            <Text as="h2" variant="headingMd">
+              Customer
+            </Text>
+            <Text as="p">ID: {customerId}</Text>
+          </BlockStack>
+        </Card>
 
-  if (existingActive) {
-    return json({
-      ok: true,
-      alreadyIssued: true,
-      redemptionId: existingActive.id,
-      code: existingActive.code,
-      expiresAt: (existingActive.expiresAt ?? now).toISOString(),
-      points: existingActive.points,
-      valueDollars: existingActive.value,
-      valueCents: dollarsToCents(existingActive.value),
-      minimumSubtotalCents: dollarsToCents(settings.redemptionMinOrder),
-    });
-  }
+        <Card>
+          <BlockStack gap="200">
+            <Text as="h2" variant="headingMd">
+              Points
+            </Text>
 
-  const form = await request.formData();
-  const pointsRequested = toInt(form.get("points"), 0);
+            <InlineStack gap="200" align="start" blockAlign="center">
+              <Text as="span">Balance:</Text>
+              <Badge tone="success">{loyalty.pointsBalance}</Badge>
+            </InlineStack>
 
-  if (!pointsRequested) {
-    return json({ ok: false, error: "Missing points." }, { status: 400 });
-  }
+            <Text as="p" tone="subdued">
+              Lifetime earned: {loyalty.lifetimeEarned} • Lifetime redeemed:{" "}
+              {loyalty.lifetimeRedeemed}
+            </Text>
 
-  try {
-    const result = await issueRedemptionCode({
-      shop,
-      admin: admin as any,
-      customerId,
-      pointsRequested,
-      // optional: allow storefront to send an idempotency key
-      idemKey: String(form.get("idemKey") ?? "").trim() || null,
-    });
+            <InlineStack gap="200">
+              <Button
+                url={`/apps/${encodeURIComponent("lions-creek-rewards")}/app`}
+                variant="secondary"
+              >
+                Admin dashboard
+              </Button>
 
-    return json({
-      ok: true,
-      alreadyIssued: false,
-      redemptionId: result.redemptionId,
-      code: result.code,
-      expiresAt: result.expiresAt,
-      points: result.points,
-      valueDollars: result.valueDollars,
-      valueCents: dollarsToCents(result.valueDollars),
-      minimumSubtotalCents: dollarsToCents(settings.redemptionMinOrder),
-      discountNodeId: result.discountNodeId,
-    });
-  } catch (e: any) {
-    return json({ ok: false, error: e?.message ?? "Redemption failed" }, { status: 400 });
-  }
-};
+              <Link to="/loyalty.json">Raw JSON</Link>
+            </InlineStack>
+          </BlockStack>
+        </Card>
 
-export default function LoyaltyRoute() {
-  // App proxy routes typically render via Liquid/Storefront. No embedded UI here.
-  return null;
+        <Card>
+          <BlockStack gap="200">
+            <Text as="h2" variant="headingMd">
+              Redeem (example)
+            </Text>
+            <Text as="p" tone="subdued">
+              This form is just a placeholder. Your real redeem flow is via your
+              storefront UI calling the redeem endpoint.
+            </Text>
+
+            <Form method="post" action="/api/customer/redeem">
+              <InlineStack gap="200">
+                <Button submit variant="primary">
+                  Redeem sample
+                </Button>
+              </InlineStack>
+            </Form>
+          </BlockStack>
+        </Card>
+
+        <Outlet />
+      </BlockStack>
+    </Page>
+  );
 }
