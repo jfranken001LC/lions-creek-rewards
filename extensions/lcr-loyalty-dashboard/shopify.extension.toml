@@ -1,6 +1,12 @@
-name = "lcr-loyalty-dashboard"
+# File: extensions/lcr-loyalty-dashboard/shopify.extension.toml
+
+api_version = "2026-01"
+
+[[extensions]]
+name = "LCR Loyalty Dashboard"
+handle = "lcr-loyalty-dashboard"
 type = "ui_extension"
-api_version = "2025-07"
+uid = "6b2c0a71-6f5e-4a35-9e2c-ec7b5c0c7f1cec7b5c0c"
 
 [[extensions.targeting]]
 target = "customer-account.page.render"

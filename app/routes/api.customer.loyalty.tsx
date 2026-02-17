@@ -1,99 +1,55 @@
-import type { ActionFunctionArgs } from "react-router";
-import { json } from "react-router";
-import db from "../db.server";
+// File: app/routes/api.customer.loyalty.tsx
+
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
-import { getShopSettings } from "../lib/shopSettings.server";
-import { customerAccountPreflight, withCustomerAccountCors } from "../lib/customerAccountCors.server";
+import { customerAccountCors } from "../lib/customerAccountCors.server";
+import {
+  getOrCreateCustomer,
+  getCustomerLoyaltySummary,
+} from "../models/customer.server";
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  if (request.method.toUpperCase() === "OPTIONS") {
-    return customerAccountPreflight();
-  }
+async function handleCustomerLoyalty(request: Request): Promise<Response> {
+  const method = request.method.toUpperCase();
 
-  if (request.method.toUpperCase() !== "GET") {
-    return withCustomerAccountCors(new Response("Method Not Allowed", { status: 405 }));
-  }
-
-  try {
-    const { sessionToken, customerAccount, shop } = await authenticate.public.customerAccount(request);
-
-    const customerId = String(customerAccount.id);
-    const settings = await getShopSettings(shop);
-
-    const balance = await db.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop, customerId } },
-    });
-
-    const now = new Date();
-
-    const redemptionActive = await db.redemption.findFirst({
-      where: {
-        shop,
-        customerId,
-        status: { in: ["ISSUED", "APPLIED"] },
-        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-      },
-      orderBy: { createdAt: "desc" },
-      select: { id: true, code: true, points: true, value: true, expiresAt: true, status: true },
-    });
-
-    const ledger = await db.pointsLedger.findMany({
-      where: { shop, customerId },
-      orderBy: { createdAt: "desc" },
-      take: 25,
-      select: { id: true, createdAt: true, type: true, delta: true, source: true, description: true },
-    });
-
-    const response = json({
-      ok: true,
-      shop,
-      customerId,
-      balances: {
-        points: balance?.balance ?? 0,
-        lifetimeEarned: balance?.lifetimeEarned ?? 0,
-        lifetimeRedeemed: balance?.lifetimeRedeemed ?? 0,
-        lastActivityAt: balance?.lastActivityAt ? balance.lastActivityAt.toISOString() : null,
-        expiredAt: balance?.expiredAt ? balance.expiredAt.toISOString() : null
-      },
-      settings: {
-        earnRate: settings.earnRate,
-        includeProductTags: settings.includeProductTags,
-        excludeProductTags: settings.excludeProductTags,
-        excludedCustomerTags: settings.excludedCustomerTags,
-        redemptionSteps: settings.redemptionSteps,
-        redemptionValueMap: settings.redemptionValueMap,
-        redemptionMinOrder: settings.redemptionMinOrder,
-        eligibleCollectionHandle: settings.eligibleCollectionHandle,
-        expiry: "Points expire after 12 months of inactivity."
-      },
-      activeRedemption: redemptionActive
-        ? {
-            id: redemptionActive.id,
-            code: redemptionActive.code,
-            points: redemptionActive.points,
-            value: redemptionActive.value,
-            status: redemptionActive.status,
-            expiresAt: redemptionActive.expiresAt
-              ? redemptionActive.expiresAt.toISOString()
-              : new Date(now.getTime() + 72 * 60 * 60 * 1000).toISOString()
-          }
-        : null,
-      recentLedger: ledger.map((l) => ({
-        id: l.id,
-        createdAt: l.createdAt.toISOString(),
-        type: l.type,
-        delta: l.delta,
-        source: l.source,
-        description: l.description
-      }))
-    });
-
-    return withCustomerAccountCors(response);
-  } catch (e: any) {
-    const resp = json(
-      { ok: false, error: String(e?.message ?? e ?? "Unauthorized") },
-      { status: 401 }
+  // Allow GET (extension fetch), POST (per requirements), and OPTIONS (CORS preflight)
+  if (method !== "GET" && method !== "POST" && method !== "OPTIONS") {
+    return Response.json(
+      { ok: false, error: "Method not allowed" },
+      { status: 405 },
     );
-    return withCustomerAccountCors(resp);
   }
-};
+
+  const { shop, customer } = await authenticate.customerAccount(request);
+
+  await getOrCreateCustomer({
+    shop,
+    customerId: customer.id,
+    email: customer?.emailAddress?.emailAddress ?? null,
+    firstName: customer?.firstName ?? null,
+    lastName: customer?.lastName ?? null,
+  });
+
+  const summary = await getCustomerLoyaltySummary({
+    shop,
+    customerId: customer.id,
+  });
+
+  return Response.json({
+    ok: true,
+    shop,
+    customerId: customer.id,
+    balances: summary.balances,
+    recentLedger: summary.recentLedger,
+    program: summary.program,
+  });
+}
+
+// GET -> loader
+export async function loader({ request }: LoaderFunctionArgs) {
+  return customerAccountCors(request, () => handleCustomerLoyalty(request));
+}
+
+// POST/OPTIONS -> action
+export async function action({ request }: ActionFunctionArgs) {
+  return customerAccountCors(request, () => handleCustomerLoyalty(request));
+}
