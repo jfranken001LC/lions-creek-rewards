@@ -1,55 +1,83 @@
-// File: app/routes/api.customer.loyalty.tsx
-
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { json } from "react-router";
+
 import { authenticate } from "../shopify.server";
-import { customerAccountCors } from "../lib/customerAccountCors.server";
-import {
-  getOrCreateCustomer,
-  getCustomerLoyaltySummary,
-} from "../models/customer.server";
+import { withCustomerAccountCors } from "../lib/customerAccountCors.server";
+import { getCustomerIdFromJWTSub } from "../lib/jwtSub.server";
+import { getCurrentCustomerLoyalty } from "../services/loyalty.server";
 
-async function handleCustomerLoyalty(request: Request): Promise<Response> {
-  const method = request.method.toUpperCase();
+type LoyaltySnapshotResponse =
+  | {
+      ok: true;
+      customerId: string;
+      customerName?: string | null;
+      pointsBalance: number;
+      tier?: string | null;
+      lastEarnedAt?: string | null;
+      lastEarnedSource?: string | null;
+    }
+  | { ok: false; error: string };
 
-  // Allow GET (extension fetch), POST (per requirements), and OPTIONS (CORS preflight)
-  if (method !== "GET" && method !== "POST" && method !== "OPTIONS") {
-    return Response.json(
-      { ok: false, error: "Method not allowed" },
-      { status: 405 },
+async function handle(request: Request): Promise<Response> {
+  // CORS preflight (Customer Account UI extension fetches can trigger it)
+  if (request.method === "OPTIONS") {
+    return withCustomerAccountCors(new Response(null, { status: 204 }));
+  }
+
+  // Allow both GET and POST (requirements say POST; earlier UI code used GET)
+  if (request.method !== "GET" && request.method !== "POST") {
+    return withCustomerAccountCors(
+      json<LoyaltySnapshotResponse>(
+        { ok: false, error: "method_not_allowed" },
+        { status: 405, headers: { "Cache-Control": "no-store" } }
+      )
     );
   }
 
-  const { shop, customer } = await authenticate.customerAccount(request);
+  try {
+    const { sessionToken } = await authenticate.public.customerAccount(request);
+    const customerId = getCustomerIdFromJWTSub(sessionToken?.sub);
 
-  await getOrCreateCustomer({
-    shop,
-    customerId: customer.id,
-    email: customer?.emailAddress?.emailAddress ?? null,
-    firstName: customer?.firstName ?? null,
-    lastName: customer?.lastName ?? null,
-  });
+    if (!customerId) {
+      return withCustomerAccountCors(
+        json<LoyaltySnapshotResponse>(
+          { ok: false, error: "unauthorized" },
+          { status: 401, headers: { "Cache-Control": "no-store" } }
+        )
+      );
+    }
 
-  const summary = await getCustomerLoyaltySummary({
-    shop,
-    customerId: customer.id,
-  });
+    const loyalty = await getCurrentCustomerLoyalty(customerId);
 
-  return Response.json({
-    ok: true,
-    shop,
-    customerId: customer.id,
-    balances: summary.balances,
-    recentLedger: summary.recentLedger,
-    program: summary.program,
-  });
+    return withCustomerAccountCors(
+      json<LoyaltySnapshotResponse>(
+        {
+          ok: true,
+          customerId,
+          customerName: loyalty.customerName ?? null,
+          pointsBalance: loyalty.pointsBalance,
+          tier: loyalty.tier ?? null,
+          lastEarnedAt: loyalty.lastEarnedAt ?? null,
+          lastEarnedSource: loyalty.lastEarnedSource ?? null,
+        },
+        { headers: { "Cache-Control": "no-store" } }
+      )
+    );
+  } catch (err) {
+    console.error("api.customer.loyalty error:", err);
+    return withCustomerAccountCors(
+      json<LoyaltySnapshotResponse>(
+        { ok: false, error: "server_error" },
+        { status: 500, headers: { "Cache-Control": "no-store" } }
+      )
+    );
+  }
 }
 
-// GET -> loader
 export async function loader({ request }: LoaderFunctionArgs) {
-  return customerAccountCors(request, () => handleCustomerLoyalty(request));
+  return handle(request);
 }
 
-// POST/OPTIONS -> action
 export async function action({ request }: ActionFunctionArgs) {
-  return customerAccountCors(request, () => handleCustomerLoyalty(request));
+  return handle(request);
 }

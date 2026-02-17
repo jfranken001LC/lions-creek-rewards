@@ -1,12 +1,11 @@
-# File: extensions/lcr-loyalty-dashboard/shopify.extension.toml
-
 api_version = "2026-01"
 
 [[extensions]]
-name = "LCR Loyalty Dashboard"
+name = "Lions Creek Rewards Dashboard"
 handle = "lcr-loyalty-dashboard"
 type = "ui_extension"
-uid = "6b2c0a71-6f5e-4a35-9e2c-ec7b5c0c7f1cec7b5c0c"
+uid = "d8c5a2b1-73fd-4f71-ae21-6c5c8d6b8c4e1f2a3b4c"
+description = "Customer Account full-page loyalty dashboard for Lions Creek Rewards."
 
 [[extensions.targeting]]
 target = "customer-account.page.render"
