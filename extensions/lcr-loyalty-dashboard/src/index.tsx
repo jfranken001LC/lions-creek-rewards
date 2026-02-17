@@ -1,330 +1,224 @@
-// extensions/lcr-loyalty-dashboard/src/index.tsx
-import React, { useEffect, useMemo, useState } from "react";
-import {
-  reactExtension,
-  BlockStack,
-  InlineStack,
-  Text,
-  Heading,
-  Button,
-  Divider,
-  Banner,
-  Spinner,
-  Card,
-  TextField,
-  useApi,
-} from "@shopify/ui-extensions-react/customer-account";
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
+import { useEffect, useMemo, useState } from "preact/hooks";
 
-const APP_URL = "https://loyalty.basketbooster.ca"; // must match your deployed app domain
+declare const shopify: any;
 
-type LoyaltyPayload = {
+// ✅ Change this if you want to point dev extension to your tunnel host
+const APP_BASE_URL = "https://loyalty.basketbooster.ca";
+
+type LoyaltyResponse = {
   ok: boolean;
+  error?: string;
 
-  pointsBalance: number;
-  pointsLifetimeEarned: number;
-  pointsLifetimeRedeemed: number;
-  pointsLastActivityAt: string | null;
+  shop: string;
+  customerId: string;
 
-  ledger: Array<{
-    id: string;
-    type: string;
-    delta: number;
-    description: string | null;
-    createdAt: string;
-  }>;
+  balances: {
+    points: number;
+    lifetimeEarned: number;
+    lifetimeRedeemed: number;
+    lastActivityAt: string | null;
+    expiredAt: string | null;
+  };
 
-  redemptionActive: null | {
+  settings: {
+    earnRate: number;
+    includeProductTags: string[];
+    excludeProductTags: string[];
+    excludedCustomerTags: string[];
+
+    redemptionSteps: number[];
+    redemptionValueMap: Record<string, number>;
+    redemptionMinOrder: number;
+    eligibleCollectionHandle: string;
+    expiry: string;
+  };
+
+  activeRedemption: null | {
     id: string;
     code: string;
-    valueCents: number;
-    minimumSubtotalCents: number;
+    points: number;
+    value: number;
     status: string;
     expiresAt: string;
   };
 
-  catalog: Array<{
-    points: number;
-    valueDollars: number;
-    minimumOrderDollars: number;
+  recentLedger: Array<{
+    id: string;
+    createdAt: string;
+    type: string;
+    delta: number;
+    source: string;
+    description: string;
   }>;
-
-  copy: { earn: string; expiry: string };
 };
 
-type RedeemResponse = {
-  ok: boolean;
-  redemptionId?: string;
-  code?: string;
-  expiresAt?: string;
-  points?: number;
-  valueDollars?: number;
-  discountNodeId?: string;
-  error?: string;
-};
+async function getSessionToken(): Promise<string> {
+  if (!shopify?.sessionToken?.get) throw new Error("sessionToken API not available");
+  return await shopify.sessionToken.get();
+}
 
-export default reactExtension("customer-account.page.render", () => <App />);
+async function apiRequest(path: string, init: RequestInit = {}) {
+  const token = await getSessionToken();
+  const res = await fetch(`${APP_BASE_URL}${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(init.headers || {})
+    }
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.error || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+function formatDelta(n: number) {
+  return `${n >= 0 ? "+" : ""}${n}`;
+}
 
 function App() {
-  const api = useApi();
-
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [data, setData] = useState<LoyaltyPayload | null>(null);
+  const [busyRedeem, setBusyRedeem] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [data, setData] = useState<LoyaltyResponse | null>(null);
 
-  const [redeemPoints, setRedeemPoints] = useState<string>(""); // will default from catalog
-  const [redeeming, setRedeeming] = useState(false);
-  const [redeemMsg, setRedeemMsg] = useState<string | null>(null);
+  const steps = useMemo(() => data?.settings?.redemptionSteps ?? [], [data]);
+  const points = data?.balances?.points ?? 0;
 
-  const parsedRedeem = useMemo(() => {
-    const n = Math.floor(Number(redeemPoints));
-    return Number.isFinite(n) ? n : 0;
-  }, [redeemPoints]);
-
-  function fmtMoney(n: number) {
-    // keep it simple and deterministic
-    return `$${Number(n || 0).toFixed(2)}`;
-  }
-
-  async function authedPost<T = any>(path: string, body?: any): Promise<T> {
-    const token = await api.sessionToken.get();
-
-    const resp = await fetch(`${APP_URL}${path}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(body ?? {}),
-    });
-
-    const jsonBody = (await resp.json().catch(() => null)) as any;
-
-    // Handle non-2xx
-    if (!resp.ok || !jsonBody) {
-      const msg = jsonBody?.error ?? `Request failed (${resp.status})`;
-      throw new Error(msg);
-    }
-
-    // Defensive: treat {ok:false} as an error even if HTTP 200
-    if (jsonBody?.ok === false) {
-      const msg = jsonBody?.error ?? "Request failed";
-      throw new Error(msg);
-    }
-
-    return jsonBody as T;
-  }
-
-  async function refresh() {
-    setErr(null);
+  async function load() {
     setLoading(true);
-
+    setError(null);
     try {
-      const payload = await authedPost<LoyaltyPayload>("/api/customer/loyalty");
-
-      setData(payload);
-      setRedeemMsg(null);
-
-      // Ensure we always have a valid selected step
-      const steps = (payload.catalog ?? []).map((c) => c.points).filter((p) => Number.isFinite(p) && p > 0);
-      if (steps.length) {
-        const current = Math.floor(Number(redeemPoints));
-        if (!steps.includes(current)) {
-          setRedeemPoints(String(steps[0]));
-        }
-      } else if (!redeemPoints) {
-        setRedeemPoints("500");
-      }
+      const d = (await apiRequest("/api/customer/loyalty", { method: "GET" })) as LoyaltyResponse;
+      setData(d);
     } catch (e: any) {
-      setErr(String(e?.message ?? e));
+      setError(String(e?.message ?? e));
     } finally {
       setLoading(false);
     }
   }
 
-  useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const selectedCatalog = useMemo(() => {
-    if (!data?.catalog?.length) return null;
-    return data.catalog.find((c) => c.points === parsedRedeem) ?? null;
-  }, [data, parsedRedeem]);
-
-  async function onRedeem() {
-    if (!data) return;
-    setRedeeming(true);
-    setRedeemMsg(null);
-    setErr(null);
-
+  async function redeem(pointsRequested: number) {
+    setBusyRedeem(true);
+    setError(null);
     try {
-      const res = await authedPost<RedeemResponse>("/api/customer/redeem", { points: parsedRedeem });
-
-      if (res?.code && res?.expiresAt) {
-        setRedeemMsg(`Your code: ${res.code} (expires ${new Date(res.expiresAt).toLocaleString()})`);
-      } else {
-        setRedeemMsg("Reward created.");
-      }
-
-      await refresh();
+      await apiRequest("/api/customer/redeem", {
+        method: "POST",
+        body: JSON.stringify({ points: pointsRequested })
+      });
+      await load();
     } catch (e: any) {
-      setErr(String(e?.message ?? e));
+      setError(String(e?.message ?? e));
     } finally {
-      setRedeeming(false);
+      setBusyRedeem(false);
     }
   }
 
-  if (loading) {
-    return (
-      <BlockStack spacing="loose">
-        <InlineStack spacing="loose" blockAlignment="center">
-          <Spinner />
-          <Text>Loading your points…</Text>
-        </InlineStack>
-      </BlockStack>
-    );
-  }
+  useEffect(() => {
+    load();
+  }, []);
 
-  if (err) {
-    return (
-      <BlockStack spacing="loose">
-        <Banner title="Could not load loyalty data" status="critical">
-          <Text>{err}</Text>
-        </Banner>
-        <Button onPress={refresh}>Try again</Button>
-      </BlockStack>
-    );
-  }
-
-  if (!data) return <Text>Unavailable.</Text>;
-
-  const active = data.redemptionActive;
+  const active = data?.activeRedemption;
 
   return (
-    <BlockStack spacing="loose">
-      <Heading>Lions Creek Rewards</Heading>
+    <s-page>
+      <s-section>
+        <s-stack gap="tight">
+          <s-heading>Lions Creek Rewards</s-heading>
 
-      <Card>
-        <BlockStack spacing="tight">
-          <Text size="large">Points balance</Text>
-          <Heading>{data.pointsBalance}</Heading>
-          <Text>
-            Lifetime earned: {data.pointsLifetimeEarned} • Lifetime redeemed: {data.pointsLifetimeRedeemed}
-          </Text>
-          <Text>
-            Last activity: {data.pointsLastActivityAt ? new Date(data.pointsLastActivityAt).toLocaleString() : "—"}
-          </Text>
-        </BlockStack>
-      </Card>
+          {loading && <s-text>Loading loyalty status…</s-text>}
 
-      <Divider />
-
-      <Card>
-        <BlockStack spacing="tight">
-          <Text size="large">Rewards</Text>
-
-          {data.catalog?.length ? (
-            <BlockStack spacing="extraTight">
-              {data.catalog.map((c) => (
-                <Text key={c.points}>
-                  {c.points} points → {fmtMoney(c.valueDollars)} off (min order {fmtMoney(c.minimumOrderDollars)})
-                </Text>
-              ))}
-            </BlockStack>
-          ) : (
-            <Text>Rewards are not available right now.</Text>
+          {error && (
+            <s-banner tone="critical">
+              <s-text>{error}</s-text>
+            </s-banner>
           )}
 
-          <Divider />
+          {!loading && data?.ok && (
+            <>
+              <s-banner tone="info">
+                <s-text>
+                  Points balance: <strong>{points}</strong>
+                </s-text>
+                <s-text>{data.settings.expiry}</s-text>
+              </s-banner>
 
-          {active ? (
-            <Banner title="You already have an active reward code" status="info">
-              <Text>
-                Code: <Text emphasis="bold">{active.code}</Text> • Expires{" "}
-                {new Date(active.expiresAt).toLocaleString()}
-              </Text>
-              <Text>
-                Value: {fmtMoney(active.valueCents / 100)} • Min order {fmtMoney(active.minimumSubtotalCents / 100)}
-              </Text>
-              <Text>Use this code at checkout before it expires.</Text>
-            </Banner>
-          ) : (
-            <BlockStack spacing="tight">
-              <TextField
-                label="Redeem points"
-                value={redeemPoints}
-                onChange={setRedeemPoints}
-                helpText={data.catalog?.length ? "Choose one of the point values shown above." : "Enter points to redeem."}
-              />
-
-              {selectedCatalog ? (
-                <Text>
-                  You’ll get {fmtMoney(selectedCatalog.valueDollars)} off (min order{" "}
-                  {fmtMoney(selectedCatalog.minimumOrderDollars)}).
-                </Text>
+              {active ? (
+                <s-banner tone="success">
+                  <s-text>
+                    Active reward code: <strong>{active.code}</strong>
+                  </s-text>
+                  <s-text>
+                    {active.points} points → ${active.value} off (expires{" "}
+                    {new Date(active.expiresAt).toLocaleString()})
+                  </s-text>
+                </s-banner>
               ) : (
-                <Text>Enter a valid points amount from the Rewards list.</Text>
+                <s-banner tone="warning">
+                  <s-text>No active reward code.</s-text>
+                </s-banner>
               )}
 
-              <Button
-                kind="primary"
-                disabled={
-                  redeeming ||
-                  !selectedCatalog ||
-                  data.pointsBalance < parsedRedeem ||
-                  parsedRedeem <= 0 ||
-                  !data.catalog?.length
-                }
-                onPress={onRedeem}
-              >
-                {redeeming ? "Creating code…" : "Generate discount code"}
-              </Button>
+              <s-divider />
 
-              {data.pointsBalance < parsedRedeem && parsedRedeem > 0 ? <Text>Not enough points for this reward.</Text> : null}
+              <s-heading size="medium">Redeem points</s-heading>
+              <s-stack gap="tight">
+                {steps.map((step) => {
+                  const value = data.settings.redemptionValueMap[String(step)] ?? 0;
+                  const disabled = busyRedeem || points < step || Boolean(active);
+                  return (
+                    <s-inline-stack key={String(step)} gap="tight" align="space-between">
+                      <s-text>
+                        {step} points → ${value} off
+                      </s-text>
+                      <s-button
+                        variant="primary"
+                        disabled={disabled}
+                        onClick={() => redeem(step)}
+                      >
+                        Redeem
+                      </s-button>
+                    </s-inline-stack>
+                  );
+                })}
+                {active && (
+                  <s-text tone="subdued">
+                    You already have an active code. Use it or wait for it to expire.
+                  </s-text>
+                )}
+              </s-stack>
 
-              {redeemMsg ? (
-                <Banner title="Reward created" status="success">
-                  <Text>{redeemMsg}</Text>
-                </Banner>
-              ) : null}
-            </BlockStack>
+              <s-divider />
+
+              <s-heading size="medium">Recent activity</s-heading>
+              <s-stack gap="tight">
+                {(data.recentLedger ?? []).slice(0, 10).map((row) => (
+                  <s-inline-stack key={row.id} gap="tight" align="space-between">
+                    <s-text>{new Date(row.createdAt).toLocaleDateString()}</s-text>
+                    <s-text>
+                      {row.type}: <strong>{formatDelta(row.delta)}</strong>
+                    </s-text>
+                  </s-inline-stack>
+                ))}
+              </s-stack>
+
+              <s-divider />
+              <s-button variant="secondary" onClick={load} disabled={loading}>
+                Refresh
+              </s-button>
+            </>
           )}
-        </BlockStack>
-      </Card>
-
-      <Divider />
-
-      <Card>
-        <BlockStack spacing="tight">
-          <Text size="large">How it works</Text>
-          <Text>{data.copy?.earn ?? "Earn points on eligible purchases."}</Text>
-          <Text>{data.copy?.expiry ?? "Points may expire after inactivity."}</Text>
-        </BlockStack>
-      </Card>
-
-      <Divider />
-
-      <Card>
-        <BlockStack spacing="tight">
-          <Text size="large">Recent activity</Text>
-          {data.ledger?.length ? (
-            data.ledger.slice(0, 10).map((r) => (
-              <BlockStack key={r.id} spacing="extraTight">
-                <InlineStack spacing="loose">
-                  <Text>{new Date(r.createdAt).toLocaleDateString()}</Text>
-                  <Text emphasis="bold">{r.delta > 0 ? `+${r.delta}` : `${r.delta}`}</Text>
-                  <Text>{r.description ?? r.type}</Text>
-                </InlineStack>
-                <Divider />
-              </BlockStack>
-            ))
-          ) : (
-            <Text>No activity yet.</Text>
-          )}
-        </BlockStack>
-      </Card>
-
-      <Button onPress={refresh}>Refresh</Button>
-    </BlockStack>
+        </s-stack>
+      </s-section>
+    </s-page>
   );
 }
+
+export default async () => {
+  render(<App />, document.body);
+};

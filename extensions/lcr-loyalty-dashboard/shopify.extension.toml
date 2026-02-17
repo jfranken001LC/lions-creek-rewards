@@ -1,10 +1,6 @@
-api_version = "2026-01"
-
-[[extensions]]
-name = "LCR Loyalty Dashboard"
-handle = "lcr-loyalty-dashboard"
+name = "lcr-loyalty-dashboard"
 type = "ui_extension"
-uid = "bdf6d224-1b79-111a-ab65-44ec2514c87d1770670417"
+api_version = "2025-07"
 
 [[extensions.targeting]]
 target = "customer-account.page.render"

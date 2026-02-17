@@ -1,83 +1,71 @@
-import { data, Link, useLoaderData } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
-import db from "../db.server";
+import { json, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
+import db from "../db.server";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
+export async function loader({ request }: LoaderFunctionArgs) {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const now = new Date();
 
-  const [customerCount, balanceAgg, activeRedemptions, failedWebhooks24h] = await Promise.all([
+  const [activeCustomerCount, activeRedemptionCount] = await Promise.all([
     db.customerPointsBalance.count({ where: { shop } }),
-    db.customerPointsBalance.aggregate({ where: { shop }, _sum: { balance: true } }),
-    db.redemption.count({ where: { shop, status: "ISSUED" } }),
-    db.webhookEvent.count({ where: { shop, outcome: "FAILED", receivedAt: { gte: since24h } } }),
+    db.redemption.count({
+      where: {
+        shop,
+        status: { in: ["ISSUED", "APPLIED"] },
+        expiresAt: { gt: now },
+      },
+    }),
   ]);
 
-  return data({
-    shop,
-    stats: {
-      customersWithBalance: customerCount,
-      outstandingPoints: balanceAgg._sum.balance ?? 0,
-      activeRedemptions,
-      failedWebhooks24h,
-    },
-  });
-};
+  return json({ shop, activeCustomerCount, activeRedemptionCount });
+}
 
-export default function AdminIndex() {
-  const { shop, stats } = useLoaderData<typeof loader>();
+export default function AppIndex() {
+  const { shop, activeCustomerCount, activeRedemptionCount } =
+    useLoaderData<typeof loader>();
 
   return (
-    <div style={{ padding: 18, maxWidth: 980 }}>
-      <h1 style={{ margin: 0 }}>Lions Creek Rewards — Admin</h1>
-      <div style={{ opacity: 0.7, marginTop: 6, marginBottom: 14 }}>Shop: {shop}</div>
+    <div style={{ padding: "16px" }}>
+      <h1 style={{ margin: 0 }}>Lions Creek Rewards</h1>
+      <p style={{ marginTop: 8, opacity: 0.8 }}>
+        Connected shop: <b>{shop}</b>
+      </p>
 
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Quick stats</h2>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>Customers with a balance row</div>
-            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.customersWithBalance}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>Outstanding points</div>
-            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.outstandingPoints}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>Active (ISSUED) redemptions</div>
-            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.activeRedemptions}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>Webhook failures (last 24h)</div>
-            <div style={{ fontSize: 22, fontWeight: 600 }}>{stats.failedWebhooks24h}</div>
-          </div>
+      <div style={{ display: "flex", gap: 16, marginTop: 16, flexWrap: "wrap" }}>
+        <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 12 }}>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>Customers tracked</div>
+          <div style={{ fontSize: 28, fontWeight: 700 }}>{activeCustomerCount}</div>
         </div>
-      </section>
 
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginBottom: 14 }}>
-        <h2 style={{ marginTop: 0 }}>Admin tools</h2>
-        <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
+        <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 12 }}>
+          <div style={{ fontSize: 12, opacity: 0.7 }}>Active redemptions</div>
+          <div style={{ fontSize: 28, fontWeight: 700 }}>{activeRedemptionCount}</div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 24 }}>
+        <h2 style={{ marginBottom: 8 }}>Admin</h2>
+        <ul>
           <li>
-            <Link to="/app/settings">Program settings</Link>
+            <a href="/app/customers">Customers</a>
           </li>
           <li>
-            <Link to="/app/customers">Customer lookup + manual adjustments</Link>
+            <a href="/app/redemptions">Redemptions</a>
           </li>
           <li>
-            <Link to="/app/reports">Reports + CSV export</Link>
+            <a href="/app/reports">Reports</a>
           </li>
           <li>
-            <Link to="/app/webhooks">Webhook processing logs</Link>
+            <a href="/app/settings">Settings</a>
+          </li>
+          <li>
+            <a href="/support">Support</a>
           </li>
         </ul>
-        <div style={{ marginTop: 10, opacity: 0.75 }}>
-          Start with <Link to="/app/settings">Program settings</Link> to configure eligibility tags and the minimum order
-          subtotal for redemption.
-        </div>
-      </section>
+      </div>
     </div>
   );
 }

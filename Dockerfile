@@ -1,18 +1,19 @@
-FROM node:20-alpine
-RUN apk add --no-cache openssl
-
-EXPOSE 3000
+FROM node:22-alpine AS app
 
 WORKDIR /app
 
-ENV NODE_ENV=production
+# Copy lockfiles first for deterministic installs
+COPY package.json package-lock.json ./
+COPY extensions ./extensions
 
-COPY package.json package-lock.json* ./
+# Install ALL deps (build requires dev deps)
+RUN npm ci
 
-RUN npm ci --omit=dev && npm cache clean --force
-
+# Copy app source and build
 COPY . .
-
 RUN npm run build
 
-CMD ["npm", "run", "docker-start"]
+ENV NODE_ENV=production
+EXPOSE 3000
+
+CMD ["npm","run","start"]

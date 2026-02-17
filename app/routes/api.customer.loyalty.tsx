@@ -1,121 +1,99 @@
-// app/routes/api.customer.loyalty.tsx
-import { json, type ActionFunctionArgs } from "react-router";
-import { authenticate } from "../shopify.server";
+import type { ActionFunctionArgs } from "react-router";
+import { json } from "react-router";
 import db from "../db.server";
+import { authenticate } from "../shopify.server";
 import { getShopSettings } from "../lib/shopSettings.server";
-import { RedemptionStatus } from "@prisma/client";
-import { normalizeCustomerId } from "../lib/redemption.server";
+import { customerAccountPreflight, withCustomerAccountCors } from "../lib/customerAccountCors.server";
 
-/**
- * Customer Account UI Extension endpoint.
- *
- * Auth: Authorization: Bearer <customer account session token>
- */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { cors, sessionToken } = await authenticate.public.customerAccount(request);
-
-  // CORS preflight
-  if (request.method === "OPTIONS") {
-    return cors(new Response(null, { status: 204 }));
+  if (request.method.toUpperCase() === "OPTIONS") {
+    return customerAccountPreflight();
   }
 
-  const shop = sessionToken?.dest?.replace(/^https:\/\//, "") ?? "";
-  const customerGid = String(sessionToken?.sub ?? "");
-  const customerId = normalizeCustomerId(customerGid);
-
-  if (!shop || !customerId) {
-    return cors(json({ ok: false, error: "Missing shop or customer identity" }, { status: 401 }));
+  if (request.method.toUpperCase() !== "GET") {
+    return withCustomerAccountCors(new Response("Method Not Allowed", { status: 405 }));
   }
 
-  const settings = await getShopSettings(shop);
+  try {
+    const { sessionToken, customerAccount, shop } = await authenticate.public.customerAccount(request);
 
-  // Ensure the row exists (so first-time customers don't 404)
-  const balanceRow =
-    (await db.customerPointsBalance.findUnique({
+    const customerId = String(customerAccount.id);
+    const settings = await getShopSettings(shop);
+
+    const balance = await db.customerPointsBalance.findUnique({
       where: { shop_customerId: { shop, customerId } },
-    })) ??
-    (await db.customerPointsBalance.create({
-      data: {
+    });
+
+    const now = new Date();
+
+    const redemptionActive = await db.redemption.findFirst({
+      where: {
         shop,
         customerId,
-        balance: 0,
-        lifetimeEarned: 0,
-        lifetimeRedeemed: 0,
+        status: { in: ["ISSUED", "APPLIED"] },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
       },
-    }));
+      orderBy: { createdAt: "desc" },
+      select: { id: true, code: true, points: true, value: true, expiresAt: true, status: true },
+    });
 
-  const ledger = await db.pointsLedger.findMany({
-    where: { shop, customerId },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-    select: {
-      id: true,
-      type: true,
-      delta: true,
-      description: true,
-      createdAt: true,
-    },
-  });
+    const ledger = await db.pointsLedger.findMany({
+      where: { shop, customerId },
+      orderBy: { createdAt: "desc" },
+      take: 25,
+      select: { id: true, createdAt: true, type: true, delta: true, source: true, description: true },
+    });
 
-  const now = new Date();
-  const redemptionActive = await db.redemption.findFirst({
-    where: {
+    const response = json({
+      ok: true,
       shop,
       customerId,
-      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-    },
-    orderBy: { issuedAt: "desc" },
-    select: {
-      id: true,
-      code: true,
-      value: true, // dollars (int)
-      points: true,
-      status: true,
-      expiresAt: true,
-    },
-  });
-
-  // FIX: redemptionSteps is number[]; do NOT use step.points
-  const steps = (settings.redemptionSteps ?? []).map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0);
-
-  const catalog = steps
-    .map((points) => {
-      const valueDollars = Number(settings.redemptionValueMap?.[String(points)] ?? 0);
-      return {
-        points,
-        valueDollars,
-        minimumOrderDollars: settings.redemptionMinOrder,
-      };
-    })
-    .filter((c) => c.points > 0 && c.valueDollars > 0);
-
-  return cors(
-    json({
-      ok: true,
-      pointsBalance: balanceRow.balance,
-      pointsLifetimeEarned: balanceRow.lifetimeEarned,
-      pointsLifetimeRedeemed: balanceRow.lifetimeRedeemed,
-      pointsLastActivityAt: balanceRow.lastActivityAt?.toISOString?.() ?? null,
-      ledger: ledger.map((r) => ({
-        ...r,
-        createdAt: r.createdAt.toISOString(),
-      })),
-      redemptionActive: redemptionActive
+      balances: {
+        points: balance?.balance ?? 0,
+        lifetimeEarned: balance?.lifetimeEarned ?? 0,
+        lifetimeRedeemed: balance?.lifetimeRedeemed ?? 0,
+        lastActivityAt: balance?.lastActivityAt ? balance.lastActivityAt.toISOString() : null,
+        expiredAt: balance?.expiredAt ? balance.expiredAt.toISOString() : null
+      },
+      settings: {
+        earnRate: settings.earnRate,
+        includeProductTags: settings.includeProductTags,
+        excludeProductTags: settings.excludeProductTags,
+        excludedCustomerTags: settings.excludedCustomerTags,
+        redemptionSteps: settings.redemptionSteps,
+        redemptionValueMap: settings.redemptionValueMap,
+        redemptionMinOrder: settings.redemptionMinOrder,
+        eligibleCollectionHandle: settings.eligibleCollectionHandle,
+        expiry: "Points expire after 12 months of inactivity."
+      },
+      activeRedemption: redemptionActive
         ? {
             id: redemptionActive.id,
             code: redemptionActive.code,
-            valueCents: Math.round(Number(redemptionActive.value) * 100),
-            minimumSubtotalCents: Math.round(settings.redemptionMinOrder * 100),
+            points: redemptionActive.points,
+            value: redemptionActive.value,
             status: redemptionActive.status,
-            expiresAt: (redemptionActive.expiresAt ?? new Date(now.getTime() + 72 * 60 * 60 * 1000)).toISOString(),
+            expiresAt: redemptionActive.expiresAt
+              ? redemptionActive.expiresAt.toISOString()
+              : new Date(now.getTime() + 72 * 60 * 60 * 1000).toISOString()
           }
         : null,
-      catalog,
-      copy: {
-        earn: `Earn ${settings.earnRate} point(s) for every $1 you spend on eligible items (after discounts).`,
-        expiry: "Points expire after 12 months of inactivity.",
-      },
-    }),
-  );
+      recentLedger: ledger.map((l) => ({
+        id: l.id,
+        createdAt: l.createdAt.toISOString(),
+        type: l.type,
+        delta: l.delta,
+        source: l.source,
+        description: l.description
+      }))
+    });
+
+    return withCustomerAccountCors(response);
+  } catch (e: any) {
+    const resp = json(
+      { ok: false, error: String(e?.message ?? e ?? "Unauthorized") },
+      { status: 401 }
+    );
+    return withCustomerAccountCors(resp);
+  }
 };
