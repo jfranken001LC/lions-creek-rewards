@@ -211,6 +211,5 @@ say "Ensure scripts are executable"
 cd "$REPO_DIR"
 sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh || true
 sudo chmod +x ./scripts/Server_Git_Only.sh || true
-sudo chmod +x ./scripts/Prisma_Reset_DB.sh || true
 
 say "Done"

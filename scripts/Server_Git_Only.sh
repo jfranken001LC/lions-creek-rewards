@@ -59,7 +59,10 @@ git reset --hard "${REMOTE}/${BRANCH}"
 say "Show current revision"
 git rev-parse --short HEAD
 git log -1 --oneline
-sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh
-sudo chmod +x ./scripts/Server_Git_Only.sh
-sudo chmod +x ./scripts/Prisma_Reset_DB.sh
+
+say "Ensure scripts are executable"
+cd "$REPO_DIR"
+sudo chmod +x ./scripts/Server_Git_Code_Deploy.sh || true
+sudo chmod +x ./scripts/Server_Git_Only.sh || true
+
 say "Done"
