@@ -14,6 +14,9 @@ SERVICE_NAME="${SERVICE_NAME:-lions-creek-rewards}"
 ENV_FILE="${ENV_FILE:-/etc/lions-creek-rewards/lions-creek-rewards.env}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/${SERVICE_NAME}.deploy.lock}"
 
+# Optional: set STRICT_NPM_CI=1 to fail deploy if npm ci can't be used
+STRICT_NPM_CI="${STRICT_NPM_CI:-0}"
+
 say() { printf "\n==== %s ====\n" "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
@@ -56,9 +59,17 @@ install_deps() {
       return 0
     fi
 
+    if [[ "$STRICT_NPM_CI" == "1" ]]; then
+      die "npm ci failed and STRICT_NPM_CI=1. Fix package-lock.json consistency and retry."
+    fi
+
     echo "npm ci failed (lock out of sync). Falling back to npm install..."
     npm install --include=dev --no-audit --no-fund
     return 0
+  fi
+
+  if [[ "$STRICT_NPM_CI" == "1" ]]; then
+    die "package-lock.json missing and STRICT_NPM_CI=1. Commit a lockfile and retry."
   fi
 
   say "Install dependencies (npm install)"
@@ -80,6 +91,7 @@ echo "NPM:  $(npm -v)"
 echo "Branch: $BRANCH"
 echo "Service: $SERVICE_NAME"
 echo "Env file: $ENV_FILE"
+echo "STRICT_NPM_CI: $STRICT_NPM_CI"
 
 # lock to prevent concurrent deploy runs
 exec 9>"$LOCK_FILE"
@@ -100,7 +112,6 @@ git reset --hard "${REMOTE}/${BRANCH}"
 
 # -------- Clean build artifacts (preserve env + sqlite DB) ---------------------
 say "Clean ignored/untracked build artifacts (preserve env + sqlite DB)"
-# Preserve common sqlite/db locations regardless of accidental nesting
 git clean -ffdx \
   -e ".env" \
   -e ".env.*" \
@@ -124,7 +135,8 @@ echo "PORT=${PORT:-3001}"
 [[ -n "${SHOPIFY_APP_URL:-}" ]] && echo "SHOPIFY_APP_URL=${SHOPIFY_APP_URL}"
 
 missing=()
-for k in DATABASE_URL SHOPIFY_API_KEY SHOPIFY_API_SECRET SHOPIFY_APP_URL SESSION_SECRET; do
+# Added JOB_TOKEN because /jobs/expire is token-protected in the requirements and implementation.
+for k in DATABASE_URL SHOPIFY_API_KEY SHOPIFY_API_SECRET SHOPIFY_APP_URL SESSION_SECRET JOB_TOKEN; do
   [[ -n "${!k:-}" ]] || missing+=("$k")
 done
 if (( ${#missing[@]} > 0 )); then
@@ -138,9 +150,7 @@ install_deps
 
 # -------- Prisma migrate + generate -------------------------------------------
 say "Prisma deploy"
-# Silence Prisma’s “update available” nag in logs
 export PRISMA_HIDE_UPDATE_MESSAGE=1
-
 run_prisma generate
 
 if [[ -d "$REPO_DIR/prisma/migrations" ]] && [[ -n "$(ls -A "$REPO_DIR/prisma/migrations" 2>/dev/null || true)" ]]; then
@@ -160,6 +170,7 @@ fi
 
 # -------- Build app ------------------------------------------------------------
 say "Build app"
+export NODE_ENV=production
 npm run -s build
 
 # -------- Verify server entry exists ------------------------------------------
