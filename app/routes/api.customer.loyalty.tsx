@@ -1,83 +1,132 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { json } from "react-router";
-
+import db from "../db.server";
 import { authenticate } from "../shopify.server";
-import { withCustomerAccountCors } from "../lib/customerAccountCors.server";
-import { getCustomerIdFromJWTSub } from "../lib/jwtSub.server";
-import { getCurrentCustomerLoyalty } from "../services/loyalty.server";
+import { getShopSettings } from "../lib/shopSettings.server";
+import {
+  customerAccountPreflight,
+  withCustomerAccountCors,
+} from "../lib/customerAccountCors.server";
 
-type LoyaltySnapshotResponse =
-  | {
-      ok: true;
-      customerId: string;
-      customerName?: string | null;
-      pointsBalance: number;
-      tier?: string | null;
-      lastEarnedAt?: string | null;
-      lastEarnedSource?: string | null;
-    }
-  | { ok: false; error: string };
+async function handle(request: Request) {
+  const method = request.method.toUpperCase();
 
-async function handle(request: Request): Promise<Response> {
-  // CORS preflight (Customer Account UI extension fetches can trigger it)
-  if (request.method === "OPTIONS") {
-    return withCustomerAccountCors(new Response(null, { status: 204 }));
+  // CORS preflight for Customer Account UI extension calls
+  if (method === "OPTIONS") {
+    return customerAccountPreflight();
   }
 
-  // Allow both GET and POST (requirements say POST; earlier UI code used GET)
-  if (request.method !== "GET" && request.method !== "POST") {
+  // Requirements mention POST; extension currently uses GET. Support both.
+  if (method !== "GET" && method !== "POST") {
     return withCustomerAccountCors(
-      json<LoyaltySnapshotResponse>(
-        { ok: false, error: "method_not_allowed" },
-        { status: 405, headers: { "Cache-Control": "no-store" } }
-      )
+      new Response("Method Not Allowed", { status: 405 }),
     );
   }
 
   try {
-    const { sessionToken } = await authenticate.public.customerAccount(request);
-    const customerId = getCustomerIdFromJWTSub(sessionToken?.sub);
+    const { customerAccount, shop } =
+      await authenticate.public.customerAccount(request);
 
-    if (!customerId) {
-      return withCustomerAccountCors(
-        json<LoyaltySnapshotResponse>(
-          { ok: false, error: "unauthorized" },
-          { status: 401, headers: { "Cache-Control": "no-store" } }
-        )
-      );
-    }
+    const customerId = String(customerAccount.id);
+    const settings = await getShopSettings(shop);
 
-    const loyalty = await getCurrentCustomerLoyalty(customerId);
+    const balance = await db.customerPointsBalance.findUnique({
+      where: { shop_customerId: { shop, customerId } },
+    });
 
-    return withCustomerAccountCors(
-      json<LoyaltySnapshotResponse>(
-        {
-          ok: true,
-          customerId,
-          customerName: loyalty.customerName ?? null,
-          pointsBalance: loyalty.pointsBalance,
-          tier: loyalty.tier ?? null,
-          lastEarnedAt: loyalty.lastEarnedAt ?? null,
-          lastEarnedSource: loyalty.lastEarnedSource ?? null,
-        },
-        { headers: { "Cache-Control": "no-store" } }
-      )
+    const now = new Date();
+
+    const redemptionActive = await db.redemption.findFirst({
+      where: {
+        shop,
+        customerId,
+        status: { in: ["ISSUED", "APPLIED"] },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        code: true,
+        points: true,
+        value: true,
+        expiresAt: true,
+        status: true,
+      },
+    });
+
+    const ledger = await db.pointsLedger.findMany({
+      where: { shop, customerId },
+      orderBy: { createdAt: "desc" },
+      take: 25,
+      select: {
+        id: true,
+        createdAt: true,
+        type: true,
+        delta: true,
+        source: true,
+        description: true,
+      },
+    });
+
+    const response = json({
+      ok: true,
+      shop,
+      customerId,
+      balances: {
+        points: balance?.balance ?? 0,
+        lifetimeEarned: balance?.lifetimeEarned ?? 0,
+        lifetimeRedeemed: balance?.lifetimeRedeemed ?? 0,
+        lastActivityAt: balance?.lastActivityAt
+          ? balance.lastActivityAt.toISOString()
+          : null,
+        expiredAt: balance?.expiredAt ? balance.expiredAt.toISOString() : null,
+      },
+      settings: {
+        earnRate: settings.earnRate,
+        includeProductTags: settings.includeProductTags,
+        excludeProductTags: settings.excludeProductTags,
+        excludedCustomerTags: settings.excludedCustomerTags,
+        redemptionSteps: settings.redemptionSteps,
+        redemptionValueMap: settings.redemptionValueMap,
+        redemptionMinOrder: settings.redemptionMinOrder,
+        eligibleCollectionHandle: settings.eligibleCollectionHandle,
+        expiry: "Points expire after 12 months of inactivity.",
+      },
+      activeRedemption: redemptionActive
+        ? {
+            id: redemptionActive.id,
+            code: redemptionActive.code,
+            points: redemptionActive.points,
+            value: redemptionActive.value,
+            status: redemptionActive.status,
+            expiresAt: redemptionActive.expiresAt
+              ? redemptionActive.expiresAt.toISOString()
+              : // safety: if null in DB, present a 72h default for UI display
+                new Date(now.getTime() + 72 * 60 * 60 * 1000).toISOString(),
+          }
+        : null,
+      recentLedger: ledger.map((l) => ({
+        id: l.id,
+        createdAt: l.createdAt.toISOString(),
+        type: l.type,
+        delta: l.delta,
+        source: l.source,
+        description: l.description,
+      })),
+    });
+
+    return withCustomerAccountCors(response);
+  } catch (e: any) {
+    const resp = json(
+      { ok: false, error: String(e?.message ?? e ?? "Unauthorized") },
+      { status: 401 },
     );
-  } catch (err) {
-    console.error("api.customer.loyalty error:", err);
-    return withCustomerAccountCors(
-      json<LoyaltySnapshotResponse>(
-        { ok: false, error: "server_error" },
-        { status: 500, headers: { "Cache-Control": "no-store" } }
-      )
-    );
+    return withCustomerAccountCors(resp);
   }
 }
 
-export async function loader({ request }: LoaderFunctionArgs) {
-  return handle(request);
-}
+// GET requests must be handled by a loader
+export const loader = async ({ request }: LoaderFunctionArgs) => handle(request);
 
-export async function action({ request }: ActionFunctionArgs) {
-  return handle(request);
-}
+// POST/OPTIONS requests must be handled by an action
+export const action = async ({ request }: ActionFunctionArgs) => handle(request);

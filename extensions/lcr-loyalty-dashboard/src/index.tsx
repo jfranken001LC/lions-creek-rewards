@@ -1,259 +1,224 @@
-/* eslint-disable react-hooks/exhaustive-deps */
-import {
-  reactExtension,
-  useApi,
-  useExtensionCapability,
-  useSessionToken,
-  BlockStack,
-  Card,
-  Text,
-  Button,
-  InlineStack,
-  Divider,
-  Banner,
-  Spinner,
-} from "@shopify/ui-extensions-react/customer-account";
-import { useEffect, useMemo, useState } from "react";
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
+import { useEffect, useMemo, useState } from "preact/hooks";
 
+declare const shopify: any;
+
+// Point dev extension to your tunnel host if desired
 const APP_BASE_URL = "https://loyalty.basketbooster.ca";
 
-type LoyaltySnapshot =
-  | {
-      ok: true;
-      customerId: string;
-      customerName?: string | null;
-      pointsBalance: number;
-      tier?: string | null;
-      lastEarnedAt?: string | null;
-      lastEarnedSource?: string | null;
-    }
-  | { ok: false; error: string };
+type LoyaltyResponse = {
+  ok: boolean;
+  error?: string;
 
-type RedeemResponse =
-  | {
-      ok: true;
-      discountCode: string;
-      redemptionId: string;
-      pointsDebited: number;
-      expiresAt: string;
-    }
-  | { ok: false; error: string };
+  shop: string;
+  customerId: string;
 
-export default reactExtension("customer-account.page.render", () => (
-  <LoyaltyDashboard />
-));
+  balances: {
+    points: number;
+    lifetimeEarned: number;
+    lifetimeRedeemed: number;
+    lastActivityAt: string | null;
+    expiredAt: string | null;
+  };
 
-function LoyaltyDashboard() {
-  const api = useApi();
-  const sessionToken = useSessionToken();
-  const canNetwork = useExtensionCapability("network_access");
+  settings: {
+    earnRate: number;
+    includeProductTags: string[];
+    excludeProductTags: string[];
+    excludedCustomerTags: string[];
 
-  const [loading, setLoading] = useState(true);
-  const [snapshot, setSnapshot] = useState<LoyaltySnapshot | null>(null);
-  const [error, setError] = useState<string | null>(null);
+    redemptionSteps: number[];
+    redemptionValueMap: Record<string, number>;
+    redemptionMinOrder: number;
+    eligibleCollectionHandle: string;
+    expiry: string;
+  };
 
-  const [redeeming, setRedeeming] = useState(false);
-  const [redeemResult, setRedeemResult] = useState<RedeemResponse | null>(null);
+  activeRedemption: null | {
+    id: string;
+    code: string;
+    points: number;
+    value: number;
+    status: string;
+    expiresAt: string;
+  };
 
-  const canCallApi = useMemo(() => {
-    return canNetwork === true;
-  }, [canNetwork]);
+  recentLedger: Array<{
+    id: string;
+    createdAt: string;
+    type: string;
+    delta: number;
+    source: string;
+    description: string;
+  }>;
+};
 
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      if (!canCallApi) {
-        setError("This extension does not have network access enabled.");
-        setLoading(false);
-        return;
-      }
-
-      setLoading(true);
-      setError(null);
-      setRedeemResult(null);
-
-      try {
-        // CHANGED: use POST (server supports GET+POST; requirements specify POST)
-        const snap = await apiRequest<LoyaltySnapshot>(
-          sessionToken,
-          "/api/customer/loyalty",
-          { method: "POST" }
-        );
-
-        if (cancelled) return;
-
-        setSnapshot(snap);
-      } catch (e) {
-        if (cancelled) return;
-        setError((e as Error)?.message ?? String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    load();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [canCallApi, sessionToken]);
-
-  async function onRedeem() {
-    if (!canCallApi) return;
-
-    setRedeeming(true);
-    setRedeemResult(null);
-    setError(null);
-
-    try {
-      const res = await apiRequest<RedeemResponse>(
-        sessionToken,
-        "/api/customer/redeem",
-        { method: "POST" }
-      );
-
-      setRedeemResult(res);
-
-      // Refresh snapshot after redeem
-      const snap = await apiRequest<LoyaltySnapshot>(
-        sessionToken,
-        "/api/customer/loyalty",
-        { method: "POST" }
-      );
-      setSnapshot(snap);
-    } catch (e) {
-      setError((e as Error)?.message ?? String(e));
-    } finally {
-      setRedeeming(false);
-    }
-  }
-
-  return (
-    <BlockStack spacing="loose">
-      <Text size="large" emphasis="bold">
-        Lions Creek Rewards
-      </Text>
-
-      {!canCallApi ? (
-        <Banner status="critical">
-          Network access is disabled for this extension. Enable
-          <Text emphasis="bold"> network_access </Text>
-          in <Text emphasis="bold">shopify.extension.toml</Text>.
-        </Banner>
-      ) : null}
-
-      {loading ? (
-        <InlineStack spacing="loose" inlineAlignment="center">
-          <Spinner />
-          <Text>Loading your loyalty summary…</Text>
-        </InlineStack>
-      ) : null}
-
-      {error ? <Banner status="critical">{error}</Banner> : null}
-
-      {!loading && snapshot?.ok === false ? (
-        <Banner status="critical">
-          Could not load loyalty: {snapshot.error}
-        </Banner>
-      ) : null}
-
-      {!loading && snapshot?.ok === true ? (
-        <Card>
-          <BlockStack spacing="tight">
-            <Text emphasis="bold">
-              {snapshot.customerName ? `Hi ${snapshot.customerName}!` : "Hi!"}
-            </Text>
-
-            <Text>
-              <Text emphasis="bold">{snapshot.pointsBalance}</Text> points
-              available
-            </Text>
-
-            {snapshot.tier ? <Text>Tier: {snapshot.tier}</Text> : null}
-
-            {snapshot.lastEarnedAt ? (
-              <Text>
-                Last earned: {new Date(snapshot.lastEarnedAt).toLocaleString()}
-                {snapshot.lastEarnedSource
-                  ? ` (${snapshot.lastEarnedSource})`
-                  : ""}
-              </Text>
-            ) : null}
-
-            <Divider />
-
-            <InlineStack spacing="base" inlineAlignment="start">
-              <Button onPress={onRedeem} disabled={redeeming}>
-                Redeem points
-              </Button>
-
-              {redeeming ? (
-                <InlineStack spacing="tight" inlineAlignment="center">
-                  <Spinner />
-                  <Text>Creating code…</Text>
-                </InlineStack>
-              ) : null}
-            </InlineStack>
-
-            {redeemResult?.ok === false ? (
-              <Banner status="critical">
-                Redeem failed: {redeemResult.error}
-              </Banner>
-            ) : null}
-
-            {redeemResult?.ok === true ? (
-              <Banner status="success">
-                Your discount code:
-                <Text emphasis="bold"> {redeemResult.discountCode}</Text>
-                <Text>
-                  Expires: {new Date(redeemResult.expiresAt).toLocaleString()}
-                </Text>
-              </Banner>
-            ) : null}
-          </BlockStack>
-        </Card>
-      ) : null}
-
-      <Text size="small" appearance="subdued">
-        If you need help, contact support from the Lions Creek Team.
-      </Text>
-    </BlockStack>
-  );
+async function getSessionToken(): Promise<string> {
+  if (!shopify?.sessionToken?.get) throw new Error("sessionToken API not available");
+  return await shopify.sessionToken.get();
 }
 
-async function apiRequest<T>(
-  sessionToken: ReturnType<typeof useSessionToken>,
-  path: string,
-  init?: RequestInit
-): Promise<T> {
-  const token = await sessionToken.get();
-
+async function apiRequest(path: string, init: RequestInit = {}) {
+  const token = await getSessionToken();
   const res = await fetch(`${APP_BASE_URL}${path}`, {
     ...init,
     headers: {
-      ...(init?.headers ?? {}),
       Authorization: `Bearer ${token}`,
-      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
     },
   });
 
-  const text = await res.text();
-  let data: unknown = null;
-
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    // Non-JSON response
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.ok === false) {
+    throw new Error(data?.error || `Request failed (${res.status})`);
   }
-
-  if (!res.ok) {
-    const msg =
-      (data as any)?.error ||
-      (data as any)?.message ||
-      `Request failed (${res.status})`;
-    throw new Error(msg);
-  }
-
-  return data as T;
+  return data;
 }
+
+function formatDelta(n: number) {
+  return `${n >= 0 ? "+" : ""}${n}`;
+}
+
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [busyRedeem, setBusyRedeem] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [data, setData] = useState<LoyaltyResponse | null>(null);
+
+  const steps = useMemo(() => data?.settings?.redemptionSteps ?? [], [data]);
+  const points = data?.balances?.points ?? 0;
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const d = (await apiRequest("/api/customer/loyalty", { method: "GET" })) as LoyaltyResponse;
+      setData(d);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function redeem(pointsRequested: number) {
+    setBusyRedeem(true);
+    setError(null);
+    try {
+      await apiRequest("/api/customer/redeem", {
+        method: "POST",
+        body: JSON.stringify({ points: pointsRequested }),
+      });
+      await load();
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setBusyRedeem(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const active = data?.activeRedemption;
+
+  return (
+    <s-page>
+      <s-section>
+        <s-stack gap="tight">
+          <s-heading>Lions Creek Rewards</s-heading>
+
+          {loading && <s-text>Loading loyalty status…</s-text>}
+
+          {error && (
+            <s-banner tone="critical">
+              <s-text>{error}</s-text>
+            </s-banner>
+          )}
+
+          {!loading && data?.ok && (
+            <>
+              <s-banner tone="info">
+                <s-text>
+                  Points balance: <strong>{points}</strong>
+                </s-text>
+                <s-text>{data.settings.expiry}</s-text>
+              </s-banner>
+
+              {active ? (
+                <s-banner tone="success">
+                  <s-text>
+                    Active reward code: <strong>{active.code}</strong>
+                  </s-text>
+                  <s-text>
+                    {active.points} points → ${active.value} off (expires{" "}
+                    {new Date(active.expiresAt).toLocaleString()})
+                  </s-text>
+                </s-banner>
+              ) : (
+                <s-banner tone="warning">
+                  <s-text>No active reward code.</s-text>
+                </s-banner>
+              )}
+
+              <s-divider />
+
+              <s-heading size="medium">Redeem points</s-heading>
+              <s-stack gap="tight">
+                {steps.map((step) => {
+                  const value = data.settings.redemptionValueMap[String(step)] ?? 0;
+                  const disabled = busyRedeem || points < step || Boolean(active);
+                  return (
+                    <s-inline-stack key={String(step)} gap="tight" align="space-between">
+                      <s-text>
+                        {step} points → ${value} off
+                      </s-text>
+                      <s-button
+                        variant="primary"
+                        disabled={disabled}
+                        onClick={() => redeem(step)}
+                      >
+                        Redeem
+                      </s-button>
+                    </s-inline-stack>
+                  );
+                })}
+                {active && (
+                  <s-text tone="subdued">
+                    You already have an active code. Use it or wait for it to expire.
+                  </s-text>
+                )}
+              </s-stack>
+
+              <s-divider />
+
+              <s-heading size="medium">Recent activity</s-heading>
+              <s-stack gap="tight">
+                {(data.recentLedger ?? []).slice(0, 10).map((row) => (
+                  <s-inline-stack key={row.id} gap="tight" align="space-between">
+                    <s-text>{new Date(row.createdAt).toLocaleDateString()}</s-text>
+                    <s-text>
+                      {row.type}: <strong>{formatDelta(row.delta)}</strong>
+                    </s-text>
+                  </s-inline-stack>
+                ))}
+              </s-stack>
+
+              <s-divider />
+              <s-button variant="secondary" onClick={load} disabled={loading}>
+                Refresh
+              </s-button>
+            </>
+          )}
+        </s-stack>
+      </s-section>
+    </s-page>
+  );
+}
+
+export default async () => {
+  render(<App />, document.body);
+};
