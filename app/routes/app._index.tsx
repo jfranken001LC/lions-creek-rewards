@@ -1,60 +1,42 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { data, Link, useLoaderData } from "react-router";
-import { Page, Card, BlockStack, Text } from "@shopify/polaris";
+import { data, useLoaderData } from "react-router";
+import { Page, Layout, Card, Text, BlockStack, InlineStack, Badge } from "@shopify/polaris";
+import db from "../db.server";
 import { requireAdmin } from "../lib/shopify.server";
-import { prisma } from "../lib/prisma.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireAdmin(request);
+  const session = await requireAdmin(request);
+  const shop = session.shop;
 
-  const customerCount = await prisma.customer.count();
-  const redemptionCount = await prisma.redemption.count();
-  const unprocessedOrders = await prisma.orderEvent.count({
-    where: { processedAt: null },
-  });
+  const [customerCount, redemptionCount, unprocessedWebhooks] = await Promise.all([
+    db.customerPointsBalance.count({ where: { shop } }),
+    db.redemption.count({ where: { shop } }),
+    db.webhookEvent.count({ where: { shop, processedAt: null } }),
+  ]);
 
-  return data({
-    customerCount,
-    redemptionCount,
-    unprocessedOrders,
-  });
+  return data({ shop, customerCount, redemptionCount, unprocessedWebhooks });
 }
 
 export default function AppIndex() {
-  const { customerCount, redemptionCount, unprocessedOrders } =
-    useLoaderData<typeof loader>();
+  const { shop, customerCount, redemptionCount, unprocessedWebhooks } = useLoaderData<typeof loader>();
 
   return (
     <Page title="Lions Creek Rewards">
-      <BlockStack gap="400">
-        <Card>
-          <BlockStack gap="200">
-            <Text as="h2" variant="headingMd">
-              Overview
-            </Text>
-            <Text as="p">Customers tracked: {customerCount}</Text>
-            <Text as="p">Redemptions: {redemptionCount}</Text>
-            <Text as="p">Unprocessed orders: {unprocessedOrders}</Text>
-          </BlockStack>
-        </Card>
-
-        <Card>
-          <BlockStack gap="200">
-            <Text as="h2" variant="headingMd">
-              Quick links
-            </Text>
-            <Text as="p">
-              <Link to="/app/customers">Customers</Link>
-            </Text>
-            <Text as="p">
-              <Link to="/app/redemptions">Redemptions</Link>
-            </Text>
-            <Text as="p">
-              <Link to="/app/settings">Settings</Link>
-            </Text>
-          </BlockStack>
-        </Card>
-      </BlockStack>
+      <Layout>
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="400">
+              <InlineStack align="space-between">
+                <Text as="h2" variant="headingMd">Store</Text>
+                <Badge tone="info">{shop}</Badge>
+              </InlineStack>
+              <InlineStack align="space-between"><Text as="p">Tracked customers</Text><Text as="p" variant="headingLg">{customerCount}</Text></InlineStack>
+              <InlineStack align="space-between"><Text as="p">Redemptions</Text><Text as="p" variant="headingLg">{redemptionCount}</Text></InlineStack>
+              <InlineStack align="space-between"><Text as="p">Unprocessed webhook events</Text><Text as="p" variant="headingLg">{unprocessedWebhooks}</Text></InlineStack>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+      </Layout>
     </Page>
   );
 }
