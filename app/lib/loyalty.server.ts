@@ -78,3 +78,48 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
     },
   };
 }
+
+/**
+ * Required by routes/loyalty.json.tsx and routes/loyalty.tsx.
+ * This is the canonical computation used by the app proxy endpoints.
+ *
+ * Shape: returns the same base payload as getCustomerLoyaltyPayload,
+ * plus recent ledger activity for debug/admin visibility.
+ */
+export async function computeCustomerLoyalty(args: { shop: string; customerId?: string | null }) {
+  const shop = String(args?.shop || "").trim();
+  const cid = normalizeCustomerId(String(args?.customerId || "").trim());
+
+  if (!shop) throw new Error("shop is required");
+  if (!cid) throw new Error("customerId is required");
+
+  const base = await getCustomerLoyaltyPayload(shop, cid);
+
+  const recentLedger = await db.pointsLedger.findMany({
+    where: { shop, customerId: cid },
+    orderBy: { createdAt: "desc" },
+    take: 10,
+    select: {
+      type: true,
+      delta: true,
+      source: true,
+      sourceId: true,
+      description: true,
+      createdAt: true,
+    },
+  });
+
+  return {
+    ...base,
+    activity: {
+      recentLedger: recentLedger.map((x) => ({
+        type: x.type,
+        delta: x.delta,
+        source: x.source,
+        sourceId: x.sourceId,
+        description: x.description ?? null,
+        createdAt: x.createdAt.toISOString(),
+      })),
+    },
+  };
+}
