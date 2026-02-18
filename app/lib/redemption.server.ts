@@ -1,358 +1,237 @@
-// app/lib/redemption.server.ts
-import crypto from "crypto";
 import db from "../db.server";
-import { LedgerType, RedemptionStatus } from "@prisma/client";
-import { getShopSettings } from "./shopSettings.server";
-import { fetchCustomerTags, resolveEligibleCollectionGid } from "./shopifyQueries.server";
+import { apiVersion } from "../shopify.server";
+import { RedemptionStatus } from "@prisma/client";
+import { getOrCreateShopSettings } from "./shopSettings.server";
+import { fetchCustomerTags, resolveEligibleCollectionGid, type AdminGraphql } from "./shopifyQueries.server";
 
-type AdminClient = {
-  graphql: (query: string, args?: { variables?: Record<string, any> }) => Promise<Response>;
+export type IssueRedemptionArgs = {
+  shop: string;
+  customerId: string;
+  pointsRequested: number;
+  idempotencyKey?: string;
 };
 
-const REDEMPTION_EXPIRY_HOURS = 72;
+export type IssueRedemptionResult =
+  | { ok: true; code: string; expiresAt: string; pointsDebited: number; valueDollars: number; idempotencyKey?: string }
+  | { ok: false; error: string };
 
-const DISCOUNT_CODE_BASIC_CREATE = `#graphql
-  mutation DiscountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
-    discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-      codeDiscountNode { id }
-      userErrors { field code message }
-    }
-  }
-`;
-
-function normSet(list: string[]) {
-  return new Set(list.map((s) => s.trim().toLowerCase()).filter(Boolean));
+async function getOfflineAccessToken(shop: string): Promise<string | null> {
+  const id = `offline_${shop}`;
+  const sess = await db.session.findUnique({ where: { id } }).catch(() => null);
+  return sess?.accessToken ?? null;
 }
 
-/**
- * Normalize a Shopify customer identifier into the numeric ID string.
- * - Accepts: "gid://shopify/Customer/123", "123"
- * - Returns: "123"
- */
-export function normalizeCustomerId(input: string): string {
-  const s = String(input ?? "").trim();
-  if (!s) return "";
-  const m = s.match(/^gid:\/\/shopify\/Customer\/(\d+)$/);
-  if (m?.[1]) return m[1];
+function makeAdminGraphql(shop: string, accessToken: string): AdminGraphql {
+  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
+  return async (query: string, args?: { variables?: Record<string, any> }) => {
+    return fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken,
+      },
+      body: JSON.stringify({ query, variables: args?.variables ?? {} }),
+    });
+  };
+}
+
+async function graphqlJson(res: Response): Promise<any> {
+  const text = await res.text().catch(() => "");
+  let json: any = null;
+  try { json = JSON.parse(text); } catch { json = null; }
+  if (!res.ok) throw new Error(`Shopify GraphQL failed: ${res.status} ${res.statusText} ${text}`);
+  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  return json?.data ?? null;
+}
+
+function normalizeCustomerId(raw: string): string {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  const m = s.match(/Customer\/(\d+)/i);
+  if (m) return m[1];
   if (/^\d+$/.test(s)) return s;
-
-  // Conservative fallback for rare formats containing the GID inside a larger string.
-  const m2 = s.match(/gid:\/\/shopify\/Customer\/(\d+)/);
-  if (m2?.[1]) return m2[1];
-
   return s;
 }
 
-export function toCustomerGid(customerId: string): string {
-  const id = normalizeCustomerId(customerId);
-  return `gid://shopify/Customer/${id}`;
+function generateCode(): string {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "LCR-";
+  for (let i = 0; i < 8; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
 }
 
-export type IssueRedemptionResult = {
-  redemptionId: string;
-  code: string;
-  discountNodeId: string;
-  expiresAt: string;
-  points: number;
-  valueDollars: number;
-};
-
-export async function issueRedemptionCode(args: {
-  shop: string;
-  admin: AdminClient;
-
-  /**
-   * Prefer passing numeric ID string ("123").
-   * Back-compat: customerGid is still accepted.
-   */
-  customerId?: string;
-  customerGid?: string;
-
-  pointsRequested: number;
-  idemKey?: string | null;
-  now?: Date;
-}): Promise<IssueRedemptionResult> {
-  const now = args.now ?? new Date();
-  const idemKey = args.idemKey?.trim() ? args.idemKey.trim() : null;
-
-  const customerId = normalizeCustomerId(args.customerId ?? args.customerGid ?? "");
-  if (!customerId) throw new Error("Missing customerId");
-
-  const settings = await getShopSettings(args.shop);
-
-  if (!Number.isInteger(args.pointsRequested) || args.pointsRequested <= 0) {
-    throw new Error("Invalid pointsRequested");
+async function uniqueCode(shop: string): Promise<string> {
+  for (let i = 0; i < 10; i++) {
+    const code = generateCode();
+    const exists = await db.redemption.findFirst({ where: { shop, code }, select: { id: true } });
+    if (!exists) return code;
   }
-  if (!settings.redemptionSteps.includes(args.pointsRequested)) {
-    throw new Error(`Invalid redemption amount. Allowed: ${settings.redemptionSteps.join(", ")}`);
+  return `${generateCode()}-${Math.floor(Math.random() * 9)}`;
+}
+
+const DISCOUNT_CREATE = `#graphql
+mutation DiscountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+  discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+    codeDiscountNode { id }
+    userErrors { field message }
+  }
+}
+`;
+
+async function createDiscount(
+  adminGraphql: AdminGraphql,
+  args: { code: string; valueDollars: number; endsAt: Date; eligibleCollectionGid: string },
+): Promise<{ ok: true; discountNodeId: string } | { ok: false; error: string }> {
+  const variables = {
+    basicCodeDiscount: {
+      title: `LCR Redemption ${args.code}`,
+      code: args.code,
+      startsAt: new Date().toISOString(),
+      endsAt: args.endsAt.toISOString(),
+      usageLimit: 1,
+      customerSelection: { all: true },
+      combinesWith: { orderDiscounts: true, productDiscounts: true, shippingDiscounts: true },
+      customerGets: {
+        value: { discountAmount: { amount: String(args.valueDollars), appliesOnEachItem: false } },
+        items: { collections: { add: [args.eligibleCollectionGid] } },
+      },
+    },
+  };
+
+  const data = await graphqlJson(await adminGraphql(DISCOUNT_CREATE, { variables }));
+  const result = data?.discountCodeBasicCreate;
+  const errs = result?.userErrors ?? [];
+  if (errs.length) return { ok: false, error: errs.map((e: any) => e?.message).join("; ") };
+
+  const id = result?.codeDiscountNode?.id;
+  if (!id) return { ok: false, error: "Missing codeDiscountNode.id" };
+  return { ok: true, discountNodeId: String(id) };
+}
+
+export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<IssueRedemptionResult> {
+  const shop = String(args.shop || "").trim();
+  const customerId = normalizeCustomerId(args.customerId);
+  const pointsRequested = Number(args.pointsRequested);
+  const idemKey = args.idempotencyKey ? String(args.idempotencyKey).trim() : undefined;
+
+  if (!shop) return { ok: false, error: "Missing shop" };
+  if (!customerId) return { ok: false, error: "Missing customerId" };
+  if (!Number.isInteger(pointsRequested) || pointsRequested <= 0) return { ok: false, error: "Invalid points" };
+
+  const settings = await getOrCreateShopSettings(shop);
+
+  if (!settings.redemptionSteps.includes(pointsRequested)) {
+    return { ok: false, error: `Points must be one of: ${settings.redemptionSteps.join(", ")}` };
   }
 
-  // Customer tag exclusions
-  if (settings.excludedCustomerTags.length > 0) {
-    const tags = await fetchCustomerTags(args.admin, toCustomerGid(customerId));
-    const customer = normSet(tags);
-    const excluded = normSet(settings.excludedCustomerTags);
-    for (const t of excluded) {
-      if (customer.has(t)) {
-        throw new Error("Customer is not eligible for loyalty redemption.");
-      }
-    }
-  }
+  const valueDollars = Number(settings.redemptionValueMap[String(pointsRequested)]);
+  if (!Number.isFinite(valueDollars) || valueDollars <= 0) return { ok: false, error: "Invalid redemption map" };
 
-  // Require eligible collection handle for redemption eligibility
-  if (!settings.eligibleCollectionHandle?.trim()) {
-    throw new Error("Eligible collection handle is not configured in Settings.");
-  }
-
-  const eligibleCollectionGid = await resolveEligibleCollectionGid({
-    admin: args.admin,
-    shop: args.shop,
-    handle: settings.eligibleCollectionHandle,
-  });
-
-  // Idempotency key support (optional)
+  // Idempotency
   if (idemKey) {
-    const existing = await db.redemption.findFirst({
-      where: { shop: args.shop, customerId, idemKey },
+    const existing = await db.redemption.findUnique({
+      where: { redemption_idem: { shop, customerId, idemKey } },
+      select: { code: true, expiresAt: true, points: true, valueDollars: true },
     });
-    if (
-      existing &&
-      existing.status !== RedemptionStatus.VOID &&
-      existing.expiresAt &&
-      existing.expiresAt > now &&
-      existing.discountNodeId
-    ) {
+    if (existing) {
       return {
-        redemptionId: existing.id,
+        ok: true,
         code: existing.code,
-        discountNodeId: existing.discountNodeId,
-        expiresAt: existing.expiresAt.toISOString(),
-        points: existing.points,
-        valueDollars: existing.value,
+        expiresAt: existing.expiresAt ? existing.expiresAt.toISOString() : new Date().toISOString(),
+        pointsDebited: existing.points,
+        valueDollars: existing.valueDollars,
+        idempotencyKey: idemKey,
       };
     }
   }
 
-  // Only one active code at a time
+  // Active redemption guard
   const active = await db.redemption.findFirst({
     where: {
-      shop: args.shop,
+      shop,
       customerId,
       status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      expiresAt: { gt: now },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
     },
-    orderBy: { createdAt: "desc" },
+    select: { code: true },
   });
-  if (active?.discountNodeId && active.expiresAt) {
-    return {
-      redemptionId: active.id,
-      code: active.code,
-      discountNodeId: active.discountNodeId,
-      expiresAt: active.expiresAt.toISOString(),
-      points: active.points,
-      valueDollars: active.value,
-    };
-  }
+  if (active) return { ok: false, error: "Active redemption already exists" };
 
-  const valueDollars = Number(settings.redemptionValueMap[String(args.pointsRequested)] ?? 0);
-  if (!valueDollars) throw new Error("Redemption value map misconfigured.");
+  const token = await getOfflineAccessToken(shop);
+  if (!token) return { ok: false, error: `Missing offline token for ${shop}` };
+  const adminGraphql = makeAdminGraphql(shop, token);
 
-  const code = `LCR-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
-  const expiresAt = new Date(now.getTime() + REDEMPTION_EXPIRY_HOURS * 60 * 60 * 1000);
-
-  // Phase 1: debit points + create local redemption + ledger
-  const redemption = await db.$transaction(async (tx) => {
-    const bal = await tx.customerPointsBalance.upsert({
-      where: { shop_customerId: { shop: args.shop, customerId } },
-      create: {
-        shop: args.shop,
-        customerId,
-        balance: 0,
-        lifetimeEarned: 0,
-        lifetimeRedeemed: 0,
-        lastActivityAt: now,
-        expiredAt: null,
-      },
-      update: {},
-    });
-
-    if (bal.balance < args.pointsRequested) {
-      throw new Error("Insufficient points");
+  // Excluded customer tags
+  if (settings.excludedCustomerTags.length) {
+    const tags = await fetchCustomerTags(adminGraphql, customerId);
+    const lower = new Set(tags.map((t) => t.toLowerCase()));
+    if (settings.excludedCustomerTags.some((t) => lower.has(String(t).toLowerCase()))) {
+      return { ok: false, error: "Customer excluded from loyalty program" };
     }
+  }
 
-    const created = await tx.redemption.create({
-      data: {
-        shop: args.shop,
-        customerId,
-        points: args.pointsRequested,
-        value: valueDollars,
-        code,
-        discountNodeId: null,
-        idemKey,
-        status: RedemptionStatus.ISSUED,
-        issuedAt: now,
-        expiresAt,
-      },
-    });
+  const eligibleCollectionGid = await resolveEligibleCollectionGid(adminGraphql, shop, settings);
 
-    await tx.pointsLedger.create({
-      data: {
-        shop: args.shop,
-        customerId,
-        type: LedgerType.REDEEM,
-        delta: -args.pointsRequested,
-        source: "REDEMPTION",
-        sourceId: created.id,
-        description: `Redeem ${args.pointsRequested} pts → $${valueDollars} off (code ${code})`,
-      },
-    });
+  // Balance check
+  const bal = await db.customerPointsBalance.upsert({
+    where: { shop_customerId: { shop, customerId } },
+    create: { shop, customerId },
+    update: {},
+  });
+  if (bal.balance < pointsRequested) return { ok: false, error: "Insufficient points" };
 
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + settings.redemptionExpiryHours * 60 * 60 * 1000);
+  const code = await uniqueCode(shop);
+
+  // Create discount first (dev-safe), then transactionally debit points + persist redemption.
+  const discount = await createDiscount(adminGraphql, { code, valueDollars, endsAt: expiresAt, eligibleCollectionGid });
+  if (!discount.ok) return { ok: false, error: discount.error };
+
+  await db.$transaction(async (tx) => {
     await tx.customerPointsBalance.update({
-      where: { shop_customerId: { shop: args.shop, customerId } },
+      where: { shop_customerId: { shop, customerId } },
       data: {
-        balance: { decrement: args.pointsRequested },
-        lifetimeRedeemed: { increment: args.pointsRequested },
+        balance: { decrement: pointsRequested },
+        lifetimeRedeemed: { increment: pointsRequested },
         lastActivityAt: now,
         expiredAt: null,
       },
     });
 
-    return created;
-  });
-
-  // Phase 2: create Shopify discount code
-  try {
-    const discountNodeId = await createShopifyDiscountCode({
-      admin: args.admin,
-      code,
-      customerId,
-      valueDollars,
-      minSubtotalDollars: settings.redemptionMinOrder,
-      eligibleCollectionGid,
-      endsAt: expiresAt,
-    });
-
-    const updated = await db.redemption.update({
-      where: { id: redemption.id },
-      data: { discountNodeId },
-    });
-
-    return {
-      redemptionId: updated.id,
-      code: updated.code,
-      discountNodeId,
-      expiresAt: updated.expiresAt!.toISOString(),
-      points: updated.points,
-      valueDollars: updated.value,
-    };
-  } catch (e: any) {
-    // Compensating restore
-    await voidAndRestore({
-      shop: args.shop,
-      customerId,
-      redemptionId: redemption.id,
-      points: args.pointsRequested,
-      now,
-      reason: `SHOPIFY_DISCOUNT_CREATE_FAILED: ${String(e?.message ?? e)}`,
-    });
-    throw e;
-  }
-}
-
-async function createShopifyDiscountCode(args: {
-  admin: AdminClient;
-  code: string;
-  customerId: string;
-  valueDollars: number;
-  minSubtotalDollars: number;
-  eligibleCollectionGid: string;
-  endsAt: Date;
-}): Promise<string> {
-  const money = (n: number) => n.toFixed(2);
-  const customerGid = toCustomerGid(args.customerId);
-
-  const variables = {
-    basicCodeDiscount: {
-      title: `Lions Creek Rewards $${args.valueDollars} off`,
-      code: args.code,
-      startsAt: new Date().toISOString(),
-      endsAt: args.endsAt.toISOString(),
-      customerSelection: { customers: { add: [customerGid] } },
-      usageLimit: 1,
-      appliesOncePerCustomer: true,
-      customerGets: {
-        items: { collections: { add: [args.eligibleCollectionGid] } },
-        value: {
-          discountAmount: {
-            amount: money(args.valueDollars),
-            appliesOnEachItem: false,
-          },
-        },
-      },
-      minimumRequirement:
-        args.minSubtotalDollars > 0
-          ? {
-              subtotal: {
-                greaterThanOrEqualToSubtotal: money(args.minSubtotalDollars),
-              },
-            }
-          : null,
-    },
-  };
-
-  const res = await args.admin.graphql(DISCOUNT_CODE_BASIC_CREATE, { variables });
-  const json = (await res.json()) as any;
-  const errs = json?.data?.discountCodeBasicCreate?.userErrors ?? [];
-  if (errs.length) throw new Error(errs.map((e: any) => e.message).join("; "));
-  const id = json?.data?.discountCodeBasicCreate?.codeDiscountNode?.id;
-  if (!id) throw new Error("Discount creation failed (missing node id)");
-  return String(id);
-}
-
-async function voidAndRestore(args: {
-  shop: string;
-  customerId: string;
-  redemptionId: string;
-  points: number;
-  now: Date;
-  reason: string;
-}) {
-  await db.$transaction(async (tx) => {
-    const bal = await tx.customerPointsBalance.findUnique({
-      where: { shop_customerId: { shop: args.shop, customerId: args.customerId } },
-      select: { lifetimeRedeemed: true },
-    });
-    const nextLifetimeRedeemed = Math.max(0, (bal?.lifetimeRedeemed ?? 0) - args.points);
-
-    await tx.redemption.update({
-      where: { id: args.redemptionId },
-      data: {
-        status: RedemptionStatus.VOID,
-        voidedAt: args.now,
-        restoredAt: args.now,
-        restoreReason: args.reason,
-      },
-    });
-
     await tx.pointsLedger.create({
       data: {
-        shop: args.shop,
-        customerId: args.customerId,
-        type: LedgerType.ADJUST,
-        delta: args.points,
-        source: "REDEMPTION_VOID",
-        sourceId: args.redemptionId,
-        description: `Restore ${args.points} pts (void redemption). Reason: ${args.reason}`,
+        shop,
+        customerId,
+        type: "REDEEM",
+        delta: -pointsRequested,
+        source: "REDEMPTION",
+        sourceId: code,
+        description: `Issued redemption ${code} for $${valueDollars}`,
       },
     });
 
-    await tx.customerPointsBalance.update({
-      where: { shop_customerId: { shop: args.shop, customerId: args.customerId } },
+    await tx.redemption.create({
       data: {
-        balance: { increment: args.points },
-        lifetimeRedeemed: nextLifetimeRedeemed,
-        expiredAt: null,
+        shop,
+        customerId,
+        status: RedemptionStatus.ISSUED,
+        points: pointsRequested,
+        valueDollars,
+        code,
+        discountNodeId: discount.discountNodeId,
+        expiresAt,
+        idemKey: idemKey ?? null,
       },
     });
   });
+
+  return {
+    ok: true,
+    code,
+    expiresAt: expiresAt.toISOString(),
+    pointsDebited: pointsRequested,
+    valueDollars,
+    idempotencyKey: idemKey,
+  };
 }

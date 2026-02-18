@@ -1,77 +1,77 @@
-// app/lib/shopifyQueries.server.ts
 import db from "../db.server";
+import type { ShopSettingsNormalized } from "./shopSettings.server";
 
-type AdminClient = {
-  graphql: (query: string, args?: { variables?: Record<string, any> }) => Promise<Response>;
-};
+export type AdminGraphql = (query: string, args?: { variables?: Record<string, any> }) => Promise<Response>;
 
 const CUSTOMER_TAGS_QUERY = `#graphql
   query CustomerTags($id: ID!) {
-    customer(id: $id) {
-      id
-      tags
-    }
+    customer(id: $id) { id tags }
   }
 `;
 
 const COLLECTION_BY_HANDLE_QUERY = `#graphql
   query CollectionByHandle($handle: String!) {
-    collectionByHandle(handle: $handle) {
-      id
-      handle
-      title
-    }
+    collectionByHandle(handle: $handle) { id handle title }
   }
 `;
 
-export async function fetchCustomerTags(admin: AdminClient, customerGid: string): Promise<string[]> {
-  const res = await admin.graphql(CUSTOMER_TAGS_QUERY, { variables: { id: customerGid } });
-  const json = (await res.json()) as any;
-  const tags = json?.data?.customer?.tags;
+function toCustomerGid(customerIdOrGid: string): string {
+  const s = String(customerIdOrGid || "").trim();
+  if (!s) return "";
+  if (s.startsWith("gid://")) return s;
+  if (/^\d+$/.test(s)) return `gid://shopify/Customer/${s}`;
+  const m = s.match(/Customer\/(\d+)/i);
+  if (m) return `gid://shopify/Customer/${m[1]}`;
+  return s;
+}
+
+async function graphqlJson(res: Response): Promise<any> {
+  const text = await res.text().catch(() => "");
+  let json: any = null;
+  try { json = JSON.parse(text); } catch { json = null; }
+
+  if (!res.ok) throw new Error(`Shopify GraphQL failed: ${res.status} ${res.statusText} ${text}`);
+  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  return json?.data ?? null;
+}
+
+export async function fetchCustomerTags(adminGraphql: AdminGraphql, customerIdOrGid: string): Promise<string[]> {
+  const gid = toCustomerGid(customerIdOrGid);
+  if (!gid) return [];
+  const data = await graphqlJson(await adminGraphql(CUSTOMER_TAGS_QUERY, { variables: { id: gid } }));
+  const tags = data?.customer?.tags;
   return Array.isArray(tags) ? tags.map((t: any) => String(t)) : [];
 }
 
 export async function fetchCollectionGidByHandle(
-  admin: AdminClient,
+  adminGraphql: AdminGraphql,
   handle: string,
 ): Promise<{ id: string; title: string } | null> {
-  const res = await admin.graphql(COLLECTION_BY_HANDLE_QUERY, { variables: { handle } });
-  const json = (await res.json()) as any;
-  const col = json?.data?.collectionByHandle;
+  const h = String(handle || "").trim();
+  if (!h) return null;
+
+  const data = await graphqlJson(await adminGraphql(COLLECTION_BY_HANDLE_QUERY, { variables: { handle: h } }));
+  const col = data?.collectionByHandle;
   if (!col?.id) return null;
   return { id: String(col.id), title: String(col.title ?? "") };
 }
 
-/**
- * Resolve + cache the eligible collection GID in ShopSettings.
- * This is required to ensure redemption discounts only apply to eligible merchandise.
- */
-export async function resolveEligibleCollectionGid(args: {
-  admin: AdminClient;
-  shop: string;
-  handle: string;
-}): Promise<string> {
-  const handle = args.handle.trim();
+export async function resolveEligibleCollectionGid(
+  adminGraphql: AdminGraphql,
+  shop: string,
+  settings: Pick<ShopSettingsNormalized, "eligibleCollectionHandle" | "eligibleCollectionGid">,
+): Promise<string> {
+  const handle = String(settings.eligibleCollectionHandle || "").trim();
   if (!handle) throw new Error("Eligible collection handle is empty.");
 
-  const row = await db.shopSettings.findUnique({ where: { shop: args.shop } }).catch(() => null);
-  if (
-    row?.eligibleCollectionGid &&
-    row?.eligibleCollectionHandle?.trim().toLowerCase() === handle.toLowerCase()
-  ) {
-    return row.eligibleCollectionGid;
-  }
+  if (settings.eligibleCollectionGid) return settings.eligibleCollectionGid;
 
-  const found = await fetchCollectionGidByHandle(args.admin, handle);
-  if (!found) {
-    throw new Error(
-      `Eligible collection not found for handle "${handle}". Create the collection or update Settings.`,
-    );
-  }
+  const found = await fetchCollectionGidByHandle(adminGraphql, handle);
+  if (!found) throw new Error(`Eligible collection not found for handle "${handle}".`);
 
   await db.shopSettings.upsert({
-    where: { shop: args.shop },
-    create: { shop: args.shop, eligibleCollectionHandle: handle, eligibleCollectionGid: found.id } as any,
+    where: { shop },
+    create: { shop, eligibleCollectionHandle: handle, eligibleCollectionGid: found.id } as any,
     update: { eligibleCollectionHandle: handle, eligibleCollectionGid: found.id } as any,
   });
 

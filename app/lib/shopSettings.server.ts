@@ -2,54 +2,75 @@ import db from "../db.server";
 
 export type ShopSettingsNormalized = {
   shop: string;
-  earnRate: number; // points per $ (default 1)
-  redemptionMinOrder: number; // dollars (default 100)
-  eligibleCollections: string[];
-  excludedProductIds: string[];
-  redemptionSteps: number[]; // e.g. [500, 1000]
-  redemptionValueMap: Record<string, number>; // points -> dollars
+  earnRate: number;
+  redemptionMinOrder: number;
+  pointsExpireInactivityDays: number;
+  redemptionExpiryHours: number;
+
+  eligibleCollectionHandle: string;
+  eligibleCollectionGid: string | null;
+
+  excludedCustomerTags: string[];
+  includeProductTags: string[];
+  excludeProductTags: string[];
+
+  redemptionSteps: number[];
+  redemptionValueMap: Record<string, number>;
 };
 
-function safeParseJsonArray(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map(String);
+const DEFAULT_STEPS = [500, 1000];
+const DEFAULT_VALUE_MAP: Record<string, number> = { "500": 10, "1000": 25 };
+
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((x) => String(x)).filter(Boolean);
   if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return [];
     try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed.map(String);
+      return toStringArray(JSON.parse(s));
     } catch {
-      // ignore
+      return s
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
     }
   }
   return [];
 }
 
-function safeParseValueMap(value: unknown): Record<string, number> {
+function toNumberArray(value: unknown, fallback: number[]): number[] {
+  const raw = toStringArray(value);
+  const nums = raw
+    .map((x) => Number(x))
+    .filter((n) => Number.isFinite(n) && Number.isInteger(n) && n > 0);
+  return nums.length ? nums : fallback;
+}
+
+function toValueMap(value: unknown, fallback: Record<string, number>): Record<string, number> {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const out: Record<string, number> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       const n = typeof v === "number" ? v : Number(v);
       if (Number.isFinite(n)) out[String(k)] = n;
     }
-    return out;
+    return Object.keys(out).length ? out : fallback;
   }
   if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return fallback;
     try {
-      return safeParseValueMap(JSON.parse(value));
+      return toValueMap(JSON.parse(s), fallback);
     } catch {
-      // ignore
+      return fallback;
     }
   }
-  return {};
+  return fallback;
 }
 
 export function normalizeShopSettings(row: any, shop: string): ShopSettingsNormalized {
-  const redemptionSteps = Array.isArray(row?.redemptionSteps)
-    ? row.redemptionSteps.map(Number).filter(Number.isFinite)
-    : [500, 1000];
+  const redemptionSteps = toNumberArray(row?.redemptionSteps, DEFAULT_STEPS);
+  const redemptionValueMap = toValueMap(row?.redemptionValueMap, { ...DEFAULT_VALUE_MAP });
 
-  const redemptionValueMap = safeParseValueMap(row?.redemptionValueMap);
-
-  // Ensure a value exists for each step; default $10 per 500 points.
   for (const step of redemptionSteps) {
     const key = String(step);
     if (redemptionValueMap[key] == null) {
@@ -60,9 +81,27 @@ export function normalizeShopSettings(row: any, shop: string): ShopSettingsNorma
   return {
     shop,
     earnRate: Number.isFinite(row?.earnRate) ? Number(row.earnRate) : 1,
-    redemptionMinOrder: Number.isFinite(row?.redemptionMinOrder) ? Number(row.redemptionMinOrder) : 100,
-    eligibleCollections: safeParseJsonArray(row?.eligibleCollections),
-    excludedProductIds: safeParseJsonArray(row?.excludedProductIds),
+    redemptionMinOrder: Number.isFinite(row?.redemptionMinOrder) ? Number(row.redemptionMinOrder) : 0,
+    pointsExpireInactivityDays: Number.isFinite(row?.pointsExpireInactivityDays)
+      ? Number(row.pointsExpireInactivityDays)
+      : 365,
+    redemptionExpiryHours: Number.isFinite(row?.redemptionExpiryHours)
+      ? Number(row.redemptionExpiryHours)
+      : 72,
+
+    eligibleCollectionHandle:
+      typeof row?.eligibleCollectionHandle === "string" && row.eligibleCollectionHandle.trim()
+        ? row.eligibleCollectionHandle.trim()
+        : "lcr_loyalty_eligible",
+    eligibleCollectionGid:
+      typeof row?.eligibleCollectionGid === "string" && row.eligibleCollectionGid.trim()
+        ? row.eligibleCollectionGid.trim()
+        : null,
+
+    excludedCustomerTags: toStringArray(row?.excludedCustomerTags),
+    includeProductTags: toStringArray(row?.includeProductTags),
+    excludeProductTags: toStringArray(row?.excludeProductTags),
+
     redemptionSteps,
     redemptionValueMap,
   };
@@ -73,7 +112,6 @@ export async function getShopSettings(shop: string): Promise<ShopSettingsNormali
   return normalizeShopSettings(row, shop);
 }
 
-/** Create row if missing (useful when downstream assumes settings exist). */
 export async function getOrCreateShopSettings(shop: string): Promise<ShopSettingsNormalized> {
   const row =
     (await db.shopSettings.findUnique({ where: { shop } })) ??
@@ -85,8 +123,13 @@ export async function upsertShopSettings(shop: string, input: Partial<ShopSettin
   const data: any = {
     earnRate: input.earnRate,
     redemptionMinOrder: input.redemptionMinOrder,
-    eligibleCollections: input.eligibleCollections,
-    excludedProductIds: input.excludedProductIds,
+    pointsExpireInactivityDays: input.pointsExpireInactivityDays,
+    redemptionExpiryHours: input.redemptionExpiryHours,
+    eligibleCollectionHandle: input.eligibleCollectionHandle,
+    eligibleCollectionGid: input.eligibleCollectionGid,
+    excludedCustomerTags: input.excludedCustomerTags,
+    includeProductTags: input.includeProductTags,
+    excludeProductTags: input.excludeProductTags,
     redemptionSteps: input.redemptionSteps,
     redemptionValueMap: input.redemptionValueMap,
   };

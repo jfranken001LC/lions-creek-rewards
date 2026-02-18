@@ -1,4 +1,6 @@
 import type { Route } from "./+types/root";
+import { isRouteErrorResponse, useRouteError } from "react-router";
+
 import {
   Links,
   Meta,
@@ -35,21 +37,33 @@ export default function App() {
   return <Outlet />;
 }
 
-export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
-  return (
-    <html lang="en">
-      <head>
-        <title>Oops!</title>
-        <Meta />
-        <Links />
-      </head>
-      <body>
+
+export function ErrorBoundary() {
+  const error = useRouteError();
+
+  if (isRouteErrorResponse(error)) {
+    return (
+      <Page>
         <h1>App Error</h1>
-        <pre style={{ whiteSpace: "pre-wrap" }}>
-          {error?.message ?? String(error)}
-        </pre>
-        <Scripts />
-      </body>
-    </html>
+        <p>
+          {error.status} {error.statusText}
+        </p>
+        {"data" in error && error.data ? (
+          <pre style={{ whiteSpace: "pre-wrap" }}>
+            {typeof error.data === "string" ? error.data : JSON.stringify(error.data, null, 2)}
+          </pre>
+        ) : null}
+      </Page>
+    );
+  }
+
+  const message = error instanceof Error ? error.message : JSON.stringify(error, null, 2);
+
+  return (
+    <Page>
+      <h1>App Error</h1>
+      <pre style={{ whiteSpace: "pre-wrap" }}>{message}</pre>
+    </Page>
   );
 }
+

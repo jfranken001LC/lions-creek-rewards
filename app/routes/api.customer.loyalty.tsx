@@ -1,7 +1,8 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import { applyCustomerAccountCors, preflightCustomerAccountCors } from "../lib/customerAccountCors.server";
-import { getCustomerLoyaltyPayload, normalizeCustomerId, shopFromDest } from "../lib/loyalty.server";
+import { getCustomerLoyaltyPayload, normalizeCustomerId } from "../lib/loyalty.server";
+import { shopFromDest } from "../lib/proxy.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const { sessionToken } = await authenticate.public.customerAccount(request);
@@ -14,7 +15,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     return applyCustomerAccountCors(request, res);
   }
 
-  const payload = await getCustomerLoyaltyPayload({ shop, customerId });
+  const payload = await getCustomerLoyaltyPayload(shop, customerId);
   const res = Response.json({ ok: true, ...payload });
   return applyCustomerAccountCors(request, res);
 }

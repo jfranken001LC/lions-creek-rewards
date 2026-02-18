@@ -1,13 +1,18 @@
-import type { ActionFunctionArgs } from "react-router";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { authenticate } from "../shopify.server";
 import { applyCustomerAccountCors, preflightCustomerAccountCors } from "../lib/customerAccountCors.server";
 import { issueRedemptionCode } from "../lib/redemption.server";
-import { getShopSettings } from "../lib/shopSettings.server";
-import { normalizeCustomerId, shopFromDest, validateRedeemPoints } from "../lib/loyalty.server";
+import { normalizeCustomerId } from "../lib/loyalty.server";
+import { shopFromDest } from "../lib/proxy.server";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  if (request.method === "OPTIONS") return preflightCustomerAccountCors(request);
+  const res = new Response("Method Not Allowed", { status: 405 });
+  return applyCustomerAccountCors(request, res);
+}
 
 export async function action({ request }: ActionFunctionArgs) {
   if (request.method === "OPTIONS") return preflightCustomerAccountCors(request);
-  if (request.method !== "POST") return applyCustomerAccountCors(request, new Response("Method Not Allowed", { status: 405 }));
 
   try {
     const { sessionToken } = await authenticate.public.customerAccount(request);
@@ -21,36 +26,20 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     const body = (await request.json().catch(() => null)) as any;
-    const requestedPoints = body?.points;
-    const idempotencyKey = (body?.idempotencyKey ?? "").toString();
-
-    const settings = await getShopSettings(shop);
-    const validate = validateRedeemPoints(requestedPoints, settings.redemptionSteps);
-    if (!validate.ok) {
-      const res = Response.json({ ok: false, error: validate.code }, { status: 400 });
-      return applyCustomerAccountCors(request, res);
-    }
+    const requestedPoints = Number(body?.points);
+    const idempotencyKey = body?.idempotencyKey ? String(body.idempotencyKey) : undefined;
 
     const issued = await issueRedemptionCode({
       shop,
       customerId,
-      points: validate.points,
+      pointsRequested: requestedPoints,
       idempotencyKey,
     });
 
-    const res = Response.json({
-      ok: true,
-      code: issued.code,
-      expiry: issued.expiresAt,
-      pointsDebited: issued.pointsDebited,
-      // extras are safe to ignore:
-      valueDollars: issued.valueDollars,
-      redemptionId: issued.id,
-    });
-
+    const res = Response.json(issued, { status: issued.ok ? 200 : 400 });
     return applyCustomerAccountCors(request, res);
-  } catch (err: any) {
-    const res = Response.json({ ok: false, error: err?.message ?? "Unknown error" }, { status: 500 });
+  } catch (e: any) {
+    const res = Response.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
     return applyCustomerAccountCors(request, res);
   }
 }
