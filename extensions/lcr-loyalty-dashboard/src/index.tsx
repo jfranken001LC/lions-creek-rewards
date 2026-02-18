@@ -1,194 +1,175 @@
-import {
-  render,
-  BlockStack,
-  InlineStack,
-  Text,
-  Button,
-  Banner,
-  Divider,
-  Spinner,
-} from "@shopify/ui-extensions/customer-account";
-import { useApi, useEffect, useMemo, useState } from "@shopify/ui-extensions/preact";
+// extensions/lcr-loyalty-dashboard/src/index.tsx
+// Customer Account UI Extension entrypoint.
+// Shopify expects a DEFAULT export for the module referenced in shopify.extension.toml.
 
-type LoyaltyBalances = {
-  balance: number;
-  lifetimeEarned: number;
-  lifetimeRedeemed: number;
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
+import { useEffect, useMemo, useState } from "preact/hooks";
+
+// Shopify provides a global `shopify` object in Customer Account UI Extensions.
+declare const shopify: any;
+
+type LoyaltyPayload = {
+  customerId?: string;
+  shop?: string;
+  pointsBalance?: number;
+  tier?: string | null;
 };
 
-type LoyaltySettings = {
-  redemptionSteps: number[];
-  dollarPerPoint: number;
-  expireAfterDays: number;
-};
-
-type LedgerRow = {
-  id: string;
-  delta: number;
-  type: string;
-  description: string | null;
-  createdAt: string;
-};
-
-type ActiveRedemption = {
-  code: string;
-  pointsDebited: number;
-  valueDollars: number;
-  expiresAt: string;
-};
-
-type LoyaltyResponse = {
+type RedeemResponse = {
   ok: boolean;
-  balances: LoyaltyBalances;
-  settings: LoyaltySettings;
-  activeRedemption: ActiveRedemption | null;
-  recentLedger: LedgerRow[];
+  message?: string;
 };
 
-render("customer-account.page.render", () => <App />);
+const PROD_API_ORIGIN = "https://loyalty.basketbooster.ca";
 
-function App() {
-  const api = useApi();
+// In dev, the extension bundle is typically served from your tunnel origin.
+// In prod, it's typically served from a Shopify CDN origin.
+// Use the bundle origin for dev; fall back to PROD_API_ORIGIN for Shopify CDN origins.
+function resolveApiOrigin(): string {
+  try {
+    const scriptUrl = shopify?.extension?.scriptUrl;
+    if (!scriptUrl) return PROD_API_ORIGIN;
 
-  const baseUrl = useMemo(() => api.extension.origin, [api.extension.origin]);
+    const origin = new URL(scriptUrl).origin.toLowerCase();
+    const isShopifyCdn =
+      origin.includes("cdn.shopify.com") ||
+      origin.includes("shopifycdn.com") ||
+      origin.includes("extensions.shopifycdn.com");
 
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [data, setData] = useState<LoyaltyResponse | null>(null);
-  const [redeemBusy, setRedeemBusy] = useState<number | null>(null);
-  const [redeemMsg, setRedeemMsg] = useState<string | null>(null);
-
-  async function authedFetch(path: string, init?: RequestInit) {
-    const token = await api.sessionToken.get();
-    return fetch(`${baseUrl}${path}`, {
-      ...init,
-      headers: {
-        ...(init?.headers ?? {}),
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-    });
+    return isShopifyCdn ? PROD_API_ORIGIN : new URL(scriptUrl).origin;
+  } catch {
+    return PROD_API_ORIGIN;
   }
+}
 
-  async function load() {
-    setLoading(true);
-    setErr(null);
-    setRedeemMsg(null);
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const resp = await fetch(url, init);
+  const text = await resp.text();
 
+  if (!resp.ok) {
     try {
-      const res = await authedFetch("/api/customer/loyalty", { method: "GET" });
-      const json = (await res.json()) as LoyaltyResponse;
-
-      if (!res.ok || !json?.ok) {
-        throw new Error((json as any)?.error ?? `HTTP ${res.status}`);
-      }
-
-      setData(json);
-    } catch (e: any) {
-      setErr(e?.message ?? "Failed to load loyalty data");
-    } finally {
-      setLoading(false);
+      const j = JSON.parse(text);
+      throw new Error(j?.error || j?.message || `${resp.status} ${resp.statusText}`);
+    } catch {
+      throw new Error(text || `${resp.status} ${resp.statusText}`);
     }
   }
 
-  async function redeem(points: number) {
-    setRedeemBusy(points);
-    setRedeemMsg(null);
-    setErr(null);
+  return text ? (JSON.parse(text) as T) : ({} as T);
+}
 
+export default async function extensionEntry() {
+  // Customer Account UI extensions expect a default export that renders the UI.
+  render(<Extension />, document.body);
+}
+
+function Extension() {
+  const apiOrigin = useMemo(() => resolveApiOrigin(), []);
+  const [loading, setLoading] = useState(true);
+  const [busyRedeem, setBusyRedeem] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [data, setData] = useState<LoyaltyPayload | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        setLoading(true);
+        setError(null);
+
+        const token = await shopify.sessionToken.get();
+        const payload = await fetchJson<LoyaltyPayload>(`${apiOrigin}/api/customer/loyalty`, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+          },
+        });
+
+        if (!cancelled) setData(payload);
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apiOrigin]);
+
+  async function redeem100() {
     try {
-      const res = await authedFetch("/api/customer/redeem", {
+      setBusyRedeem(true);
+      setError(null);
+      setToast(null);
+
+      const token = await shopify.sessionToken.get();
+      const resp = await fetchJson<RedeemResponse>(`${apiOrigin}/api/customer/redeem`, {
         method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
         body: JSON.stringify({
-          points,
-          idempotencyKey: `${points}-${Date.now()}`,
+          pointsToRedeem: 100,
+          rewardCodeType: "fixed_amount",
+          rewardValue: 10,
+          currency: "CAD",
         }),
       });
 
-      const json = await res.json().catch(() => ({} as any));
-      if (!res.ok || json?.ok !== true) throw new Error(json?.error ?? `HTTP ${res.status}`);
-
-      setRedeemMsg(`Discount code: ${json.code} (expires ${new Date(json.expiry).toLocaleString()})`);
-      await load();
+      setToast(resp.message || (resp.ok ? "Redeemed successfully." : "Redeem failed."));
     } catch (e: any) {
-      setErr(e?.message ?? "Redeem failed");
+      setError(e?.message || String(e));
     } finally {
-      setRedeemBusy(null);
+      setBusyRedeem(false);
     }
   }
 
-  useEffect(() => {
-    load();
-  }, []);
-
-  if (loading) {
-    return (
-      <BlockStack spacing="tight">
-        <InlineStack spacing="tight" blockAlignment="center">
-          <Spinner />
-          <Text>Loading loyalty…</Text>
-        </InlineStack>
-      </BlockStack>
-    );
-  }
-
-  if (err) {
-    return (
-      <BlockStack spacing="loose">
-        <Banner status="critical" title="Couldn’t load loyalty">
-          <Text>{err}</Text>
-        </Banner>
-        <Button onPress={load}>Try again</Button>
-      </BlockStack>
-    );
-  }
-
-  if (!data) return <Text>No data</Text>;
-
-  const points = data.balances?.balance ?? 0;
-  const steps = (data.settings?.redemptionSteps ?? []).slice().sort((a, b) => a - b);
-  const hasActive = Boolean(data.activeRedemption?.code);
+  const points = data?.pointsBalance ?? 0;
 
   return (
-    <BlockStack spacing="loose">
-      <Text size="large" emphasis="bold">Lions Creek Rewards</Text>
+    <s-block-stack spacing="loose">
+      <s-heading level="2">Lions Creek Rewards</s-heading>
 
-      <Text><Text emphasis="bold">{points}</Text> points available</Text>
-      <Text>Lifetime earned: {data.balances.lifetimeEarned} • Lifetime redeemed: {data.balances.lifetimeRedeemed}</Text>
-
-      <Divider />
-
-      {hasActive ? (
-        <Banner status="warning" title="Active discount code already exists">
-          <Text>Code: <Text emphasis="bold">{data.activeRedemption!.code}</Text></Text>
-          <Text>Expires: {new Date(data.activeRedemption!.expiresAt).toLocaleString()}</Text>
-        </Banner>
+      {loading ? (
+        <s-text>Loading your rewards…</s-text>
+      ) : error ? (
+        <s-banner status="critical">
+          <s-text>{error}</s-text>
+        </s-banner>
       ) : (
-        <BlockStack spacing="tight">
-          <Text emphasis="bold">Redeem points</Text>
-          <Text>
-            ~$ {data.settings.dollarPerPoint.toFixed(2)} per point • codes expire after {data.settings.expireAfterDays} days
-          </Text>
+        <>
+          <s-text>
+            Points balance: <s-text emphasis="strong">{points}</s-text>
+          </s-text>
 
-          <InlineStack spacing="tight">
-            {steps.map((s) => (
-              <Button
-                key={s}
-                disabled={redeemBusy !== null || points < s}
-                onPress={() => redeem(s)}
-              >
-                Redeem {s} pts
-              </Button>
-            ))}
-          </InlineStack>
+          <s-inline-stack spacing="tight" blockAlignment="center">
+            <s-button onPress={redeem100} disabled={busyRedeem || points < 100}>
+              Redeem 100 points
+            </s-button>
+            {busyRedeem ? <s-text appearance="subdued">Processing…</s-text> : null}
+          </s-inline-stack>
 
-          {redeemMsg ? (
-            <Banner status="success" title="Code created">
-              <Text>{redeemMsg}</Text>
-            </Banner>
+          {toast ? (
+            <s-banner status="success">
+              <s-text>{toast}</s-text>
+            </s-banner>
           ) : null}
-        </BlockStack>
+
+          <s-divider />
+
+          <s-text appearance="subdued">
+            Secured using a Shopify session token.
+          </s-text>
+        </>
       )}
-    </BlockStack>
+    </s-block-stack>
   );
 }
