@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@shopify/ui-extensions": "2026.1.1",
-    "@shopify/ui-extensions/preact": "2026.1.1",
     "preact": "^10.25.0",
     "@preact/signals": "^1.3.2"
   }
