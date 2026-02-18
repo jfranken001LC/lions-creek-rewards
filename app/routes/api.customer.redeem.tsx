@@ -1,82 +1,112 @@
+// app/routes/api.customer.redeem.tsx
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { getCustomerAccountCorsHeaders } from "../lib/customerAccountCors.server";
-import { CustomerSessionError, requireCustomerSession } from "../lib/customerSession.server";
-import { unauthenticated } from "../lib/shopify.server";
+import { shopify } from "../shopify.server";
+import { getShopSettings } from "../lib/shopSettings.server";
 import { issueRedemptionCode } from "../lib/redemption.server";
-import { computeCustomerLoyalty } from "../lib/loyalty.server";
-
-function jsonResponse(payload: unknown, init?: ResponseInit) {
-  const headers = new Headers(init?.headers);
-  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json; charset=utf-8");
-  if (!headers.has("Cache-Control")) headers.set("Cache-Control", "no-store");
-  return new Response(JSON.stringify(payload), { ...init, headers });
-}
-
-function preflight() {
-  return new Response(null, { status: 204, headers: getCustomerAccountCorsHeaders() });
-}
+import { normalizeCustomerId, shopFromDest, validateRedeemPoints } from "../lib/loyalty.server";
+import db from "../db.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  if (request.method === "OPTIONS") return preflight();
-  return jsonResponse({ ok: false, error: "Method not allowed" }, { status: 405, headers: getCustomerAccountCorsHeaders() });
+  const { cors } = await shopify.authenticate.public.customerAccount(request, {
+    corsHeaders: ["Authorization", "Content-Type"],
+  });
+
+  // Preflight support (Shopify will OPTIONS before POST)
+  if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+
+  // If someone GETs it, keep it tidy.
+  return cors(
+    Response.json(
+      { ok: false, error: "method_not_allowed" },
+      { status: 405, headers: { "Cache-Control": "no-store" } },
+    ),
+  );
 }
 
 export async function action({ request }: ActionFunctionArgs) {
-  if (request.method === "OPTIONS") return preflight();
+  const { sessionToken, cors } = await shopify.authenticate.public.customerAccount(request, {
+    corsHeaders: ["Authorization", "Content-Type"],
+  });
+
+  if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
   if (request.method !== "POST") {
-    return jsonResponse({ ok: false, error: "Method not allowed" }, { status: 405, headers: getCustomerAccountCorsHeaders() });
-  }
-
-  const cors = getCustomerAccountCorsHeaders();
-
-  try {
-    const { shop, customerId } = await requireCustomerSession(request);
-
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ ok: false, error: "Invalid JSON body" }, { status: 400, headers: cors });
-    }
-
-    const points = Number(body?.points);
-    if (!Number.isFinite(points) || !Number.isInteger(points) || points <= 0) {
-      return jsonResponse({ ok: false, error: "points must be a positive integer" }, { status: 400, headers: cors });
-    }
-
-    const idemKey = request.headers.get("Idempotency-Key") || request.headers.get("X-Idempotency-Key") || undefined;
-
-    const { admin } = await unauthenticated.admin(shop);
-
-    const redemption = await issueRedemptionCode({
-      shop,
-      admin,
-      customerId,
-      pointsRequested: points,
-      idemKey,
-    });
-
-    const loyalty = await computeCustomerLoyalty({ shop, customerId });
-
-    return jsonResponse(
-      {
-        ok: true,
-        redemption: {
-          code: redemption.code,
-          points: redemption.points,
-          value: redemption.valueDollars,
-          expiresAt: redemption.expiresAt,
-          discountNodeId: redemption.discountNodeId,
-        },
-        loyalty,
-        ...loyalty,
-      },
-      { status: 200, headers: cors },
+    return cors(
+      Response.json(
+        { ok: false, error: "method_not_allowed" },
+        { status: 405, headers: { "Cache-Control": "no-store" } },
+      ),
     );
-  } catch (err: any) {
-    if (err instanceof CustomerSessionError) {
-      return jsonResponse({ ok: false, error: err.message, code: err.code }, { status: err.status, headers: cors });
-    }
-    return jsonResponse({ ok: false, error: err?.message ?? "Unable to redeem" }, { status: 400, headers: cors });
   }
+
+  const shop = shopFromDest((sessionToken as any).dest);
+  const customerId = normalizeCustomerId((sessionToken as any).sub);
+
+  if (!shop) {
+    return cors(
+      Response.json({ ok: false, error: "invalid_shop" }, { status: 400, headers: { "Cache-Control": "no-store" } }),
+    );
+  }
+  if (!customerId) {
+    return cors(
+      Response.json(
+        { ok: false, error: "customer_not_logged_in" },
+        { status: 401, headers: { "Cache-Control": "no-store" } },
+      ),
+    );
+  }
+
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return cors(
+      Response.json({ ok: false, error: "invalid_json" }, { status: 400, headers: { "Cache-Control": "no-store" } }),
+    );
+  }
+
+  const settings = await getShopSettings(shop);
+  const valid = validateRedeemPoints(body?.points, settings.redemptionSteps);
+  if (!valid.ok) {
+    return cors(
+      Response.json({ ok: false, error: valid.error }, { status: 400, headers: { "Cache-Control": "no-store" } }),
+    );
+  }
+
+  // Ensure we have a balance row and enough points
+  const balance = await db.customerPointsBalance.upsert({
+    where: { shop_customerId: { shop, customerId } },
+    create: { shop, customerId, balance: 0, lifetimeEarned: 0, lifetimeRedeemed: 0, lastActivityAt: new Date() },
+    update: {},
+  });
+
+  if (balance.balance < valid.points) {
+    return cors(
+      Response.json(
+        { ok: false, error: "insufficient_points", have: balance.balance, need: valid.points },
+        { status: 409, headers: { "Cache-Control": "no-store" } },
+      ),
+    );
+  }
+
+  // Create an Admin client using stored offline session access token
+  const { admin } = await shopify.unauthenticated.admin(shop);
+
+  const issued = await issueRedemptionCode({
+    admin,
+    shop,
+    customerId,
+    pointsRequested: valid.points,
+    eligibleCollectionGid: settings.eligibleCollectionGid,
+    eligibleCollectionHandle: settings.eligibleCollectionHandle,
+    includeProductTags: settings.includeProductTags,
+    excludeProductTags: settings.excludeProductTags,
+    excludedCustomerTags: settings.excludedCustomerTags,
+    minOrderSubtotalCents: settings.redemptionMinOrderCents,
+    redemptionExpiryHours: settings.redemptionExpiryHours,
+    redemptionValueMap: settings.redemptionValueMap,
+  });
+
+  return cors(
+    Response.json({ ok: true, redemption: issued }, { headers: { "Cache-Control": "no-store" } }),
+  );
 }

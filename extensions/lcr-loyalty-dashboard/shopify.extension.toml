@@ -1,15 +1,24 @@
 api_version = "2026-01"
 
 [[extensions]]
-name = "Lions Creek Rewards Dashboard"
+name = "LCR Loyalty Dashboard"
 handle = "lcr-loyalty-dashboard"
 type = "ui_extension"
-uid = "d8c5a2b1-73fd-4f71-ae21-6c5c8d6b8c4e1f2a3b4c"
-description = "Customer Account full-page loyalty dashboard for Lions Creek Rewards."
+# NOTE: uid is required by current Shopify extension config format.
+# If Shopify CLI has already generated a uid for you, keep that value.
+uid = "9c7c7a2f-2f18-4a1a-9b36-7a0a3f8d5b9f"
 
 [[extensions.targeting]]
-target = "customer-account.page.render"
+target = "customer-account.profile.block.render"
 module = "./src/index.tsx"
 
-[extensions.capabilities]
-network_access = true
+[[extensions.targeting]]
+target = "customer-account.order-status.block.render"
+module = "./src/index.tsx"
+
+[extensions.settings]
+  [[extensions.settings.fields]]
+  key = "title"
+  type = "single_line_text_field"
+  name = "Title"
+  description = "Optional header shown above points balance"
