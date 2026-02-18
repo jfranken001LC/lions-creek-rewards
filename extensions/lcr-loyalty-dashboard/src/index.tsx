@@ -1,10 +1,4 @@
-import {
-  extension,
-  Banner,
-  BlockStack,
-  Button,
-  TextBlock,
-} from "@shopify/ui-extensions/customer-account";
+import { render, BlockStack, Text, Banner, Button } from "@shopify/ui-extensions/preact";
 
 /**
  * Customer Accounts UI Extension
@@ -12,23 +6,23 @@ import {
  *
  * IMPORTANT:
  * - Shopify's extension bundler expects a **default export**.
- * - You should NOT call `shopify.extend(...)` yourself here.
  */
-export default extension("customer-account.page.render", (root) => {
-  const content = root.createComponent(BlockStack, { spacing: "loose" }, [
-    root.createComponent(TextBlock, undefined, "Lions Creek Rewards"),
-    root.createComponent(
-      Banner,
-      { title: "Coming soon" },
-      "Your points balance and redemption options will appear here once enabled.",
-    ),
-    root.createComponent(
-      TextBlock,
-      undefined,
-      "If you’re seeing this page, the extension is installed and rendering correctly.",
-    ),
-    root.createComponent(Button, { kind: "secondary" }, "Refresh"),
-  ]);
+export default render("customer-account.page.render", () => {
+  return (
+    <BlockStack spacing="loose">
+      <Text size="large">Lions Creek Rewards</Text>
 
-  root.appendChild(content);
+      <Banner title="Coming soon">
+        Your points balance and redemption options will appear here once enabled.
+      </Banner>
+
+      <Text>
+        If you’re seeing this page, the extension is installed and rendering correctly.
+      </Text>
+
+      <Button kind="secondary" onPress={() => {}}>
+        Refresh
+      </Button>
+    </BlockStack>
+  );
 });
