@@ -45,6 +45,16 @@ export async function assertJobAuth(request: Request, jobName: string) {
   if (!res.ok) throw new Response(res.error, { status: res.status });
 }
 
+/**
+ * Back-compat helper for routes that were written to expect a non-throwing
+ * auth check with a fixed function name.
+ *
+ * Prefer `assertJobAuth()` in new code.
+ */
+export async function jobAuthFromRequest(request: Request): Promise<JobAuthResult> {
+  return isAuthorizedJobRequest(request, "jobs");
+}
+
 export function isJobTokenValid(presented: string) {
   const configured = (process.env.JOB_TOKEN ?? "").trim();
   if (!configured) return process.env.NODE_ENV !== "production";

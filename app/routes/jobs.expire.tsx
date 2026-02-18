@@ -1,68 +1,113 @@
 import type { ActionFunctionArgs } from "react-router";
 import db from "../db.server";
-import { jobAuthFromRequest } from "../lib/jobAuth.server";
+import { assertJobAuth } from "../lib/jobAuth.server";
 import { acquireJobLock, releaseJobLock } from "../lib/jobLock.server";
+import { PointsLedgerType, RedemptionStatus } from "@prisma/client";
 
-const INACTIVITY_EXPIRE_DAYS = 365;
-
+/**
+ * POST /jobs/expire
+ *
+ * 1) Expire unused/expired redemptions.
+ * 2) Restore points for those expired redemptions.
+ *
+ * Protected by JOB_TOKEN.
+ */
 export async function action({ request }: ActionFunctionArgs) {
-  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", {
+      status: 405,
+      headers: { Allow: "POST" },
+    });
+  }
 
-  const auth = jobAuthFromRequest(request);
-  if (!auth.ok) return new Response(auth.error, { status: 401 });
+  await assertJobAuth(request, "jobs.expire");
 
-  const lock = await acquireJobLock("jobs.expire");
-  if (!lock.ok) return new Response(lock.error, { status: 423 });
+  const lock = await acquireJobLock("jobs.expire", 2 * 60 * 1000);
+  if (!lock.acquired) {
+    return Response.json(
+      { ok: false, error: lock.error },
+      { status: 423 },
+    );
+  }
+
+  const now = new Date();
 
   try {
-    const now = new Date();
-
-    const expiredRedemptions = await db.redemption.updateMany({
-      where: { status: "ACTIVE", expiresAt: { lte: now } },
-      data: { status: "EXPIRED" },
-    });
-
-    const cutoff = new Date(now.getTime() - INACTIVITY_EXPIRE_DAYS * 24 * 60 * 60 * 1000);
-    const staleBalances = await db.customerPointsBalance.findMany({
+    // Find expirable redemptions first so we can restore points accurately.
+    const expirable = await db.redemption.findMany({
       where: {
-        expiredAt: null,
-        balance: { gt: 0 },
-        lastActivityAt: { lt: cutoff },
+        expiresAt: { lt: now },
+        status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
       },
-      select: { shop: true, customerId: true, balance: true },
-      take: 500,
+      select: {
+        id: true,
+        shop: true,
+        customerId: true,
+        points: true,
+        code: true,
+        expiresAt: true,
+        status: true,
+      },
     });
 
-    let expiredPointsCount = 0;
+    let expiredCount = 0;
+    let pointsRestored = 0;
 
-    for (const b of staleBalances) {
-      await db.$transaction([
-        db.pointsLedger.create({
-          data: {
-            shop: b.shop,
-            customerId: b.customerId,
-            delta: -b.balance,
-            type: "EXPIRE",
-            source: "SYSTEM",
-            sourceId: `INACTIVITY_${INACTIVITY_EXPIRE_DAYS}D`,
-            description: `Expired ${b.balance} points after ${INACTIVITY_EXPIRE_DAYS} days of inactivity.`,
+    // Use a transaction to keep balance + ledger + redemption status consistent.
+    await db.$transaction(async (tx) => {
+      for (const r of expirable) {
+        // Guard against double-processing if another worker already updated it.
+        const updated = await tx.redemption.updateMany({
+          where: {
+            id: r.id,
+            status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
           },
-        }),
-        db.customerPointsBalance.update({
-          where: { shop_customerId: { shop: b.shop, customerId: b.customerId } },
-          data: { balance: 0, expiredAt: now },
-        }),
-      ]);
+          data: { status: RedemptionStatus.EXPIRED },
+        });
 
-      expiredPointsCount += 1;
-    }
+        if (updated.count !== 1) continue;
+
+        expiredCount += 1;
+        pointsRestored += r.points;
+
+        // Ensure a balance row exists.
+        await tx.customerPointsBalance.upsert({
+          where: {
+            shop_customerId: { shop: r.shop, customerId: r.customerId },
+          },
+          create: {
+            shop: r.shop,
+            customerId: r.customerId,
+            balance: r.points,
+            lifetimeEarned: 0,
+            lifetimeRedeemed: 0,
+            lastActivityAt: now,
+          },
+          update: {
+            balance: { increment: r.points },
+            lastActivityAt: now,
+          },
+        });
+
+        await tx.pointsLedger.create({
+          data: {
+            shop: r.shop,
+            customerId: r.customerId,
+            type: PointsLedgerType.EXPIRE,
+            delta: r.points,
+            notes: `Expiry restore for redemption ${r.id} (code ${r.code})`,
+          },
+        });
+      }
+    });
 
     return Response.json({
       ok: true,
-      expiredRedemptions: expiredRedemptions.count,
-      expiredPointBalances: expiredPointsCount,
+      now: now.toISOString(),
+      expiredRedemptions: expiredCount,
+      pointsRestored,
     });
   } finally {
-    await releaseJobLock("jobs.expire");
+    await releaseJobLock("jobs.expire", lock.lockId);
   }
 }
