@@ -1,40 +1,78 @@
-import { render } from "@shopify/ui-extensions/customer-account";
-import { useApi, useSubscription } from "@shopify/ui-extensions-preact/customer-account";
+/** @jsxImportSource preact */
+// extensions/lcr-loyalty-dashboard/src/index.tsx
+
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
 import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
 
-render("customer-account.page.render", () => <App />);
+declare const shopify: any;
+
+type LoyaltyPayload = {
+  customerId: string;
+  balances: {
+    balance: number;
+    lifetimeEarned: number;
+    lifetimeRedeemed: number;
+    lastActivityAt: string | null;
+    expiredAt: string | null;
+  };
+  settings: {
+    pointsPerDollar: number;
+    redemptionSteps: number[];
+    redemptionValueMap: Record<string, number>;
+    redemptionMinOrderCents: number;
+    eligibleCollectionHandle: string;
+    pointsExpireInactivityDays: number;
+    redemptionExpiryHours: number;
+  };
+  activeRedemption: null | {
+    id: string;
+    code: string;
+    valueDollars: number;
+    points: number;
+    expiresAt: string;
+    status: string;
+  };
+  ledger: Array<{
+    id: string;
+    createdAt: string;
+    type: string;
+    delta: number;
+    description: string | null;
+  }>;
+};
+
+type LoyaltyResponse = {
+  ok: boolean;
+  payload?: LoyaltyPayload;
+  error?: string;
+};
+
+type RedeemResponse =
+  | { ok: true; redemption: { code: string; valueDollars: number; points: number; expiresAt: string } }
+  | { ok: false; error: string };
+
+export default async function extension() {
+  render(<App />, document.body);
+}
 
 function App() {
-  const api = useApi();
-  const customer = useSubscription(api.customer.current);
-  const customerId = customer?.id;
+  // IMPORTANT: In production, Shopify hosts extension assets on Shopify’s CDN.
+  // Do NOT rely on import.meta.url for your app origin.
+  // Keep this aligned with SHOPIFY_APP_URL (your app’s public URL).
+  const baseUrl = useMemo(() => "https://loyalty.basketbooster.ca", []);
 
-  const [state, setState] = useState<{
-    loading: boolean;
-    error?: string;
-    points: number;
-    lifetimePoints: number;
-    tier?: string;
-    wallet: Array<{ id: string; title: string; code: string; amountCents: number; status: string; expiresAt?: string }>;
-  }>({
-    loading: true,
-    points: 0,
-    lifetimePoints: 0,
-    wallet: [],
-  });
-
-  const baseUrl = useMemo(() => {
-    // Keep this aligned with your prod hostname.
-    return "https://loyalty.basketbooster.ca";
-  }, []);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [payload, setPayload] = useState<LoyaltyPayload | null>(null);
+  const [redeemingPoints, setRedeemingPoints] = useState<number | null>(null);
 
   const fetchLoyalty = useCallback(async () => {
-    if (!customerId) return;
-
-    setState((s) => ({ ...s, loading: true, error: undefined }));
+    setLoading(true);
+    setError(null);
 
     try {
-      const token = await api.sessionToken.get();
+      const token = await shopify.sessionToken.get();
 
       const res = await fetch(`${baseUrl}/api/customer/loyalty`, {
         method: "GET",
@@ -44,33 +82,30 @@ function App() {
         },
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`HTTP ${res.status}: ${text}`);
+      const json = (await res.json()) as LoyaltyResponse;
+
+      if (!res.ok || !json.ok || !json.payload) {
+        throw new Error(json.error || `HTTP ${res.status}`);
       }
 
-      const json = await res.json();
-
-      setState({
-        loading: false,
-        points: json.points ?? 0,
-        lifetimePoints: json.lifetimePoints ?? 0,
-        tier: json.tier ?? undefined,
-        wallet: Array.isArray(json.wallet) ? json.wallet : [],
-      });
+      setPayload(json.payload);
     } catch (e: any) {
-      setState((s) => ({
-        ...s,
-        loading: false,
-        error: e?.message ?? "Failed to load rewards.",
-      }));
+      setError(e?.message ?? "Failed to load rewards.");
+      setPayload(null);
+    } finally {
+      setLoading(false);
     }
-  }, [api.sessionToken, baseUrl, customerId]);
+  }, [baseUrl]);
 
   const redeem = useCallback(
-    async (rewardId: string) => {
+    async (points: number) => {
+      setRedeemingPoints(points);
+      setError(null);
+
       try {
-        const token = await api.sessionToken.get();
+        const token = await shopify.sessionToken.get();
+        const idemKey =
+          typeof crypto !== "undefined" && "randomUUID" in crypto ? (crypto as any).randomUUID() : String(Date.now());
 
         const res = await fetch(`${baseUrl}/api/customer/redeem`, {
           method: "POST",
@@ -79,99 +114,166 @@ function App() {
             "Content-Type": "application/json",
             Accept: "application/json",
           },
-          body: JSON.stringify({ rewardId }),
+          body: JSON.stringify({ points, idemKey }),
         });
 
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(`HTTP ${res.status}: ${text}`);
+        const json = (await res.json()) as RedeemResponse;
+
+        if (!res.ok || !json.ok) {
+          throw new Error((json as any).error || `HTTP ${res.status}`);
         }
 
+        // Refresh view (shows active redemption + updated balance)
         await fetchLoyalty();
       } catch (e: any) {
-        setState((s) => ({ ...s, error: e?.message ?? "Redeem failed." }));
+        setError(e?.message ?? "Redeem failed.");
+      } finally {
+        setRedeemingPoints(null);
       }
     },
-    [api.sessionToken, baseUrl, fetchLoyalty],
+    [baseUrl, fetchLoyalty]
   );
 
   useEffect(() => {
     fetchLoyalty();
   }, [fetchLoyalty]);
 
-  return (
-    <s-page title="Lions Creek Rewards">
-      <s-section>
-        {state.loading ? (
+  if (loading) {
+    return (
+      <s-page title="Lions Creek Rewards">
+        <s-section>
           <s-banner tone="info">
             <s-text>Loading your rewards…</s-text>
           </s-banner>
-        ) : state.error ? (
+        </s-section>
+      </s-page>
+    );
+  }
+
+  if (error) {
+    return (
+      <s-page title="Lions Creek Rewards">
+        <s-section>
           <s-banner tone="critical">
-            <s-text>{state.error}</s-text>
+            <s-text>{error}</s-text>
           </s-banner>
-        ) : (
-          <s-stack gap="large">
+          <s-spacer size="base" />
+          <s-button onPress={fetchLoyalty}>Try again</s-button>
+        </s-section>
+      </s-page>
+    );
+  }
+
+  if (!payload) {
+    return (
+      <s-page title="Lions Creek Rewards">
+        <s-section>
+          <s-banner tone="critical">
+            <s-text>Unable to load your rewards right now.</s-text>
+          </s-banner>
+        </s-section>
+      </s-page>
+    );
+  }
+
+  const { balances, settings, activeRedemption, ledger } = payload;
+  const minOrder = settings.redemptionMinOrderCents > 0 ? `$${(settings.redemptionMinOrderCents / 100).toFixed(2)}` : null;
+
+  return (
+    <s-page title="Lions Creek Rewards">
+      <s-section>
+        <s-stack gap="large">
+          <s-card>
+            <s-stack gap="small">
+              <s-text emphasis="bold">Points balance</s-text>
+              <s-text size="large">{balances.balance}</s-text>
+              <s-text tone="subdued">
+                Lifetime earned: {balances.lifetimeEarned} • Lifetime redeemed: {balances.lifetimeRedeemed}
+              </s-text>
+            </s-stack>
+          </s-card>
+
+          {activeRedemption ? (
             <s-card>
               <s-stack gap="small">
-                <s-text emphasis="bold">Points balance</s-text>
-                <s-text size="large">{state.points}</s-text>
-                <s-text tone="subdued">Lifetime: {state.lifetimePoints}</s-text>
-                {state.tier ? <s-text tone="subdued">Tier: {state.tier}</s-text> : null}
-              </s-stack>
-            </s-card>
-
-            <s-card>
-              <s-stack gap="small">
-                <s-text emphasis="bold">Wallet</s-text>
-
-                {state.wallet.length === 0 ? (
-                  <s-text tone="subdued">No active rewards yet.</s-text>
-                ) : (
-                  <s-stack gap="small">
-                    {state.wallet.map((w) => (
-                      <s-card key={w.id}>
-                        <s-stack gap="small">
-                          <s-text emphasis="bold">{w.title}</s-text>
-                          <s-text>Code: {w.code}</s-text>
-                          <s-text tone="subdued">
-                            Value: ${(w.amountCents / 100).toFixed(2)} • Status: {w.status}
-                            {w.expiresAt ? ` • Expires: ${new Date(w.expiresAt).toLocaleDateString()}` : ""}
-                          </s-text>
-                        </s-stack>
-                      </s-card>
-                    ))}
-                  </s-stack>
-                )}
-              </s-stack>
-            </s-card>
-
-            <s-card>
-              <s-stack gap="small">
-                <s-text emphasis="bold">Redeem</s-text>
+                <s-text emphasis="bold">Active reward</s-text>
+                <s-text size="large">Code: {activeRedemption.code}</s-text>
                 <s-text tone="subdued">
-                  Choose a reward in the store experience and it will appear here. (If you want this page to also *list*
-                  redeemable rewards, we’ll wire it to your rewards catalog endpoint.)
+                  Value: ${activeRedemption.valueDollars.toFixed(2)} • Cost: {activeRedemption.points} points
+                </s-text>
+                <s-text tone="subdued">
+                  Expires: {new Date(activeRedemption.expiresAt).toLocaleString()}
+                </s-text>
+              </s-stack>
+            </s-card>
+          ) : (
+            <s-card>
+              <s-stack gap="small">
+                <s-text emphasis="bold">Redeem points</s-text>
+                <s-text tone="subdued">
+                  Choose a redemption amount. Your reward code will expire after {settings.redemptionExpiryHours} hours.
+                  {minOrder ? ` Minimum order: ${minOrder}.` : ""}
                 </s-text>
 
-                <s-button
-                  onPress={() => redeem("sample_reward")}
-                  accessibilityLabel="Redeem sample reward"
-                >
-                  Redeem sample reward
-                </s-button>
+                <s-stack gap="small">
+                  {settings.redemptionSteps.map((p) => {
+                    const dollars = settings.redemptionValueMap[String(p)];
+                    const disabled = redeemingPoints !== null || balances.balance < p;
+                    return (
+                      <s-button
+                        key={p}
+                        disabled={disabled}
+                        onPress={() => redeem(p)}
+                        accessibilityLabel={`Redeem ${p} points`}
+                      >
+                        {redeemingPoints === p ? "Redeeming…" : `Redeem ${p} points → $${(dollars ?? 0).toFixed(2)}`}
+                      </s-button>
+                    );
+                  })}
+                </s-stack>
+
+                {balances.balance < Math.min(...settings.redemptionSteps) ? (
+                  <s-banner tone="warning">
+                    <s-text>
+                      You need at least {Math.min(...settings.redemptionSteps)} points to redeem.
+                    </s-text>
+                  </s-banner>
+                ) : null}
               </s-stack>
             </s-card>
+          )}
 
-            <s-divider />
+          <s-card>
+            <s-stack gap="small">
+              <s-text emphasis="bold">Recent activity</s-text>
+              {ledger.length === 0 ? (
+                <s-text tone="subdued">No activity yet.</s-text>
+              ) : (
+                <s-stack gap="small">
+                  {ledger.slice(0, 10).map((e) => (
+                    <s-card key={e.id}>
+                      <s-stack gap="extraTight">
+                        <s-text emphasis="bold">
+                          {e.type} {e.delta > 0 ? `+${e.delta}` : e.delta}
+                        </s-text>
+                        <s-text tone="subdued">{new Date(e.createdAt).toLocaleString()}</s-text>
+                        {e.description ? <s-text tone="subdued">{e.description}</s-text> : null}
+                      </s-stack>
+                    </s-card>
+                  ))}
+                </s-stack>
+              )}
+            </s-stack>
+          </s-card>
 
-            <s-text tone="subdued">
-              By using Lions Creek Rewards you agree to our{" "}
-              <s-link to={`${baseUrl}/terms`}>Terms</s-link> and{" "}
-              <s-link to={`${baseUrl}/privacy`}>Privacy Policy</s-link>.
-            </s-text>
-          </s-stack>
-        )}
+          <s-divider />
+
+          <s-text tone="subdued">
+            By using Lions Creek Rewards you agree to our{" "}
+            <s-link to={`${baseUrl}/terms`}>Terms</s-link> and{" "}
+            <s-link to={`${baseUrl}/privacy`}>Privacy Policy</s-link>.
+          </s-text>
+        </s-stack>
       </s-section>
     </s-page>
   );

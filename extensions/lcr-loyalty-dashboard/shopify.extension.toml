@@ -1,9 +1,8 @@
 api_version = "2026-01"
 
 [[extensions]]
-name = "Lions Creek Rewards Dashboard"
-handle = "rewards"
-uid = "lcr_loyalty_dashboard"
+name = "lcr-loyalty-dashboard"
+handle = "lcr-loyalty-dashboard"
 type = "ui_extension"
 
 [[extensions.targeting]]
@@ -11,5 +10,5 @@ target = "customer-account.page.render"
 module = "./src/index.tsx"
 
 [extensions.capabilities]
-api_access = true
+# Required to call your app backend from the customer account sandbox.
 network_access = true

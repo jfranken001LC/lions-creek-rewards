@@ -1,23 +1,23 @@
 // app/lib/shopSettings.server.ts
 import db from "../db.server";
 
-/**
- * Lions Creek Rewards — Shop Settings (server-only)
- *
- * - Single source of truth for defaults + normalization.
- * - v1.1 redemption catalog is hard-locked to avoid drift.
- */
-
-export const V1_REDEMPTION_STEPS = [500, 1000] as const;
-export const V1_REDEMPTION_VALUE_MAP: Record<string, number> = {
-  "500": 10,
-  "1000": 20,
-};
-
 export type ShopSettingsNormalized = {
   shop: string;
+
+  // canonical internal name
   earnRate: number;
+
+  // API payload alias
+  pointsPerDollar: number;
+
+  // used by /jobs/expire and customer payload
+  pointsExpireInactivityDays: number;
+
+  // redemption settings
   redemptionMinOrder: number; // integer dollars
+  redemptionMinOrderCents: number; // computed convenience
+  redemptionExpiryHours: number;
+
   eligibleCollectionHandle: string;
   eligibleCollectionGid: string | null;
 
@@ -26,138 +26,144 @@ export type ShopSettingsNormalized = {
   excludeProductTags: string[];
 
   redemptionSteps: number[];
-  redemptionValueMap: Record<string, number>;
-  updatedAt?: Date;
+  redemptionValueMap: Record<string, number>; // points string -> dollars number
 };
-
-function uniqTrim(list: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of list) {
-    const v = String(raw ?? "").trim();
-    if (!v) continue;
-    const key = v.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(v);
-  }
-  return out;
-}
-
-function parseStringList(value: any): string[] {
-  if (!value) return [];
-  if (Array.isArray(value)) return uniqTrim(value.map((v) => String(v)));
-  if (typeof value === "string") {
-    const s = value.trim();
-    if (!s) return [];
-    try {
-      const parsed = JSON.parse(s);
-      if (Array.isArray(parsed)) return uniqTrim(parsed.map((v) => String(v)));
-    } catch {
-      // ignore
-    }
-    return uniqTrim(
-      s
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean),
-    );
-  }
-  return [];
-}
-
-function clampInt(n: any, min: number, max: number): number {
-  const x = Math.floor(Number(n));
-  if (!Number.isFinite(x)) return min;
-  return Math.max(min, Math.min(max, x));
-}
-
-export function normalizeShopSettings(shop: string, row: any | null): ShopSettingsNormalized {
-  const defaults: ShopSettingsNormalized = {
-    shop,
-    earnRate: 1,
-    redemptionMinOrder: 0,
-    eligibleCollectionHandle: "loyalty-eligible",
-    eligibleCollectionGid: null,
-
-    excludedCustomerTags: ["Wholesale"],
-    includeProductTags: [],
-    excludeProductTags: [],
-
-    redemptionSteps: [...V1_REDEMPTION_STEPS],
-    redemptionValueMap: { ...V1_REDEMPTION_VALUE_MAP },
-    updatedAt: row?.updatedAt ? new Date(row.updatedAt) : undefined,
-  };
-
-  if (!row) return defaults;
-
-  return {
-    ...defaults,
-    earnRate: clampInt(row.earnRate ?? defaults.earnRate, 1, 100),
-    redemptionMinOrder: clampInt(row.redemptionMinOrder ?? defaults.redemptionMinOrder, 0, 100000),
-
-    eligibleCollectionHandle: String(row.eligibleCollectionHandle ?? defaults.eligibleCollectionHandle),
-    eligibleCollectionGid: row.eligibleCollectionGid ? String(row.eligibleCollectionGid) : null,
-
-    excludedCustomerTags: parseStringList(row.excludedCustomerTags) || defaults.excludedCustomerTags,
-    includeProductTags: parseStringList(row.includeProductTags) || defaults.includeProductTags,
-    excludeProductTags: parseStringList(row.excludeProductTags) || defaults.excludeProductTags,
-
-    redemptionSteps: [...V1_REDEMPTION_STEPS],
-    redemptionValueMap: { ...V1_REDEMPTION_VALUE_MAP },
-
-    updatedAt: row?.updatedAt ? new Date(row.updatedAt) : defaults.updatedAt,
-  };
-}
-
-export async function getShopSettings(shop: string): Promise<ShopSettingsNormalized> {
-  const row = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
-  return normalizeShopSettings(shop, row);
-}
 
 export type ShopSettingsUpdateInput = {
   earnRate?: number;
+  pointsExpireInactivityDays?: number;
+  redemptionExpiryHours?: number;
+
   redemptionMinOrder?: number;
   eligibleCollectionHandle?: string;
 
   excludedCustomerTags?: string[];
   includeProductTags?: string[];
   excludeProductTags?: string[];
+
+  redemptionSteps?: number[];
+  redemptionValueMap?: Record<string, number>;
 };
 
-export async function upsertShopSettings(shop: string, input: ShopSettingsUpdateInput): Promise<ShopSettingsNormalized> {
-  const handle = String(input.eligibleCollectionHandle ?? "loyalty-eligible").trim();
+function clampInt(v: unknown, min: number, max: number): number {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
 
-  const normalized = {
-    earnRate: clampInt(input.earnRate ?? 1, 1, 100),
-    redemptionMinOrder: clampInt(input.redemptionMinOrder ?? 0, 0, 100000),
+function parseStringList(value: unknown): string[] {
+  if (value == null) return [];
+  if (Array.isArray(value)) return value.map(String).map((s) => s.trim()).filter(Boolean);
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
 
-    eligibleCollectionHandle: handle || "loyalty-eligible",
-    // Clear cached GID if handle changed; it'll be re-resolved on first redemption.
+const V1_REDEMPTION_STEPS = [500, 1000];
+const V1_REDEMPTION_VALUE_MAP: Record<string, number> = {
+  "500": 10,
+  "1000": 25,
+};
+
+export function normalizeShopSettings(shop: string, row: any | null): ShopSettingsNormalized {
+  const defaults: ShopSettingsNormalized = {
+    shop,
+    earnRate: 1,
+    pointsPerDollar: 1,
+    pointsExpireInactivityDays: 365,
+
+    redemptionMinOrder: 0,
+    redemptionMinOrderCents: 0,
+    redemptionExpiryHours: 72,
+
+    eligibleCollectionHandle: "lcr_loyalty_eligible",
     eligibleCollectionGid: null,
 
-    excludedCustomerTags: uniqTrim(input.excludedCustomerTags ?? ["Wholesale"]),
-    includeProductTags: uniqTrim(input.includeProductTags ?? []),
-    excludeProductTags: uniqTrim(input.excludeProductTags ?? []),
+    excludedCustomerTags: ["Wholesale"],
+    includeProductTags: [],
+    excludeProductTags: [],
 
-    redemptionSteps: [...V1_REDEMPTION_STEPS],
-    redemptionValueMap: { ...V1_REDEMPTION_VALUE_MAP },
-    updatedAt: new Date(),
+    redemptionSteps: V1_REDEMPTION_STEPS,
+    redemptionValueMap: V1_REDEMPTION_VALUE_MAP,
   };
 
-  const existing = await db.shopSettings.findUnique({ where: { shop } }).catch(() => null);
+  if (!row) return defaults;
 
-  const row = await db.shopSettings.upsert({
+  const earnRate = clampInt(row.earnRate ?? defaults.earnRate, 0, 10000);
+  const pointsExpireInactivityDays = clampInt(row.pointsExpireInactivityDays ?? defaults.pointsExpireInactivityDays, 0, 10000);
+  const redemptionMinOrder = clampInt(row.redemptionMinOrder ?? defaults.redemptionMinOrder, 0, 100000);
+  const redemptionExpiryHours = clampInt(row.redemptionExpiryHours ?? defaults.redemptionExpiryHours, 1, 24 * 365);
+
+  const eligibleCollectionHandle = String(row.eligibleCollectionHandle ?? defaults.eligibleCollectionHandle).trim() || defaults.eligibleCollectionHandle;
+
+  const excludedCustomerTagsParsed = parseStringList(row.excludedCustomerTags);
+  const includeProductTagsParsed = parseStringList(row.includeProductTags);
+  const excludeProductTagsParsed = parseStringList(row.excludeProductTags);
+
+  return {
+    ...defaults,
+    earnRate,
+    pointsPerDollar: earnRate,
+    pointsExpireInactivityDays,
+
+    redemptionMinOrder,
+    redemptionMinOrderCents: redemptionMinOrder * 100,
+    redemptionExpiryHours,
+
+    eligibleCollectionHandle,
+    eligibleCollectionGid: typeof row.eligibleCollectionGid === "string" ? row.eligibleCollectionGid : null,
+
+    excludedCustomerTags: excludedCustomerTagsParsed.length ? excludedCustomerTagsParsed : defaults.excludedCustomerTags,
+    includeProductTags: includeProductTagsParsed,
+    excludeProductTags: excludeProductTagsParsed,
+
+    // v1 hard-lock; allow override if present
+    redemptionSteps: Array.isArray(row.redemptionSteps) ? row.redemptionSteps.map((n: any) => clampInt(n, 1, 100000)) : defaults.redemptionSteps,
+    redemptionValueMap: (row.redemptionValueMap && typeof row.redemptionValueMap === "object") ? row.redemptionValueMap : defaults.redemptionValueMap,
+  };
+}
+
+export async function getShopSettings(shop: string): Promise<ShopSettingsNormalized> {
+  const row = await db.shopSettings.findUnique({ where: { shop } });
+  return normalizeShopSettings(shop, row);
+}
+
+export async function upsertShopSettings(shop: string, input: ShopSettingsUpdateInput): Promise<ShopSettingsNormalized> {
+  const handle = String(input.eligibleCollectionHandle ?? "lcr_loyalty_eligible").trim();
+
+  const normalized: any = {
+    earnRate: clampInt(input.earnRate ?? 1, 0, 10000),
+    pointsExpireInactivityDays: clampInt(input.pointsExpireInactivityDays ?? 365, 0, 10000),
+    redemptionExpiryHours: clampInt(input.redemptionExpiryHours ?? 72, 1, 24 * 365),
+
+    redemptionMinOrder: clampInt(input.redemptionMinOrder ?? 0, 0, 100000),
+    eligibleCollectionHandle: handle || "lcr_loyalty_eligible",
+
+    excludedCustomerTags: input.excludedCustomerTags ?? ["Wholesale"],
+    includeProductTags: input.includeProductTags ?? [],
+    excludeProductTags: input.excludeProductTags ?? [],
+
+    redemptionSteps: input.redemptionSteps ?? V1_REDEMPTION_STEPS,
+    redemptionValueMap: input.redemptionValueMap ?? V1_REDEMPTION_VALUE_MAP,
+
+    // keep unless handle changes
+    eligibleCollectionGid: null,
+  };
+
+  const existing = await db.shopSettings.findUnique({ where: { shop }, select: { eligibleCollectionGid: true, eligibleCollectionHandle: true } });
+  if (existing?.eligibleCollectionHandle === normalized.eligibleCollectionHandle) {
+    normalized.eligibleCollectionGid = existing.eligibleCollectionGid;
+  }
+
+  await db.shopSettings.upsert({
     where: { shop },
-    create: { shop, ...normalized } as any,
-    update: {
-      ...normalized,
-      eligibleCollectionGid:
-        existing?.eligibleCollectionHandle?.trim().toLowerCase() === normalized.eligibleCollectionHandle.toLowerCase()
-          ? existing?.eligibleCollectionGid ?? null
-          : null,
-    } as any,
+    create: { shop, ...normalized },
+    update: normalized,
   });
 
-  return normalizeShopSettings(shop, row);
+  return getShopSettings(shop);
 }
