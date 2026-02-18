@@ -3,6 +3,9 @@ api_version = "2026-01"
 [[extensions]]
 name = "lcr-loyalty-dashboard"
 handle = "lcr-loyalty-dashboard"
+
+uid = "a63729b7-9ab6-9ea6-a95f-8e942344efb1cf5ed67d"
+
 type = "ui_extension"
 
 [[extensions.targeting]]

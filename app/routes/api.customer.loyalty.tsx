@@ -1,45 +1,26 @@
-// app/routes/api.customer.loyalty.tsx
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { shopify } from "../shopify.server";
+import { authenticate } from "../shopify.server";
+import { applyCustomerAccountCors, preflightCustomerAccountCors } from "../lib/customerAccountCors.server";
 import { getCustomerLoyaltyPayload, normalizeCustomerId, shopFromDest } from "../lib/loyalty.server";
 
-async function handle(request: Request) {
-  // Official customer account session-token auth + CORS helper
-  const { sessionToken, cors } = await shopify.authenticate.public.customerAccount(request, {
-    corsHeaders: ["Authorization", "Content-Type"],
-  });
+export async function loader({ request }: LoaderFunctionArgs) {
+  const { sessionToken } = await authenticate.public.customerAccount(request);
 
-  // Preflight support
-  if (request.method === "OPTIONS") {
-    return cors(new Response(null, { status: 204 }));
-  }
+  const shop = shopFromDest(sessionToken.payload.dest);
+  const customerId = normalizeCustomerId(sessionToken.payload.sub);
 
-  const shop = shopFromDest((sessionToken as any).dest);
-  const customerId = normalizeCustomerId((sessionToken as any).sub);
-
-  if (!shop) {
-    const res = Response.json({ ok: false, error: "invalid_shop" }, { status: 400, headers: { "Cache-Control": "no-store" } });
-    return cors(res);
-  }
-
-  if (!customerId) {
-    const res = Response.json(
-      { ok: false, error: "customer_not_logged_in" },
-      { status: 401, headers: { "Cache-Control": "no-store" } },
-    );
-    return cors(res);
+  if (!shop || !customerId) {
+    const res = Response.json({ ok: false, error: "Missing shop/customer claims" }, { status: 401 });
+    return applyCustomerAccountCors(request, res);
   }
 
   const payload = await getCustomerLoyaltyPayload({ shop, customerId });
-  const res = Response.json({ ok: true, ...payload }, { headers: { "Cache-Control": "no-store" } });
-  return cors(res);
+  const res = Response.json({ ok: true, ...payload });
+  return applyCustomerAccountCors(request, res);
 }
 
-export async function loader({ request }: LoaderFunctionArgs) {
-  return handle(request);
-}
-
-// Some extension stacks POST the “loyalty refresh” call.
 export async function action({ request }: ActionFunctionArgs) {
-  return handle(request);
+  if (request.method === "OPTIONS") return preflightCustomerAccountCors(request);
+  const res = new Response("Method Not Allowed", { status: 405 });
+  return applyCustomerAccountCors(request, res);
 }

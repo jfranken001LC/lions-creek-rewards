@@ -1,45 +1,36 @@
-// app/lib/loyalty.server.ts
 import db from "../db.server";
-import { LedgerType, RedemptionStatus } from "@prisma/client";
-import { getShopSettings } from "./shopSettings.server";
+import { getOrCreateShopSettings } from "./shopSettings.server";
 
-export function normalizeCustomerId(rawSub: unknown): string | null {
-  if (!rawSub) return null;
-  const sub = String(rawSub);
-
-  // Accept numeric ids as-is
-  if (/^\d+$/.test(sub)) return sub;
-
-  // GID form: gid://shopify/Customer/123456789
+export function normalizeCustomerId(sub: string | undefined | null): string {
+  if (!sub) return "";
   const m = sub.match(/Customer\/(\d+)$/);
-  if (m?.[1]) return m[1];
-
-  // Fallback: last digits in string
-  const lastDigits = sub.match(/(\d+)\D*$/);
-  return lastDigits?.[1] ?? null;
+  return m?.[1] ?? sub;
 }
 
-export function shopFromDest(dest: unknown): string | null {
-  if (!dest) return null;
-  const d = String(dest);
+export function shopFromDest(dest: string | undefined | null): string {
+  if (!dest) return "";
   try {
-    // usually "https://shop.myshopify.com"
-    if (d.startsWith("http://") || d.startsWith("https://")) return new URL(d).hostname;
-    // sometimes already hostname
-    return d;
+    return new URL(dest).hostname;
   } catch {
-    return null;
+    return dest;
   }
 }
 
-export async function getOrCreateCustomerBalance(shop: string, customerId: string) {
-  const existing = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-  });
-  if (existing) return existing;
+// Keep in sync with redemption.server.ts (72h -> 3 days)
+const REDEMPTION_EXPIRE_AFTER_DAYS = 3;
 
-  return db.customerPointsBalance.create({
-    data: {
+function computeDollarPerPoint(settings: { redemptionSteps: number[]; redemptionValueMap: Record<string, number> }): number {
+  const steps = (settings.redemptionSteps ?? []).slice().sort((a, b) => a - b);
+  const step = steps[0] ?? 500;
+  const value = settings.redemptionValueMap?.[String(step)] ?? 10;
+  const dpp = value / step;
+  return Number.isFinite(dpp) ? Number(dpp.toFixed(4)) : 0.02;
+}
+
+async function getOrCreateBalance(shop: string, customerId: string) {
+  return db.customerPointsBalance.upsert({
+    where: { shop_customerId: { shop, customerId } },
+    create: {
       shop,
       customerId,
       balance: 0,
@@ -47,107 +38,96 @@ export async function getOrCreateCustomerBalance(shop: string, customerId: strin
       lifetimeRedeemed: 0,
       lastActivityAt: new Date(),
     },
+    update: {},
   });
 }
 
-export async function getActiveRedemption(shop: string, customerId: string) {
-  const now = new Date();
-  return db.redemption.findFirst({
-    where: {
-      shop,
-      customerId,
-      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      voidedAt: null,
-      consumedAt: null,
-      expiresAt: { gt: now },
-    },
+async function getActiveRedemption(shop: string, customerId: string) {
+  const row = await db.redemption.findFirst({
+    where: { shop, customerId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
     select: {
       id: true,
       code: true,
-      points: true,
-      valueCents: true,
-      status: true,
+      pointsDebited: true,
+      value: true,
       createdAt: true,
       expiresAt: true,
     },
   });
+
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    code: row.code,
+    pointsDebited: row.pointsDebited,
+    valueDollars: row.value,
+    createdAt: row.createdAt,
+    expiresAt: row.expiresAt,
+  };
 }
 
-export async function getRecentLedger(shop: string, customerId: string, take = 25) {
-  const rows = await db.pointsLedger.findMany({
+async function getRecentLedger(shop: string, customerId: string, take = 25) {
+  return db.pointsLedger.findMany({
     where: { shop, customerId },
     orderBy: { createdAt: "desc" },
     take,
     select: {
       id: true,
-      type: true,
       delta: true,
-      description: true,
-      createdAt: true,
+      type: true,
       source: true,
       sourceId: true,
+      description: true,
+      createdAt: true,
     },
   });
-
-  // Keep payload minimal + safe for customer surface
-  return rows.map((r) => ({
-    id: r.id,
-    type: r.type as LedgerType,
-    delta: r.delta,
-    description: r.description,
-    createdAt: r.createdAt.toISOString(),
-    source: r.source,
-    sourceId: r.sourceId,
-  }));
 }
 
+/** Canonical payload for Customer Account UI extension + App Proxy JSON. */
 export async function getCustomerLoyaltyPayload(args: { shop: string; customerId: string }) {
   const { shop, customerId } = args;
 
-  const [settings, balanceRow, activeRedemption, recentLedger] = await Promise.all([
-    getShopSettings(shop),
-    getOrCreateCustomerBalance(shop, customerId),
-    getActiveRedemption(shop, customerId),
-    getRecentLedger(shop, customerId, 25),
-  ]);
+  const settings = await getOrCreateShopSettings(shop);
+  const dollarPerPoint = computeDollarPerPoint(settings);
+
+  const balances = await getOrCreateBalance(shop, customerId);
+  const activeRedemption = await getActiveRedemption(shop, customerId);
+  const recentLedger = await getRecentLedger(shop, customerId, 25);
 
   return {
     shop,
     customerId,
-    balance: {
-      balance: balanceRow.balance,
-      lifetimeEarned: balanceRow.lifetimeEarned,
-      lifetimeRedeemed: balanceRow.lifetimeRedeemed,
-      lastActivityAt: balanceRow.lastActivityAt?.toISOString() ?? null,
-      expiredAt: balanceRow.expiredAt?.toISOString() ?? null,
-    },
+    balances,
+    // legacy alias
+    balance: balances,
     settings: {
-      pointsPerDollar: settings.pointsPerDollar,
       redemptionSteps: settings.redemptionSteps,
-      redemptionValueMap: settings.redemptionValueMap,
-      redemptionMinOrderCents: settings.redemptionMinOrderCents,
-      eligibleCollectionHandle: settings.eligibleCollectionHandle,
-      pointsExpireInactivityDays: settings.pointsExpireInactivityDays,
-      redemptionExpiryHours: settings.redemptionExpiryHours,
+      dollarPerPoint,
+      expireAfterDays: REDEMPTION_EXPIRE_AFTER_DAYS,
+      redemptionMinOrder: settings.redemptionMinOrder,
+      earnRate: settings.earnRate,
     },
-    activeRedemption: activeRedemption
-      ? {
-          ...activeRedemption,
-          createdAt: activeRedemption.createdAt.toISOString(),
-          expiresAt: activeRedemption.expiresAt.toISOString(),
-        }
-      : null,
+    activeRedemption,
     recentLedger,
   };
 }
 
+/** Backwards-compatible name used by /loyalty and /loyalty.json. */
+export async function computeCustomerLoyalty(args: { shop: string; customerId: string }) {
+  return getCustomerLoyaltyPayload(args);
+}
+
+/** Validate points against allowed step increments. */
 export function validateRedeemPoints(points: unknown, allowedSteps: number[]) {
-  if (typeof points !== "number" || !Number.isFinite(points)) {
-    return { ok: false as const, error: "invalid_points" };
-  }
-  const p = Math.trunc(points);
-  if (p <= 0) return { ok: false as const, error: "invalid_points" };
-  if (!allowedSteps.includes(p)) return { ok: false as const, error: "points_not_allowed_step" };
-  return { ok: true as const, points: p };
+  const n = typeof points === "number" ? points : Number(points);
+  if (!Number.isFinite(n) || n <= 0) return { ok: false as const, code: "INVALID_POINTS" as const };
+
+  const steps = (allowedSteps ?? []).map(Number).filter((x) => Number.isFinite(x) && x > 0);
+  if (steps.length === 0) return { ok: false as const, code: "NO_REDEMPTION_STEPS" as const };
+
+  if (!steps.includes(n)) return { ok: false as const, code: "STEP_NOT_ALLOWED" as const };
+
+  return { ok: true as const, points: n };
 }
