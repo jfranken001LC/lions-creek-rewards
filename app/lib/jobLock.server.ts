@@ -5,7 +5,14 @@ export type JobLockResult =
   | { acquired: true; lockedUntil: Date }
   | { acquired: false; lockedUntil: Date | null };
 
-export async function acquireJobLock(name: string, ttlMs: number): Promise<JobLockResult> {
+/**
+ * Simple DB-backed lock to ensure only one job runner executes a named job at a time.
+ * Uses the JobLock Prisma model.
+ */
+export async function acquireJobLock(
+  name: string,
+  ttlMs: number,
+): Promise<JobLockResult> {
   const now = new Date();
   const nextUntil = new Date(now.getTime() + ttlMs);
 
@@ -13,12 +20,17 @@ export async function acquireJobLock(name: string, ttlMs: number): Promise<JobLo
     const existing = await tx.jobLock.findUnique({ where: { name } });
 
     if (!existing) {
-      await tx.jobLock.create({ data: { name, lockedUntil: nextUntil } });
+      await tx.jobLock.create({
+        data: { name, lockedUntil: nextUntil },
+      });
       return { acquired: true as const, lockedUntil: nextUntil };
     }
 
     if (existing.lockedUntil <= now) {
-      await tx.jobLock.update({ where: { name }, data: { lockedUntil: nextUntil } });
+      await tx.jobLock.update({
+        where: { name },
+        data: { lockedUntil: nextUntil },
+      });
       return { acquired: true as const, lockedUntil: nextUntil };
     }
 
@@ -28,7 +40,9 @@ export async function acquireJobLock(name: string, ttlMs: number): Promise<JobLo
 
 export async function releaseJobLock(name: string) {
   const now = new Date();
-  await db.jobLock.update({ where: { name }, data: { lockedUntil: now } }).catch(() => {
-    // ignore if missing
-  });
+  await db.jobLock
+    .update({ where: { name }, data: { lockedUntil: now } })
+    .catch(() => {
+      // ignore if missing
+    });
 }
