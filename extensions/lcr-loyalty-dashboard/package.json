@@ -1,9 +1,7 @@
 {
-  "name": "lcr-loyalty-dashboard",
-  "version": "0.1.0",
-  "private": true,
   "dependencies": {
-    "@shopify/ui-extensions": "2025.7.3",
-    "preact": "^10.26.4"
+    "@shopify/ui-extensions": "2026.1.1",
+    "preact": "10.26.4",
+    "@preact/signals": "2.8.0"
   }
 }

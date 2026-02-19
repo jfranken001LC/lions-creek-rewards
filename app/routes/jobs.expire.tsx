@@ -1,171 +1,60 @@
-import type { ActionFunctionArgs } from "react-router";
+import type { LoaderFunctionArgs } from "react-router";
 import { data } from "react-router";
-import db from "../db.server";
-import { acquireJobLock } from "../lib/jobLock.server";
-import { assertJobAuth } from "../lib/jobAuth.server";
+import { json } from "@remix-run/node";
 
-const ymd = (d: Date) => d.toISOString().slice(0, 10);
+import { authenticate } from "../shopify.server";
+import { acquireJobLock, releaseJobLock } from "../lib/jobLock.server";
+import { assertJobSecretOrThrow } from "../lib/jobAuth.server";
+import { expireIssuedRedemptions, expireInactiveCustomers } from "../lib/loyaltyExpiry.server";
 
-export async function action({ request }: ActionFunctionArgs) {
-  // NOTE: keep the job name stable because it is part of the job token derivation.
-  assertJobAuth(request, "jobs.expire");
-
-  const release = await acquireJobLock("jobs.expire");
+export async function loader({ request }: LoaderFunctionArgs) {
   try {
-    const now = new Date();
+    // 1) Require the job secret (for Lightsail cron / manual admin curl).
+    assertJobSecretOrThrow(request);
 
-    // ---------------------------------------------------------------------------------------------
-    // 1) Expire ISSUED redemptions past `expiresAt` and restore points
-    // ---------------------------------------------------------------------------------------------
-    const toExpire = await db.redemption.findMany({
-      where: {
-        status: "ISSUED",
-        expiresAt: { lte: now },
-      },
-      select: {
-        id: true,
-        shop: true,
-        customerId: true,
-        code: true,
-        points: true,
-      },
-      take: 1000,
-    });
+    // 2) Resolve shop context (admin auth) so we can run cross-customer maintenance.
+    const { session } = await authenticate.admin(request);
+    const shop = session.shop;
 
-    let redemptionsExpired = 0;
+    // 3) Acquire a lock to avoid overlapping job runs (important if cron overlaps / manual triggers).
+    const lock = await acquireJobLock("jobs.expire");
 
-    for (const r of toExpire) {
-      await db.$transaction(async (tx) => {
-        // Mark as expired (guarded)
-        const updated = await tx.redemption.updateMany({
-          where: { id: r.id, status: "ISSUED" },
-          data: { status: "EXPIRED", expiredAt: now },
-        });
-
-        if (updated.count === 0) return;
-
-        // Idempotent ledger: if it already exists, DO NOT add balance again.
-        await tx.pointsLedger.upsert({
-          where: {
-            ledger_dedupe: {
-              shop: r.shop,
-              customerId: r.customerId,
-              type: "ADJUST",
-              source: "REDEMPTION_EXPIRE_RESTORE",
-              sourceId: r.id,
-            },
-          },
-          create: {
-            shop: r.shop,
-            customerId: r.customerId,
-            type: "ADJUST",
-            delta: r.points,
-            source: "REDEMPTION_EXPIRE_RESTORE",
-            sourceId: r.id,
-            description: `Restored points for expired redemption ${r.code}`,
-          },
-          update: {},
-        });
-
-        await tx.customerPointsBalance.upsert({
-          where: { shop_customerId: { shop: r.shop, customerId: r.customerId } },
-          create: {
-            shop: r.shop,
-            customerId: r.customerId,
-            balance: r.points,
-            lifetimeEarned: 0,
-            lifetimeRedeemed: 0,
-            lastActivityAt: now,
-            expiredAt: null,
-          },
-          update: {
-            balance: { increment: r.points },
-            expiredAt: null,
-          },
-        });
-      });
-
-      redemptionsExpired += 1;
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // 2) Expire points due to inactivity
-    // ---------------------------------------------------------------------------------------------
-    const shopsWithInactivityExpiry = await db.shopSettings.findMany({
-      where: { pointsExpireInactivityDays: { gt: 0 } },
-      select: { shop: true, pointsExpireInactivityDays: true },
-    });
-
-    let customersExpiredForInactivity = 0;
-
-    for (const s of shopsWithInactivityExpiry) {
-      const days = Number(s.pointsExpireInactivityDays ?? 0);
-      if (!Number.isFinite(days) || days <= 0) continue;
-
-      const cutoff = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
-
-      const staleBalances = await db.customerPointsBalance.findMany({
-        where: {
-          shop: s.shop,
-          balance: { gt: 0 },
-          expiredAt: null,
-          lastActivityAt: { lt: cutoff },
+    if (!lock.acquired) {
+      return data(
+        {
+          ok: false,
+          error: lock.error ?? "Job is already running.",
         },
-        select: { customerId: true, balance: true, lastActivityAt: true },
-        take: 5000,
-      });
-
-      for (const b of staleBalances) {
-        const sourceId = `${ymd(now)}:${b.customerId}`;
-        const delta = -Math.abs(b.balance);
-
-        await db.$transaction(async (tx) => {
-          await tx.pointsLedger.upsert({
-            where: {
-              ledger_dedupe: {
-                shop: s.shop,
-                customerId: b.customerId,
-                type: "EXPIRY",
-                source: "INACTIVITY",
-                sourceId,
-              },
-            },
-            create: {
-              shop: s.shop,
-              customerId: b.customerId,
-              type: "EXPIRY",
-              delta,
-              source: "INACTIVITY",
-              sourceId,
-              description: `Expired ${b.balance} points after ${days} days inactivity (last activity ${b.lastActivityAt.toISOString()})`,
-            },
-            update: {},
-          });
-
-          await tx.customerPointsBalance.updateMany({
-            where: {
-              shop: s.shop,
-              customerId: b.customerId,
-              balance: { gt: 0 },
-            },
-            data: {
-              balance: 0,
-              expiredAt: now,
-            },
-          });
-        });
-
-        customersExpiredForInactivity += 1;
-      }
+        { status: 409 },
+      );
     }
 
-    return data({
-      ok: true,
-      now: now.toISOString(),
-      redemptionsExpired,
-      customersExpiredForInactivity,
-    });
-  } finally {
-    await release();
+    try {
+      const now = new Date();
+
+      const redemptions = await expireIssuedRedemptions({ shop, now });
+      const inactive = await expireInactiveCustomers({ shop, now });
+
+      return json(
+        {
+          ok: true,
+          shop,
+          now: now.toISOString(),
+          expiredRedemptions: redemptions,
+          expiredInactiveCustomers: inactive,
+        },
+        { status: 200 },
+      );
+    } finally {
+      await releaseJobLock(lock);
+    }
+  } catch (err: any) {
+    return data(
+      {
+        ok: false,
+        error: err?.message ?? "Unhandled error",
+      },
+      { status: 500 },
+    );
   }
 }
