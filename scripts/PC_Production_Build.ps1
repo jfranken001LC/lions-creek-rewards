@@ -1,26 +1,24 @@
-# Lions Creek Rewards - Local Production Build (Windows / PowerShell)
-# Purpose: run the same production build as Lightsail (SSR + client) to catch SSR/export issues early.
-
-param(
+Param(
   [switch]$UseCI
 )
 
-function ExecOrThrow([string]$Cmd, [string[]]$Args) {
-  Write-Host ("`n> " + $Cmd + " " + ($Args -join " "))
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function ExecOrThrow([string]$Cmd, [string[]]$Args = @()) {
   & $Cmd @Args
   if ($LASTEXITCODE -ne 0) {
-    throw "Command failed with exit code $LASTEXITCODE: $Cmd $($Args -join ' ')"
+    $argText = if ($Args -and $Args.Count -gt 0) { $Args -join " " } else { "" }
+    throw ("Command failed with exit code {0}: {1} {2}" -f ${LASTEXITCODE}, $Cmd, $argText)
   }
 }
 
-$ErrorActionPreference = "Stop"
+Write-Host "==== PC Production Build ===="
+Write-Host "Repo: $PSScriptRoot\.."
 
-Write-Host "==== Preflight ===="
-Write-Host ("Repo: " + (Get-Location))
-ExecOrThrow "node" @("-v")
-ExecOrThrow "npm"  @("-v")
+Push-Location (Join-Path $PSScriptRoot "..")
 
-Write-Host "`n==== Install dependencies ===="
+Write-Host "`n==== Clean install deps ===="
 if ($UseCI) {
   ExecOrThrow "npm" @("ci")
 } else {
@@ -30,7 +28,8 @@ if ($UseCI) {
 Write-Host "`n==== Prisma generate ===="
 ExecOrThrow "npm" @("run", "generate")
 
-Write-Host "`n==== Production build (SSR + client) ===="
+Write-Host "`n==== Build ===="
 ExecOrThrow "npm" @("run", "build")
 
-Write-Host "`n✅ Production build succeeded."
+Write-Host "`n==== Done ===="
+Pop-Location

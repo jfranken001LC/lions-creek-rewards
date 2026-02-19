@@ -1,43 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------------------------------------------------------
-# Lions Creek Rewards - Server Deploy Script (Lightsail)
-# -------------------------------------------------------------------
-# - Hard resets repo to origin/main
-# - Cleans build artifacts
-# - Installs dependencies
-# - Prisma generate + migrate deploy (if migrations exist) else db push
-# - Builds Remix/React Router app
-# - Restarts systemd service
-# -------------------------------------------------------------------
-
-REPO_DIR="/var/www/lions-creek-rewards"
-SERVICE_NAME="lions-creek-rewards"
-ENV_FILE="/etc/lions-creek-rewards/lions-creek-rewards.env"
-BRANCH="main"
-
-STRICT_NPM_CI="${STRICT_NPM_CI:-0}"
-
-say() {
-  echo
-  echo "==== $* ===="
-}
-
-die() {
-  echo "ERROR: $*" >&2
-  exit 1
+run() {
+  echo "+ $*"
+  "$@"
 }
 
 run_prisma() {
-  npx prisma "$@"
+  run npx prisma "$@"
 }
 
-say "Preflight"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SERVICE_NAME="${SERVICE_NAME:-lions-creek-rewards}"
+BRANCH="${BRANCH:-main}"
+ENV_FILE="${ENV_FILE:-/etc/lions-creek-rewards/lions-creek-rewards.env}"
+STRICT_NPM_CI="${STRICT_NPM_CI:-1}"
+
+echo "==== Preflight ===="
 echo "Repo: $REPO_DIR"
 echo "User: $(whoami)"
-echo "Node: $(node -v || true)"
-echo "NPM:  $(npm -v || true)"
+echo "Node: $(node -v)"
+echo "NPM:  $(npm -v)"
 echo "Branch: $BRANCH"
 echo "Service: $SERVICE_NAME"
 echo "Env file: $ENV_FILE"
@@ -45,78 +28,85 @@ echo "STRICT_NPM_CI: $STRICT_NPM_CI"
 
 cd "$REPO_DIR"
 
-say "Stop service (if running)"
-sudo systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-
-say "Fetch + hard reset to origin/$BRANCH"
-git fetch origin
-git checkout "$BRANCH"
-git reset --hard "origin/$BRANCH"
-
-say "Clean ignored/untracked build artifacts (preserve env + sqlite DB)"
-# IMPORTANT: We keep prisma/prod.sqlite (prod DB) and env outside repo.
-git clean -xdf -e "prisma/prod.sqlite" -e ".env" -e ".env.*" || true
-
-say "Show current revision"
-git rev-parse HEAD
-git log -1 --oneline --decorate
-
-say "Load env (required for prisma/build)"
-if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-else
-  die "Env file not found: $ENV_FILE"
+echo
+echo "==== Stop service (if running) ===="
+if command -v systemctl >/dev/null 2>&1; then
+  sudo systemctl stop "$SERVICE_NAME" || true
 fi
 
-# Basic echo of a few known values (avoid secrets)
+echo
+echo "==== Fetch + hard reset to origin/$BRANCH ===="
+run git fetch origin "$BRANCH"
+run git reset --hard "origin/$BRANCH"
+
+echo
+echo "==== Clean ignored/untracked build artifacts (preserve env + sqlite DB) ===="
+# Keep prisma/*.sqlite (or similar) + env paths safe by not nuking prisma folder
+run git clean -xfd -e "prisma/*.sqlite" -e "prisma/*.db" -e ".env" -e ".env.*"
+
+echo
+echo "==== Show current revision ===="
+run git rev-parse HEAD
+run git --no-pager log -1 --oneline
+
+echo
+echo "==== Load env (required for prisma/build) ===="
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "FATAL: Env file not found: $ENV_FILE"
+  exit 1
+fi
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+# Show a few non-sensitive envs (avoid secrets)
 echo "HOST=${HOST:-}"
 echo "PORT=${PORT:-}"
 echo "SHOPIFY_APP_URL=${SHOPIFY_APP_URL:-}"
 
-say "Install dependencies (prefer npm ci; fallback to npm install if lock mismatch)"
-if [ "$STRICT_NPM_CI" = "1" ]; then
-  npm ci
+echo
+echo "==== Install dependencies ===="
+if [[ "$STRICT_NPM_CI" == "1" ]]; then
+  if [[ ! -f package-lock.json ]]; then
+    echo "FATAL: package-lock.json is missing. STRICT_NPM_CI=1 requires a committed lockfile."
+    echo "Fix on PC:"
+    echo "  1) rm -rf node_modules package-lock.json"
+    echo "  2) npm install"
+    echo "  3) git add package-lock.json && git commit -m \"Add lockfile\" && git push"
+    exit 1
+  fi
+  run npm ci
 else
-  if ! npm ci; then
-    echo "npm ci failed (lock out of sync). Falling back to npm install..."
-    npm install
+  if [[ -f package-lock.json ]]; then
+    if ! npm ci; then
+      echo "WARN: npm ci failed; falling back to npm install (STRICT_NPM_CI=0)."
+      run npm install
+    fi
+  else
+    echo "WARN: package-lock.json missing; using npm install (STRICT_NPM_CI=0)."
+    run npm install
   fi
 fi
 
-# -------- Prisma migrate + generate -------------------------------------------
-say "Prisma deploy"
-export PRISMA_HIDE_UPDATE_MESSAGE=1
+echo
+echo "==== Prisma generate + migrate deploy ===="
 run_prisma generate
-
-# Detect actual Prisma migrations by presence of migration.sql files (avoids false positives from .gitkeep).
-if find "$REPO_DIR/prisma/migrations" -maxdepth 2 -type f -name "migration.sql" 2>/dev/null | grep -q .; then
-  run_prisma migrate deploy
-else
-  echo "No Prisma migration.sql found -> using prisma db push (development-safe)"
-  run_prisma db push
-fi
-
-# -------- Build extensions (only if present) ----------------------------------
-say "Build extension(s) if configured"
-if npm run -s | grep -qE '^  build:function$'; then
-  npm run -s build:function
-else
-  echo "No build:function script found; skipping."
-fi
-
-# -------- Build app -----------------------------------------------------------
-say "Build app"
-npm run build
-
-# -------- Restart service -----------------------------------------------------
-say "Start service"
-sudo systemctl start "$SERVICE_NAME"
-
-say "Status"
-sudo systemctl --no-pager status "$SERVICE_NAME" || true
+run_prisma migrate deploy
 
 echo
-echo "✅ Deploy complete."
+echo "==== Build ===="
+run npm run build
+
+echo
+echo "==== Start service ===="
+if command -v systemctl >/dev/null 2>&1; then
+  run sudo systemctl restart "$SERVICE_NAME"
+  run sudo systemctl --no-pager status "$SERVICE_NAME" -l || true
+else
+  echo "WARN: systemctl not found; start the server manually:"
+  echo "  npm run start"
+fi
+
+echo
+echo "==== Done ===="
