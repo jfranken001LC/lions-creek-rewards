@@ -1,41 +1,36 @@
 # Lions Creek Rewards - Local Production Build (Windows / PowerShell)
-# Purpose: run the same "production build" that Lightsail runs, locally,
-# so SSR export mistakes (missing exports, server-only imports, etc.) are caught early.
-#
-# Usage (from repo root):
-#   powershell -ExecutionPolicy Bypass -File .\scripts\PC_Production_Build.ps1
-#   powershell -ExecutionPolicy Bypass -File .\scripts\PC_Production_Build.ps1 -UseCI
-#
-# Notes:
-# - This script does NOT start a tunnel or run "shopify app dev".
-# - It intentionally runs "react-router build" (SSR + client) to mimic Lightsail.
+# Purpose: run the same production build as Lightsail (SSR + client) to catch SSR/export issues early.
 
 param(
   [switch]$UseCI
 )
 
+function ExecOrThrow([string]$Cmd, [string[]]$Args) {
+  Write-Host ("`n> " + $Cmd + " " + ($Args -join " "))
+  & $Cmd @Args
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code $LASTEXITCODE: $Cmd $($Args -join ' ')"
+  }
+}
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "==== Preflight ===="
 Write-Host ("Repo: " + (Get-Location))
-Write-Host ("Node: " + (& node -v))
-Write-Host ("NPM:  " + (& npm -v))
+ExecOrThrow "node" @("-v")
+ExecOrThrow "npm"  @("-v")
 
-Write-Host ""
-Write-Host "==== Install dependencies ===="
+Write-Host "`n==== Install dependencies ===="
 if ($UseCI) {
-  & npm ci
+  ExecOrThrow "npm" @("ci")
 } else {
-  & npm install
+  ExecOrThrow "npm" @("install")
 }
 
-Write-Host ""
-Write-Host "==== Prisma generate ===="
-& npm run generate
+Write-Host "`n==== Prisma generate ===="
+ExecOrThrow "npm" @("run", "generate")
 
-Write-Host ""
-Write-Host "==== Production build (SSR + client) ===="
-& npm run build
+Write-Host "`n==== Production build (SSR + client) ===="
+ExecOrThrow "npm" @("run", "build")
 
-Write-Host ""
-Write-Host "✅ Production build succeeded."
+Write-Host "`n✅ Production build succeeded."
