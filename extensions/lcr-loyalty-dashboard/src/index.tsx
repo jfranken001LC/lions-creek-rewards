@@ -1,28 +1,19 @@
-import { render, BlockStack, Text, Banner, Button } from "@shopify/ui-extensions/preact";
+import "@shopify/ui-extensions/preact";
+import { render } from "preact";
 
-/**
- * Customer Accounts UI Extension
- * Target: customer-account.page.render
- *
- * IMPORTANT:
- * - Shopify's extension bundler expects a **default export**.
- */
-export default render("customer-account.page.render", () => {
+function LoyaltyDashboard() {
   return (
-    <BlockStack spacing="loose">
-      <Text size="large">Lions Creek Rewards</Text>
-
-      <Banner title="Coming soon">
-        Your points balance and redemption options will appear here once enabled.
-      </Banner>
-
-      <Text>
-        If you’re seeing this page, the extension is installed and rendering correctly.
-      </Text>
-
-      <Button kind="secondary" onPress={() => {}}>
-        Refresh
-      </Button>
-    </BlockStack>
+    <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
+      <h2 style={{ margin: "0 0 8px" }}>Lions Creek Rewards</h2>
+      <p style={{ margin: 0, opacity: 0.8 }}>
+        Loyalty dashboard extension is installed and rendering correctly.
+      </p>
+    </div>
   );
-});
+}
+
+// Customer Account UI extension entrypoint.
+// Shopify loads this module for target: customer-account.page.render
+export default async function main() {
+  render(<LoyaltyDashboard />, document.body);
+}
