@@ -1,28 +1,33 @@
 {
   "name": "lions-creek-rewards",
   "private": true,
-  "version": "0.0.0-dev",
   "type": "module",
   "engines": {
-    "node": ">=20.19 <22 || >=22.12"
+    "node": ">=20.19"
+  },
+  "workspaces": {
+    "packages": [
+      "extensions/*"
+    ]
   },
   "scripts": {
     "build": "react-router build",
     "dev": "shopify app dev",
     "start": "react-router-serve ./build/server/index.js",
-    "generate": "prisma generate",
     "setup": "prisma generate && prisma migrate deploy",
+    "generate": "prisma generate",
     "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "dependencies": {
     "@prisma/client": "^6.16.3",
     "@react-router/dev": "^7.12.0",
+    "@react-router/fs-routes": "^7.12.0",
     "@react-router/node": "^7.12.0",
     "@react-router/serve": "^7.12.0",
     "@shopify/app-bridge-react": "^4.2.4",
     "@shopify/polaris": "^13.9.5",
-    "@shopify/shopify-app-react-router": "^1.1.0",
+    "@shopify/shopify-app-react-router": "^1.1.1",
     "@shopify/shopify-app-session-storage-prisma": "^8.0.0",
     "isbot": "^5.1.31",
     "prisma": "^6.16.3",
@@ -35,18 +40,16 @@
     "@types/node": "^22.18.8",
     "@types/react": "^18.3.25",
     "@types/react-dom": "^18.3.7",
-    "eslint": "^10.0.0",
-    "eslint-config-prettier": "^10.0.1",
-    "eslint-plugin-prettier": "^5.2.2",
-    "eslint-plugin-react": "^7.22.0",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "eslint": "^8.57.1",
+    "eslint-import-resolver-typescript": "^3.10.1",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^4.6.2",
     "prettier": "^3.6.2",
     "typescript": "^5.9.3",
     "vite": "^6.3.6"
-  },
-  "workspaces": {
-    "packages": [
-      "extensions/*"
-    ]
   }
 }

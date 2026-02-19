@@ -1,8 +1,32 @@
-import "@shopify/ui-extensions/preact";
-import { render } from "preact";
+# PC_Production_Build.ps1
+$ErrorActionPreference = "Stop"
 
-import App from "./App";
+function ExecOrThrow {
+    param(
+        [Parameter(Mandatory=$true)][string]$Cmd,
+        [Parameter(Mandatory=$false)][string[]]$Args = @()
+    )
 
-export default async function main() {
-  render(<App />, document.body);
+    Write-Host ">> $Cmd $($Args -join ' ')" -ForegroundColor Cyan
+    & $Cmd @Args
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Command failed with exit code {0}: {1} {2}" -f $LASTEXITCODE, $Cmd, ($Args -join ' '))
+    }
 }
+
+# Clean build outputs
+Remove-Item -Recurse -Force .\build -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force .\.react-router -ErrorAction SilentlyContinue
+
+# Install dependencies (prefer npm ci when lock exists)
+if (Test-Path ".\package-lock.json") {
+    ExecOrThrow "npm" @("ci")
+} else {
+    ExecOrThrow "npm" @("install")
+}
+
+# Prisma + build
+ExecOrThrow "npm" @("run", "setup")
+ExecOrThrow "npm" @("run", "build")
+
+Write-Host "✅ Production build completed." -ForegroundColor Green
