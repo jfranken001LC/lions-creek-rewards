@@ -2,8 +2,8 @@
 import { requireAppProxyContext } from "./appProxy.server";
 
 export type VerifyAppProxyResult =
-  | { ok: true; shop: string; customerId?: string }
-  | { ok: false; error: string };
+  | { ok: true; status: 200; shop: string; customerId?: string }
+  | { ok: false; status: number; error: string };
 
 /**
  * Non-async on purpose:
@@ -13,10 +13,19 @@ export type VerifyAppProxyResult =
 export function verifyAppProxy(request: Request): VerifyAppProxyResult {
   try {
     const ctx = requireAppProxyContext(request);
-    return { ok: true, shop: ctx.shop, customerId: ctx.customerId };
-  } catch (e) {
+    return { ok: true, status: 200, shop: ctx.shop, customerId: ctx.customerId };
+  } catch (e: any) {
+    if (e instanceof Response) {
+      return {
+        ok: false,
+        status: e.status || 401,
+        error: e.statusText || "Invalid app proxy request",
+      };
+    }
+
     return {
       ok: false,
+      status: 401,
       error: e instanceof Error ? e.message : "Invalid app proxy request",
     };
   }

@@ -1,17 +1,26 @@
-api_version = "2026-01"
+name = "lcr-loyalty-dashboard"
+type = "customer_accounts_ui_extension"
+api_version = "2025-07"
 
 [[extensions]]
 name = "lcr-loyalty-dashboard"
 handle = "lcr-loyalty-dashboard"
-
-uid = "a63729b7-9ab6-9ea6-a95f-8e942344efb1cf5ed67d"
-
-type = "ui_extension"
+description = "Lions Creek Loyalty Dashboard"
+uid = "61ef0512-8c4a-68f5-4725-51d6aa6bf238"
 
 [[extensions.targeting]]
 target = "customer-account.page.render"
 module = "./src/index.tsx"
 
 [extensions.capabilities]
-# Required to call your app backend from the customer account sandbox.
+api_access = true
 network_access = true
+
+# Customer account UI extensions must call your app backend with an absolute URL.
+# Configure this in the extension settings in the Shopify admin (Customer account > Extensions).
+[settings]
+  [[settings.fields]]
+  key = "app_base_url"
+  type = "single_line_text_field"
+  name = "App base URL"
+  description = "Public base URL of your loyalty app (e.g., https://yourapp.com). Used by the customer account UI extension to call your backend using session tokens."

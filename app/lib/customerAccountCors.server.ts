@@ -6,8 +6,13 @@ function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
   const normalized = origin.replace(/\/$/, "");
 
+  // Your app's own origin (useful for local testing/tools)
   if (SHOPIFY_APP_URL && normalized === SHOPIFY_APP_URL) return true;
 
+  // Customer account UI extensions are hosted on this origin
+  if (normalized === "https://extensions.shopifycdn.com") return true;
+
+  // Allow Shopify-owned origins that may call your public customer endpoints
   if (/^https:\/\/([a-z0-9][a-z0-9-]*\.)?myshopify\.com$/i.test(normalized)) return true;
   if (/^https:\/\/([a-z0-9][a-z0-9-]*\.)?shopify\.com$/i.test(normalized)) return true;
 

@@ -5,6 +5,8 @@ import { getCustomerLoyaltyPayload, normalizeCustomerId } from "../lib/loyalty.s
 import { shopFromDest } from "../lib/proxy.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
+  if (request.method === "OPTIONS") return preflightCustomerAccountCors(request);
+
   const { sessionToken } = await authenticate.public.customerAccount(request);
 
   const shop = shopFromDest(sessionToken.payload.dest);

@@ -9,9 +9,13 @@ function jsonResponse(payload: unknown, init?: ResponseInit) {
 }
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const { ok, shop, customerId, error, status } = await verifyAppProxy(request);
-  if (!ok) return jsonResponse({ ok: false, error }, { status });
+  const result = verifyAppProxy(request);
+  if (!result.ok) return jsonResponse({ ok: false, error: result.error }, { status: result.status });
 
-  const loyalty = await computeCustomerLoyalty({ shop, customerId });
+  if (!result.customerId) {
+    return jsonResponse({ ok: false, error: "Missing customerId" }, { status: 401 });
+  }
+
+  const loyalty = await computeCustomerLoyalty({ shop: result.shop, customerId: result.customerId });
   return jsonResponse({ ok: true, ...loyalty }, { status: 200 });
 }
