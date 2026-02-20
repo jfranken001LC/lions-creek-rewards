@@ -5,9 +5,6 @@ name = "Lions Creek Rewards"
 application_url = "https://loyalty.basketbooster.ca"
 embedded = true
 
-[build]
-automatically_update_urls_on_dev = true
-
 [webhooks]
 api_version = "2026-01"
 
@@ -22,3 +19,6 @@ redirect_urls = [
   "https://loyalty.basketbooster.ca/auth/callback",
   "https://loyalty.basketbooster.ca/auth/shopify/callback"
 ]
+
+[build]
+automatically_update_urls_on_dev = true

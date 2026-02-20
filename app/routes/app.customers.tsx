@@ -1,4 +1,5 @@
 import React from "react";
+import { randomUUID } from "crypto";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { data, useActionData, useLoaderData, useNavigation, useSubmit } from "react-router";
 import {
@@ -75,7 +76,7 @@ export async function action({ request }: ActionFunctionArgs) {
       });
 
       await tx.pointsLedger.create({
-        data: { shop, customerId, type: LedgerType.ADJUST, delta, source: "ADMIN_ADJUST", description: reason },
+        data: { shop, customerId, type: LedgerType.ADJUST, delta, source: "ADMIN_ADJUST", sourceId: `admin_adjust:${randomUUID()}`, description: reason },
       });
 
       return next;

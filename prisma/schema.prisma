@@ -61,6 +61,9 @@ model ShopSettings {
   pointsExpireInactivityDays Int      @default(365)
   redemptionExpiryHours      Int      @default(72)
 
+  // If true, customers may have at most one active redemption at a time.
+  preventMultipleActiveRedemptions Boolean @default(true)
+
   eligibleCollectionHandle   String   @default("lcr_loyalty_eligible")
   // Cached GID for the eligible collection (optional)
   eligibleCollectionGid      String?
@@ -132,9 +135,9 @@ model Redemption {
   restoredAt      DateTime?
   restoreReason   String?
 
-  idemKey         String?
+  idempotencyKey         String?
 
-  @@unique([shop, customerId, idemKey], name: "redemption_idem")
+  @@unique([shop, customerId, idempotencyKey], name: "redemption_idem")
   @@unique([shop, code], name: "shop_code")
   @@index([shop, customerId, status])
 }

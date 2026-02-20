@@ -33,10 +33,25 @@ export type CustomerLoyaltyPayload = {
         createdAt: string;
       }
     | null;
+  redemptionOptions: Array<{
+    points: number;
+    valueDollars: number;
+    canRedeem: boolean;
+  }>;
+  recentActivity: Array<{
+    id: string;
+    type: string;
+    delta: number;
+    source: string;
+    sourceId: string;
+    description: string | null;
+    createdAt: string;
+  }>;
   settings: {
     earnRate: number;
     minOrderDollars: number;
     redemptionExpiryHours: number;
+    preventMultipleActiveRedemptions: boolean;
     redemptionSteps: number[];
     redemptionValueMap: Record<string, number>;
   };
@@ -113,6 +128,41 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
 
   const activeRedemption = await getActiveRedemption(shop, customerId);
 
+  const redemptionOptions = (settings.redemptionSteps || [])
+    .map((pts) => {
+      const v = Number(settings.redemptionValueMap?.[String(pts)]);
+      if (!Number.isFinite(v) || v <= 0) return null;
+      return { points: pts, valueDollars: v, canRedeem: bal.balance >= pts && (!settings.preventMultipleActiveRedemptions || !activeRedemption) };
+    })
+    .filter(
+      (x): x is { points: number; valueDollars: number; canRedeem: boolean } => Boolean(x),
+    );
+
+  const ledger = await db.pointsLedger.findMany({
+    where: { shop, customerId },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+    select: {
+      id: true,
+      type: true,
+      delta: true,
+      source: true,
+      sourceId: true,
+      description: true,
+      createdAt: true,
+    },
+  });
+
+  const recentActivity = ledger.map((l) => ({
+    id: l.id,
+    type: String(l.type),
+    delta: l.delta,
+    source: l.source,
+    sourceId: l.sourceId,
+    description: l.description ?? null,
+    createdAt: l.createdAt.toISOString(),
+  }));
+
   return {
     shop,
     customerId,
@@ -124,10 +174,13 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
       expireAfterDays: settings.pointsExpireInactivityDays ?? null,
     },
     redemption: activeRedemption,
+    redemptionOptions,
+    recentActivity,
     settings: {
       earnRate: settings.earnRate,
       minOrderDollars: settings.redemptionMinOrder,
       redemptionExpiryHours: settings.redemptionExpiryHours,
+      preventMultipleActiveRedemptions: settings.preventMultipleActiveRedemptions,
       redemptionSteps: settings.redemptionSteps,
       redemptionValueMap: settings.redemptionValueMap,
     },

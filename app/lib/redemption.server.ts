@@ -1,6 +1,6 @@
 import db from "../db.server";
 import { apiVersion } from "../shopify.server";
-import { RedemptionStatus } from "@prisma/client";
+import { RedemptionStatus, LedgerType } from "@prisma/client";
 import { getOrCreateShopSettings } from "./shopSettings.server";
 import { fetchCustomerTags, resolveEligibleCollectionGid, type AdminGraphql } from "./shopifyQueries.server";
 
@@ -20,6 +20,7 @@ export type IssueRedemptionResult =
       discountAmount: number;
       newBalance: number;
       idempotencyKey?: string;
+      wasExisting?: boolean;
     }
   | { ok: false; error: string };
 
@@ -139,7 +140,7 @@ async function getActiveRedemption(args: { shop: string; customerId: string }) {
       status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
       expiresAt: { gt: new Date() },
     },
-    select: { id: true, code: true, status: true, expiresAt: true },
+    select: { id: true, code: true, status: true, expiresAt: true, points: true, valueDollars: true, createdAt: true },
   });
 }
 
@@ -167,8 +168,8 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
   if (args.idempotencyKey) {
     const idemKey = String(args.idempotencyKey).trim();
     if (idemKey) {
-      const existing = await db.redemption.findUnique({
-        where: { idempotencyKey: idemKey },
+      const existing = await db.redemption.findFirst({
+        where: { shop, customerId, idempotencyKey: idemKey },
         select: { code: true, expiresAt: true, points: true, valueDollars: true },
       });
 
@@ -224,9 +225,27 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
 
   if (bal.balance < pointsRequested) return { ok: false, error: "Insufficient points" };
 
-  // Guardrail: prevent multiple active redemptions (default-on).
-  const active = await getActiveRedemption({ shop, customerId });
-  if (active) return { ok: false, error: "Active redemption already exists" };
+  // Guardrail: prevent multiple active redemptions (configurable).
+  if (settings.preventMultipleActiveRedemptions) {
+    const active = await getActiveRedemption({ shop, customerId });
+    if (active) {
+      const balNow = await db.customerPointsBalance.findUnique({
+        where: { shop_customerId: { shop, customerId } },
+        select: { balance: true },
+      });
+
+      return {
+        ok: true,
+        code: active.code,
+        expiresAt: (active.expiresAt ?? new Date()).toISOString(),
+        pointsRedeemed: active.points,
+        discountAmount: active.valueDollars,
+        newBalance: balNow?.balance ?? bal.balance,
+        idempotencyKey: args.idempotencyKey ? String(args.idempotencyKey).trim() : undefined,
+        wasExisting: true,
+      };
+    }
+  }
 
   // Create a discount code (Shopify) first, then persist + debit points.
   const now = new Date();
@@ -264,7 +283,7 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
 
       newBalance = updated.balance;
 
-      await tx.redemption.create({
+      const redemption = await tx.redemption.create({
         data: {
           shop,
           customerId,
@@ -276,9 +295,22 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
           createdAt: now,
           expiresAt: expires,
           idempotencyKey: args.idempotencyKey ? String(args.idempotencyKey).trim() : null,
+        
         },
+        select: { id: true },
       });
-    });
+
+      await tx.pointsLedger.create({
+        data: {
+          shop,
+          customerId,
+          type: LedgerType.REDEEM,
+          delta: -pointsRequested,
+          source: "REDEEM",
+          sourceId: redemption.id,
+          description: `Redeemed ${pointsRequested} point(s) for discount code ${created.code}.`,
+        },
+      });});
   } catch (e: any) {
     return { ok: false, error: e?.message ?? "Failed to record redemption" };
   }

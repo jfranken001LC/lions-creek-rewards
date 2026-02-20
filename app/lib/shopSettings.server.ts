@@ -6,6 +6,7 @@ export type ShopSettingsNormalized = {
   redemptionMinOrder: number;
   pointsExpireInactivityDays: number;
   redemptionExpiryHours: number;
+  preventMultipleActiveRedemptions: boolean;
 
   eligibleCollectionHandle: string;
   eligibleCollectionGid: string | null;
@@ -89,6 +90,8 @@ export function normalizeShopSettings(row: any, shop: string): ShopSettingsNorma
       ? Number(row.redemptionExpiryHours)
       : 72,
 
+    preventMultipleActiveRedemptions: typeof row?.preventMultipleActiveRedemptions === "boolean" ? row.preventMultipleActiveRedemptions : true,
+
     eligibleCollectionHandle:
       typeof row?.eligibleCollectionHandle === "string" && row.eligibleCollectionHandle.trim()
         ? row.eligibleCollectionHandle.trim()
@@ -125,6 +128,7 @@ export async function upsertShopSettings(shop: string, input: Partial<ShopSettin
     redemptionMinOrder: input.redemptionMinOrder,
     pointsExpireInactivityDays: input.pointsExpireInactivityDays,
     redemptionExpiryHours: input.redemptionExpiryHours,
+    preventMultipleActiveRedemptions: input.preventMultipleActiveRedemptions,
     eligibleCollectionHandle: input.eligibleCollectionHandle,
     eligibleCollectionGid: input.eligibleCollectionGid,
     excludedCustomerTags: input.excludedCustomerTags,

@@ -474,6 +474,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const pointsExpireInactivityDays = clampInt(form.get("pointsExpireInactivityDays"), 1, 3650);
     const redemptionExpiryHours = clampInt(form.get("redemptionExpiryHours"), 1, 720);
+    const preventMultipleActiveRedemptions = String(form.get("preventMultipleActiveRedemptions") ?? "") === "on";
 
     const excludedCustomerTags = normalizeTagList(csvToList(form.get("excludedCustomerTags")));
     const includeProductTags = normalizeTagList(csvToList(form.get("includeProductTags")));
@@ -508,6 +509,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       redemptionMinOrder,
       pointsExpireInactivityDays,
       redemptionExpiryHours,
+      preventMultipleActiveRedemptions,
       eligibleCollectionHandle,
       eligibleCollectionGid,
       excludedCustomerTags,
@@ -594,6 +596,19 @@ export default function SettingsPage() {
                 max={720}
               />
               <div style={{ fontSize: 12, opacity: 0.75 }}>Issued discount codes expire after this many hours.</div>
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Prevent multiple active redemptions</div>
+              <input
+                type="checkbox"
+                name="preventMultipleActiveRedemptions"
+                defaultChecked={settings.preventMultipleActiveRedemptions}
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                If enabled, a customer may only have one active redemption code at a time. Attempts to redeem again will
+                return the existing active code.
+              </div>
             </label>
           </div>
         </section>
