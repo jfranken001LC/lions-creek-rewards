@@ -1,32 +1,26 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { data } from "react-router";
-import { json } from "@remix-run/node";
+import db from "../db.server";
 
-import { authenticate } from "../shopify.server";
 import { acquireJobLock, releaseJobLock } from "../lib/jobLock.server";
-import { assertJobSecretOrThrow } from "../lib/jobAuth.server";
+import { assertJobAuth } from "../lib/jobAuth.server";
 import { expireIssuedRedemptions, expireInactiveCustomers } from "../lib/loyaltyExpiry.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   try {
-    // 1) Require the job secret (for Lightsail cron / manual admin curl).
-    assertJobSecretOrThrow(request);
+    // Auth: JOB_TOKEN header or Bearer token (per app/lib/jobAuth.server.ts)
+    await assertJobAuth(request, "jobs.expire");
 
-    // 2) Resolve shop context (admin auth) so we can run cross-customer maintenance.
-    const { session } = await authenticate.admin(request);
-    const shop = session.shop;
-
-    // 3) Acquire a lock to avoid overlapping job runs (important if cron overlaps / manual triggers).
-    const lock = await acquireJobLock("jobs.expire");
-
-    if (!lock.acquired) {
-      return data(
-        {
-          ok: false,
-          error: lock.error ?? "Job is already running.",
-        },
-        { status: 409 },
+    const shop = await resolveShopForJob(request);
+    if (!shop) {
+      return Response.json(
+        { ok: false, error: "missing_shop", hint: "Provide ?shop=... or ensure at least one Session exists." },
+        { status: 400 },
       );
+    }
+
+    const lock = await acquireJobLock("jobs.expire");
+    if (!lock.acquired) {
+      return Response.json({ ok: false, error: lock.error ?? "job_already_running" }, { status: 409 });
     }
 
     try {
@@ -35,7 +29,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
       const redemptions = await expireIssuedRedemptions({ shop, now });
       const inactive = await expireInactiveCustomers({ shop, now });
 
-      return json(
+      return Response.json(
         {
           ok: true,
           shop,
@@ -49,12 +43,33 @@ export async function loader({ request }: LoaderFunctionArgs) {
       await releaseJobLock(lock);
     }
   } catch (err: any) {
-    return data(
-      {
-        ok: false,
-        error: err?.message ?? "Unhandled error",
-      },
+    // Preserve intentional auth failures thrown as Response by assertJobAuth()
+    if (err instanceof Response) return err;
+
+    return Response.json(
+      { ok: false, error: err?.message ?? "Unhandled error" },
       { status: 500 },
     );
   }
+}
+
+async function resolveShopForJob(request: Request): Promise<string | null> {
+  const url = new URL(request.url);
+
+  // 1) Explicit query param is preferred
+  const qp = (url.searchParams.get("shop") ?? "").trim();
+  if (qp) return qp;
+
+  // 2) Common environment fallback (optional)
+  const envShop =
+    (process.env.PRIMARY_SHOP ?? process.env.SHOPIFY_SHOP ?? process.env.SHOP ?? "").trim();
+  if (envShop) return envShop;
+
+  // 3) DB fallback: use any installed session
+  const any = await db.session.findFirst({
+    select: { shop: true },
+    orderBy: { shop: "asc" },
+  });
+
+  return any?.shop ?? null;
 }
