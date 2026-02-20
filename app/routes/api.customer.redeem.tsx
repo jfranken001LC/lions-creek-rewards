@@ -26,7 +26,10 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     const body = (await request.json().catch(() => null)) as any;
-    const requestedPoints = Number(body?.points);
+
+    // Primary contract: pointsToRedeem (kept compatible with older 'points')
+    const requestedPointsRaw = body?.pointsToRedeem ?? body?.points;
+    const requestedPoints = Number(requestedPointsRaw);
     const idempotencyKey = body?.idempotencyKey ? String(body.idempotencyKey) : undefined;
 
     const issued = await issueRedemptionCode({

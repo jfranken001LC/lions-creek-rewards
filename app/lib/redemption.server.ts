@@ -12,7 +12,15 @@ export type IssueRedemptionArgs = {
 };
 
 export type IssueRedemptionResult =
-  | { ok: true; code: string; expiresAt: string; pointsDebited: number; valueDollars: number; idempotencyKey?: string }
+  | {
+      ok: true;
+      code: string;
+      expiresAt: string;
+      pointsRedeemed: number;
+      discountAmount: number;
+      newBalance: number;
+      idempotencyKey?: string;
+    }
   | { ok: false; error: string };
 
 async function getOfflineAccessToken(shop: string): Promise<string | null> {
@@ -35,203 +43,255 @@ function makeAdminGraphql(shop: string, accessToken: string): AdminGraphql {
   };
 }
 
-async function graphqlJson(res: Response): Promise<any> {
-  const text = await res.text().catch(() => "");
-  let json: any = null;
-  try { json = JSON.parse(text); } catch { json = null; }
-  if (!res.ok) throw new Error(`Shopify GraphQL failed: ${res.status} ${res.statusText} ${text}`);
-  if (json?.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  return json?.data ?? null;
+function isInt(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n) && Number.isInteger(n);
 }
 
-function normalizeCustomerId(raw: string): string {
-  if (!raw) return "";
-  const s = String(raw).trim();
-  const m = s.match(/Customer\/(\d+)/i);
-  if (m) return m[1];
-  if (/^\d+$/.test(s)) return s;
-  return s;
+function formatMoney(dollars: number): string {
+  const n = Number(dollars);
+  if (!Number.isFinite(n)) return "0.00";
+  return n.toFixed(2);
 }
 
-function generateCode(): string {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let out = "LCR-";
-  for (let i = 0; i < 8; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
-}
+async function createDiscount(args: {
+  adminGraphql: AdminGraphql;
+  title: string;
+  discountCode: string;
+  valueDollars: number;
+  eligibleCollectionGid: string;
+  startsAt: string;
+  endsAt: string;
+  minOrderDollars: number;
+}): Promise<{ ok: true; code: string; discountNodeId: string } | { ok: false; error: string }> {
+  const mutation = `#graphql
+    mutation DiscountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+      discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+        codeDiscountNode {
+          id
+          codeDiscount {
+            ... on DiscountCodeBasic {
+              codes(first: 1) { nodes { code } }
+            }
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
 
-async function uniqueCode(shop: string): Promise<string> {
-  for (let i = 0; i < 10; i++) {
-    const code = generateCode();
-    const exists = await db.redemption.findFirst({ where: { shop, code }, select: { id: true } });
-    if (!exists) return code;
-  }
-  return `${generateCode()}-${Math.floor(Math.random() * 9)}`;
-}
+  const minOrder = Number(args.minOrderDollars ?? 0);
+  const minimumRequirement =
+    Number.isFinite(minOrder) && minOrder > 0
+      ? { subtotal: { greaterThanOrEqualToSubtotal: formatMoney(minOrder) } }
+      : undefined;
 
-const DISCOUNT_CREATE = `#graphql
-mutation DiscountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
-  discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-    codeDiscountNode { id }
-    userErrors { field message }
-  }
-}
-`;
-
-async function createDiscount(
-  adminGraphql: AdminGraphql,
-  args: { code: string; valueDollars: number; endsAt: Date; eligibleCollectionGid: string },
-): Promise<{ ok: true; discountNodeId: string } | { ok: false; error: string }> {
-  const variables = {
+  const variables: Record<string, any> = {
     basicCodeDiscount: {
-      title: `LCR Redemption ${args.code}`,
-      code: args.code,
-      startsAt: new Date().toISOString(),
-      endsAt: args.endsAt.toISOString(),
-      usageLimit: 1,
-      customerSelection: { all: true },
-      combinesWith: { orderDiscounts: true, productDiscounts: true, shippingDiscounts: true },
+      title: args.title,
+      code: args.discountCode,
+      startsAt: args.startsAt,
+      endsAt: args.endsAt,
+
+      // Required in modern API versions (deprecated customerSelection is intentionally avoided)
+      context: { all: "ALL" },
+
+      // Minimum order requirement (subtotal) if configured
+      ...(minimumRequirement ? { minimumRequirement } : {}),
+
+      // Fixed amount off (applies to eligible collection)
       customerGets: {
-        value: { discountAmount: { amount: String(args.valueDollars), appliesOnEachItem: false } },
+        value: { discountAmount: { amount: formatMoney(args.valueDollars), appliesOnEachItem: false } },
         items: { collections: { add: [args.eligibleCollectionGid] } },
+      },
+
+      usageLimit: 1,
+
+      combinesWith: {
+        orderDiscounts: true,
+        productDiscounts: true,
+        shippingDiscounts: true,
       },
     },
   };
 
-  const data = await graphqlJson(await adminGraphql(DISCOUNT_CREATE, { variables }));
-  const result = data?.discountCodeBasicCreate;
-  const errs = result?.userErrors ?? [];
-  if (errs.length) return { ok: false, error: errs.map((e: any) => e?.message).join("; ") };
+  const res = await args.adminGraphql(mutation, { variables });
+  const json = (await res.json().catch(() => null)) as any;
 
-  const id = result?.codeDiscountNode?.id;
-  if (!id) return { ok: false, error: "Missing codeDiscountNode.id" };
-  return { ok: true, discountNodeId: String(id) };
+  const topErr = json?.errors?.[0]?.message;
+  const userErr = json?.data?.discountCodeBasicCreate?.userErrors?.[0]?.message;
+  if (!res.ok || topErr || userErr) {
+    return { ok: false, error: String(userErr || topErr || `HTTP ${res.status}`) };
+  }
+
+  const node = json?.data?.discountCodeBasicCreate?.codeDiscountNode;
+  const code = node?.codeDiscount?.codes?.nodes?.[0]?.code;
+  const discountNodeId = node?.id;
+  if (!code || !discountNodeId) return { ok: false, error: "Discount creation failed (missing code/node id)." };
+
+  return { ok: true, code, discountNodeId };
+}
+
+async function getActiveRedemption(args: { shop: string; customerId: string }) {
+  return db.redemption.findFirst({
+    where: {
+      shop: args.shop,
+      customerId: args.customerId,
+      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
+      expiresAt: { gt: new Date() },
+    },
+    select: { id: true, code: true, status: true, expiresAt: true },
+  });
 }
 
 export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<IssueRedemptionResult> {
   const shop = String(args.shop || "").trim();
-  const customerId = normalizeCustomerId(args.customerId);
+  const customerId = String(args.customerId || "").trim();
   const pointsRequested = Number(args.pointsRequested);
-  const idemKey = args.idempotencyKey ? String(args.idempotencyKey).trim() : undefined;
 
   if (!shop) return { ok: false, error: "Missing shop" };
   if (!customerId) return { ok: false, error: "Missing customerId" };
-  if (!Number.isInteger(pointsRequested) || pointsRequested <= 0) return { ok: false, error: "Invalid points" };
+  if (!Number.isFinite(pointsRequested) || !Number.isInteger(pointsRequested) || pointsRequested <= 0) {
+    return { ok: false, error: "Invalid pointsToRedeem" };
+  }
 
   const settings = await getOrCreateShopSettings(shop);
+  const steps = Array.isArray(settings.redemptionSteps) ? settings.redemptionSteps : [];
+  if (!steps.length) return { ok: false, error: "No redemption steps configured" };
+  if (!steps.includes(pointsRequested)) return { ok: false, error: "Requested points not permitted" };
 
-  if (!settings.redemptionSteps.includes(pointsRequested)) {
-    return { ok: false, error: `Points must be one of: ${settings.redemptionSteps.join(", ")}` };
-  }
+  const valueDollarsRaw = settings.redemptionValueMap?.[String(pointsRequested)];
+  const valueDollars = Number(valueDollarsRaw);
+  if (!Number.isFinite(valueDollars) || valueDollars <= 0) return { ok: false, error: "Invalid redemption mapping" };
 
-  const valueDollars = Number(settings.redemptionValueMap[String(pointsRequested)]);
-  if (!Number.isFinite(valueDollars) || valueDollars <= 0) return { ok: false, error: "Invalid redemption map" };
+  // Idempotency: if the same client request is replayed, return the already-issued code + current balance.
+  if (args.idempotencyKey) {
+    const idemKey = String(args.idempotencyKey).trim();
+    if (idemKey) {
+      const existing = await db.redemption.findUnique({
+        where: { idempotencyKey: idemKey },
+        select: { code: true, expiresAt: true, points: true, valueDollars: true },
+      });
 
-  // Idempotency
-  if (idemKey) {
-    const existing = await db.redemption.findUnique({
-      where: { redemption_idem: { shop, customerId, idemKey } },
-      select: { code: true, expiresAt: true, points: true, valueDollars: true },
-    });
-    if (existing) {
-      return {
-        ok: true,
-        code: existing.code,
-        expiresAt: existing.expiresAt ? existing.expiresAt.toISOString() : new Date().toISOString(),
-        pointsDebited: existing.points,
-        valueDollars: existing.valueDollars,
-        idempotencyKey: idemKey,
-      };
+      if (existing) {
+        const bal = await db.customerPointsBalance.findUnique({
+          where: { shop_customerId: { shop, customerId } },
+          select: { balance: true },
+        });
+
+        if (!bal) return { ok: false, error: "Points balance record missing for customer." };
+
+        return {
+          ok: true,
+          code: existing.code,
+          expiresAt: (existing.expiresAt ?? new Date()).toISOString(),
+          pointsRedeemed: existing.points,
+          discountAmount: existing.valueDollars,
+          newBalance: bal.balance,
+          idempotencyKey: idemKey,
+        };
+      }
     }
   }
 
-  // Active redemption guard
-  const active = await db.redemption.findFirst({
-    where: {
-      shop,
-      customerId,
-      status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-    },
-    select: { code: true },
+  const accessToken = await getOfflineAccessToken(shop);
+  if (!accessToken) return { ok: false, error: "Missing offline access token" };
+
+  const admin = makeAdminGraphql(shop, accessToken);
+
+  // Guardrail: excluded customer tags cannot redeem.
+  const tags = await fetchCustomerTags(admin, customerId).catch(() => []);
+  if (settings.excludedCustomerTags?.length) {
+    const excluded = new Set(settings.excludedCustomerTags.map((t) => String(t).toLowerCase()));
+    const customerTags = new Set((tags || []).map((t) => String(t).toLowerCase()));
+    for (const t of excluded) {
+      if (customerTags.has(t)) return { ok: false, error: "Customer is not eligible for loyalty redemption." };
+    }
+  }
+
+  // Ensure the eligible collection GID is cached/resolved.
+  const eligibleCollectionGid = await resolveEligibleCollectionGid(admin, shop, {
+    eligibleCollectionHandle: settings.eligibleCollectionHandle,
+    eligibleCollectionGid: settings.eligibleCollectionGid,
   });
-  if (active) return { ok: false, error: "Active redemption already exists" };
 
-  const token = await getOfflineAccessToken(shop);
-  if (!token) return { ok: false, error: `Missing offline token for ${shop}` };
-  const adminGraphql = makeAdminGraphql(shop, token);
-
-  // Excluded customer tags
-  if (settings.excludedCustomerTags.length) {
-    const tags = await fetchCustomerTags(adminGraphql, customerId);
-    const lower = new Set(tags.map((t) => t.toLowerCase()));
-    if (settings.excludedCustomerTags.some((t) => lower.has(String(t).toLowerCase()))) {
-      return { ok: false, error: "Customer excluded from loyalty program" };
-    }
-  }
-
-  const eligibleCollectionGid = await resolveEligibleCollectionGid(adminGraphql, shop, settings);
-
-  // Balance check
+  // Fetch points balance (create row if missing).
   const bal = await db.customerPointsBalance.upsert({
     where: { shop_customerId: { shop, customerId } },
     create: { shop, customerId },
     update: {},
+    select: { balance: true },
   });
+
   if (bal.balance < pointsRequested) return { ok: false, error: "Insufficient points" };
 
+  // Guardrail: prevent multiple active redemptions (default-on).
+  const active = await getActiveRedemption({ shop, customerId });
+  if (active) return { ok: false, error: "Active redemption already exists" };
+
+  // Create a discount code (Shopify) first, then persist + debit points.
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + settings.redemptionExpiryHours * 60 * 60 * 1000);
-  const code = await uniqueCode(shop);
+  const expires = new Date(now.getTime() + settings.redemptionExpiryHours * 60 * 60 * 1000);
 
-  // Create discount first (dev-safe), then transactionally debit points + persist redemption.
-  const discount = await createDiscount(adminGraphql, { code, valueDollars, endsAt: expiresAt, eligibleCollectionGid });
-  if (!discount.ok) return { ok: false, error: discount.error };
+  const discountTitle = `LCR Rewards – $${valueDollars} off (redeem ${pointsRequested})`;
+  const discountCode = `LCR-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
-  await db.$transaction(async (tx) => {
-    await tx.customerPointsBalance.update({
-      where: { shop_customerId: { shop, customerId } },
-      data: {
-        balance: { decrement: pointsRequested },
-        lifetimeRedeemed: { increment: pointsRequested },
-        lastActivityAt: now,
-        expiredAt: null,
-      },
-    });
-
-    await tx.pointsLedger.create({
-      data: {
-        shop,
-        customerId,
-        type: "REDEEM",
-        delta: -pointsRequested,
-        source: "REDEMPTION",
-        sourceId: code,
-        description: `Issued redemption ${code} for $${valueDollars}`,
-      },
-    });
-
-    await tx.redemption.create({
-      data: {
-        shop,
-        customerId,
-        status: RedemptionStatus.ISSUED,
-        points: pointsRequested,
-        valueDollars,
-        code,
-        discountNodeId: discount.discountNodeId,
-        expiresAt,
-        idemKey: idemKey ?? null,
-      },
-    });
+  const created = await createDiscount({
+    adminGraphql: admin,
+    title: discountTitle,
+    discountCode,
+    valueDollars,
+    eligibleCollectionGid,
+    startsAt: now.toISOString(),
+    endsAt: expires.toISOString(),
+    minOrderDollars: settings.redemptionMinOrder,
   });
+
+  if (!created.ok) return { ok: false, error: created.error };
+
+  let newBalance: number | null = null;
+
+  try {
+    await db.$transaction(async (tx) => {
+      const updated = await tx.customerPointsBalance.update({
+        where: { shop_customerId: { shop, customerId } },
+        data: {
+          balance: { decrement: pointsRequested },
+          lifetimeRedeemed: { increment: pointsRequested },
+          lastActivityAt: new Date(),
+        },
+        select: { balance: true },
+      });
+
+      newBalance = updated.balance;
+
+      await tx.redemption.create({
+        data: {
+          shop,
+          customerId,
+          code: created.code,
+          points: pointsRequested,
+          valueDollars: isInt(valueDollars) ? valueDollars : Math.round(valueDollars),
+          status: RedemptionStatus.ISSUED,
+          discountNodeId: created.discountNodeId,
+          createdAt: now,
+          expiresAt: expires,
+          idempotencyKey: args.idempotencyKey ? String(args.idempotencyKey).trim() : null,
+        },
+      });
+    });
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? "Failed to record redemption" };
+  }
+
+  if (newBalance === null) return { ok: false, error: "Failed to compute new balance" };
 
   return {
     ok: true,
-    code,
-    expiresAt: expiresAt.toISOString(),
-    pointsDebited: pointsRequested,
-    valueDollars,
-    idempotencyKey: idemKey,
+    code: created.code,
+    expiresAt: expires.toISOString(),
+    pointsRedeemed: pointsRequested,
+    discountAmount: valueDollars,
+    newBalance,
+    idempotencyKey: args.idempotencyKey ? String(args.idempotencyKey).trim() : undefined,
   };
 }

@@ -11,64 +11,119 @@ export function normalizeCustomerId(raw: string): string {
   return s;
 }
 
-export async function getOrCreateCustomerBalance(shop: string, customerId: string) {
-  const cid = normalizeCustomerId(customerId);
-  if (!cid) throw new Error("customerId is required");
 
-  return db.customerPointsBalance.upsert({
-    where: { shop_customerId: { shop, customerId: cid } },
-    create: { shop, customerId: cid },
-    update: {},
-  });
+export type CustomerLoyaltyPayload = {
+  shop: string;
+  customerId: string;
+  points: {
+    balance: number;
+    lifetimeEarned: number;
+    lifetimeRedeemed: number;
+    lastActivityAt: string | null;
+    expireAfterDays: number | null;
+  };
+  redemption:
+    | {
+        id: string;
+        code: string;
+        pointsRedeemed: number;
+        discountAmount: number;
+        status: "ISSUED" | "APPLIED" | "EXPIRED" | "CANCELED";
+        expiresAt: string;
+        createdAt: string;
+      }
+    | null;
+  settings: {
+    earnRate: number;
+    minOrderDollars: number;
+    redemptionExpiryHours: number;
+    redemptionSteps: number[];
+    redemptionValueMap: Record<string, number>;
+  };
+};
+
+function normalizeRedemptionStatus(
+  status: RedemptionStatus | string,
+): "ISSUED" | "APPLIED" | "EXPIRED" | "CANCELED" {
+  switch (status) {
+    case RedemptionStatus.ISSUED:
+    case "ISSUED":
+      return "ISSUED";
+    case RedemptionStatus.APPLIED:
+    case "APPLIED":
+      return "APPLIED";
+    case RedemptionStatus.EXPIRED:
+    case "EXPIRED":
+      return "EXPIRED";
+    case RedemptionStatus.CANCELLED:
+    case "CANCELLED":
+    case RedemptionStatus.VOID:
+    case "VOID":
+    case "CANCELED":
+      return "CANCELED";
+    case RedemptionStatus.CONSUMED:
+    case "CONSUMED":
+      // The UI contract doesn't expose a distinct "CONSUMED" state; treat as "APPLIED".
+      return "APPLIED";
+    default:
+      return "CANCELED";
+  }
 }
 
-export async function getActiveRedemption(shop: string, customerId: string) {
-  const cid = normalizeCustomerId(customerId);
-  if (!cid) return null;
-
-  const now = new Date();
-  return db.redemption.findFirst({
+async function getActiveRedemption(shop: string, customerId: string) {
+  const r = await db.redemption.findFirst({
     where: {
       shop,
-      customerId: cid,
+      customerId,
       status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] },
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      expiresAt: { gt: new Date() },
     },
-    orderBy: { createdAt: "desc" },
-    select: { code: true, points: true, valueDollars: true, status: true, createdAt: true, expiresAt: true },
+    select: {
+      id: true,
+      code: true,
+      points: true,
+      valueDollars: true,
+      status: true,
+      createdAt: true,
+      expiresAt: true,
+    },
   });
+
+  if (!r) return null;
+
+  return {
+    id: r.id,
+    code: r.code,
+    pointsRedeemed: r.points,
+    discountAmount: r.valueDollars,
+    status: normalizeRedemptionStatus(r.status),
+    expiresAt: (r.expiresAt ?? r.createdAt).toISOString(),
+    createdAt: r.createdAt.toISOString(),
+  } as CustomerLoyaltyPayload["redemption"] extends infer T ? Exclude<T, null> : never;
 }
 
-export async function getCustomerLoyaltyPayload(shop: string, customerId: string) {
-  const cid = normalizeCustomerId(customerId);
-  if (!cid) throw new Error("customerId is required");
+export async function getCustomerLoyaltyPayload(shop: string, customerId: string): Promise<CustomerLoyaltyPayload> {
+  const settings = await getOrCreateShopSettings(shop);
 
-  const [settings, balance, activeRedemption] = await Promise.all([
-    getOrCreateShopSettings(shop),
-    getOrCreateCustomerBalance(shop, cid),
-    getActiveRedemption(shop, cid),
-  ]);
+  const bal = await db.customerPointsBalance.upsert({
+    where: { shop_customerId: { shop, customerId } },
+    create: { shop, customerId },
+    update: {},
+  });
+
+  const activeRedemption = await getActiveRedemption(shop, customerId);
 
   return {
     shop,
-    customerId: cid,
+    customerId,
     points: {
-      balance: balance.balance,
-      lifetimeEarned: balance.lifetimeEarned,
-      lifetimeRedeemed: balance.lifetimeRedeemed,
-      lastActivityAt: balance.lastActivityAt.toISOString(),
-      expireAfterDays: settings.pointsExpireInactivityDays,
+      balance: bal.balance,
+      lifetimeEarned: bal.lifetimeEarned,
+      lifetimeRedeemed: bal.lifetimeRedeemed,
+      lastActivityAt: bal.lastActivityAt ? bal.lastActivityAt.toISOString() : null,
+      expireAfterDays: settings.pointsExpireInactivityDays ?? null,
     },
-    redemption: activeRedemption
-      ? {
-          code: activeRedemption.code,
-          pointsDebited: activeRedemption.points,
-          valueDollars: activeRedemption.valueDollars,
-          status: activeRedemption.status,
-          issuedAt: activeRedemption.createdAt.toISOString(),
-          expiresAt: activeRedemption.expiresAt ? activeRedemption.expiresAt.toISOString() : null,
-        }
-      : null,
+    redemption: activeRedemption,
     settings: {
       earnRate: settings.earnRate,
       minOrderDollars: settings.redemptionMinOrder,
@@ -79,47 +134,7 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
   };
 }
 
-/**
- * Required by routes/loyalty.json.tsx and routes/loyalty.tsx.
- * This is the canonical computation used by the app proxy endpoints.
- *
- * Shape: returns the same base payload as getCustomerLoyaltyPayload,
- * plus recent ledger activity for debug/admin visibility.
- */
-export async function computeCustomerLoyalty(args: { shop: string; customerId?: string | null }) {
-  const shop = String(args?.shop || "").trim();
-  const cid = normalizeCustomerId(String(args?.customerId || "").trim());
-
-  if (!shop) throw new Error("shop is required");
-  if (!cid) throw new Error("customerId is required");
-
-  const base = await getCustomerLoyaltyPayload(shop, cid);
-
-  const recentLedger = await db.pointsLedger.findMany({
-    where: { shop, customerId: cid },
-    orderBy: { createdAt: "desc" },
-    take: 10,
-    select: {
-      type: true,
-      delta: true,
-      source: true,
-      sourceId: true,
-      description: true,
-      createdAt: true,
-    },
-  });
-
-  return {
-    ...base,
-    activity: {
-      recentLedger: recentLedger.map((x) => ({
-        type: x.type,
-        delta: x.delta,
-        source: x.source,
-        sourceId: x.sourceId,
-        description: x.description ?? null,
-        createdAt: x.createdAt.toISOString(),
-      })),
-    },
-  };
+export async function computeCustomerLoyalty(args: { shop: string; customerId: string }) {
+  // Alias retained for backwards compatibility.
+  return getCustomerLoyaltyPayload(args.shop, args.customerId);
 }
