@@ -37,33 +37,59 @@ export default function App() {
   return <Outlet />;
 }
 
+function formatRouteError(error: unknown): { title: string; details?: string } {
+  if (isRouteErrorResponse(error)) {
+    const details =
+      "data" in error && error.data
+        ? (typeof error.data === "string" ? error.data : JSON.stringify(error.data, null, 2))
+        : undefined;
+
+    return {
+      title: `${error.status} ${error.statusText}`,
+      details,
+    };
+  }
+
+  if (error instanceof Error) {
+    return {
+      title: error.name || "Unexpected error",
+      details: error.stack ?? error.message,
+    };
+  }
+
+  return {
+    title: "Unexpected error",
+    details: error ? JSON.stringify(error, null, 2) : undefined,
+  };
+}
 
 export function ErrorBoundary() {
   const error = useRouteError();
-
-  if (isRouteErrorResponse(error)) {
-    return (
-      <Page>
-        <h1>App Error</h1>
-        <p>
-          {error.status} {error.statusText}
-        </p>
-        {"data" in error && error.data ? (
-          <pre style={{ whiteSpace: "pre-wrap" }}>
-            {typeof error.data === "string" ? error.data : JSON.stringify(error.data, null, 2)}
-          </pre>
-        ) : null}
-      </Page>
-    );
-  }
-
-  const message = error instanceof Error ? error.message : JSON.stringify(error, null, 2);
+  const { title, details } = formatRouteError(error);
 
   return (
-    <Page>
-      <h1>App Error</h1>
-      <pre style={{ whiteSpace: "pre-wrap" }}>{message}</pre>
-    </Page>
+    <div style={{
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
+      padding: 24,
+      maxWidth: 980,
+      margin: "0 auto",
+      lineHeight: 1.4,
+    }}>
+      <h1 style={{ margin: "0 0 8px" }}>{title}</h1>
+      <p style={{ margin: "0 0 16px", opacity: 0.8 }}>
+        If you reached this page via Shopify CLI preview, it usually means your preview URL is pointing at the production domain instead of the active dev tunnel.
+      </p>
+      {details ? (
+        <pre style={{
+          whiteSpace: "pre-wrap",
+          background: "rgba(0,0,0,0.04)",
+          padding: 16,
+          borderRadius: 12,
+          overflowX: "auto",
+        }}>
+          {details}
+        </pre>
+      ) : null}
+    </div>
   );
 }
-
