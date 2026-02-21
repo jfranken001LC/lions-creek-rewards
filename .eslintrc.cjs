@@ -1,74 +1,46 @@
-{
-  "name": "lions-creek-rewards",
-  "private": true,
-  "type": "module",
-  "engines": {
-    "node": ">=20.19 <22 || >=22.12"
+/**
+ * ESLint configuration (CJS) for TypeScript + React (React Router SSR).
+ */
+module.exports = {
+  root: true,
+  env: {
+    node: true,
+    browser: true,
+    es2022: true,
   },
-  "scripts": {
-    "build": "react-router build",
-    "dev": "shopify app dev",
-    "config:link": "shopify app config link",
-    "generate": "shopify app generate",
-    "deploy": "shopify app deploy",
-    "config:use": "shopify app config use",
-    "env": "shopify app env",
-    "start": "react-router-serve ./build/server/index.js",
-    "docker-start": "npm run setup && npm run start",
-    "setup": "prisma generate && prisma migrate deploy",
-    "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",
-    "shopify": "shopify",
-    "prisma": "prisma",
-    "graphql-codegen": "graphql-codegen",
-    "vite": "vite",
-    "typecheck": "react-router typegen && tsc --noEmit"
+  parser: "@typescript-eslint/parser",
+  parserOptions: {
+    ecmaVersion: "latest",
+    sourceType: "module",
+    ecmaFeatures: { jsx: true },
   },
-  "dependencies": {
-    "@prisma/client": "^6.16.3",
-    "@react-router/dev": "^7.12.0",
-    "@react-router/fs-routes": "^7.12.0",
-    "@react-router/node": "^7.12.0",
-    "@react-router/serve": "^7.12.0",
-    "@shopify/app-bridge-react": "^4.2.4",
-    "@shopify/polaris": "^13.9.5",
-    "@shopify/shopify-app-react-router": "^1.1.0",
-    "@shopify/shopify-app-session-storage-prisma": "^8.0.0",
-    "isbot": "^5.1.31",
-    "prisma": "^6.16.3",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router": "^7.12.0",
-    "vite-tsconfig-paths": "^5.1.4"
-  },
-  "devDependencies": {
-    "@shopify/api-codegen-preset": "^1.2.0",
-    "@shopify/polaris-types": "^1.0.1",
-    "@types/eslint": "^9.6.1",
-    "@types/node": "^22.18.8",
-    "@types/react": "^18.3.25",
-    "@types/react-dom": "^18.3.7",
-    "@typescript-eslint/eslint-plugin": "^6.21.0",
-    "@typescript-eslint/parser": "^6.21.0",
-    "eslint": "^8.57.1",
-    "eslint-import-resolver-typescript": "^3.10.1",
-    "eslint-plugin-import": "^2.32.0",
-    "eslint-plugin-jsx-a11y": "^6.10.2",
-    "eslint-plugin-react": "^7.37.5",
-    "eslint-plugin-react-hooks": "^4.6.2",
-    "graphql-config": "^5.1.1",
-    "prettier": "^3.6.2",
-    "typescript": "^5.9.3",
-    "vite": "^6.3.6"
-  },
-  "workspaces": {
-    "packages": [
-      "extensions/*"
-    ]
-  },
-  "trustedDependencies": [
-    "@shopify/plugin-cloudflare"
+  plugins: ["@typescript-eslint", "react", "react-hooks", "import", "jsx-a11y"],
+  extends: [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended",
+    "plugin:react/recommended",
+    "plugin:react-hooks/recommended",
+    "plugin:jsx-a11y/recommended",
+    "plugin:import/recommended",
+    "plugin:import/typescript",
   ],
-  "overrides": {
-    "p-map": "^4.0.0"
-  }
-}
+  settings: {
+    react: { version: "detect" },
+    "import/resolver": { typescript: {} },
+  },
+  rules: {
+    "react/react-in-jsx-scope": "off",
+    "@typescript-eslint/no-unused-vars": [
+      "warn",
+      { argsIgnorePattern: "^_", varsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" },
+    ],
+    "import/order": [
+      "warn",
+      {
+        "newlines-between": "always",
+        alphabetize: { order: "asc", caseInsensitive: true },
+      },
+    ],
+  },
+  ignorePatterns: ["build/**", ".react-router/**", ".shopify/**", "node_modules/**"],
+};

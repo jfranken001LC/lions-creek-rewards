@@ -1,0 +1,11 @@
+# /etc/systemd/system/lions-creek-rewards-expire.timer
+[Unit]
+Description=Run Lions Creek Rewards expiry job daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

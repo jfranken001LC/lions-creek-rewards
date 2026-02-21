@@ -10,5 +10,5 @@ webhooks_path = "/webhooks"
 port = 3010
 
 [commands]
-predev = "npx prisma generate"
-dev = "npx prisma migrate deploy && npm exec react-router dev"
+predev = "node scripts/prisma-apply.mjs --generate-only"
+dev = "node scripts/prisma-apply.mjs --apply-only && npm exec react-router dev"

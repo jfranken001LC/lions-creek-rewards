@@ -1,0 +1,26 @@
+# /etc/systemd/system/lions-creek-rewards.service
+[Unit]
+Description=Lions Creek Rewards (Shopify embedded app)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/lions-creek-rewards
+EnvironmentFile=/etc/lions-creek-rewards/lions-creek-rewards.env
+
+# Ensure node resolves local binaries (react-router-serve)
+ExecStart=/usr/bin/env npm run start
+Restart=on-failure
+RestartSec=3
+
+# Security / hygiene (adjust if needed)
+User=www-data
+Group=www-data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/www/lions-creek-rewards
+
+[Install]
+WantedBy=multi-user.target

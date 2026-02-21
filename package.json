@@ -14,10 +14,12 @@
     "build": "react-router build",
     "dev": "shopify app dev",
     "start": "react-router-serve ./build/server/index.js",
-    "setup": "prisma generate && prisma migrate deploy",
+    "setup": "node scripts/prisma-apply.mjs",
     "generate": "prisma generate",
     "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",
-    "typecheck": "react-router typegen && tsc --noEmit"
+    "typecheck": "react-router typegen && tsc --noEmit",
+    "prisma:apply": "node scripts/prisma-apply.mjs --apply-only",
+    "prisma:generate": "node scripts/prisma-apply.mjs --generate-only"
   },
   "dependencies": {
     "@prisma/client": "^6.16.3",

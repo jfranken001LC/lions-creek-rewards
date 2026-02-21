@@ -90,9 +90,24 @@ else
 fi
 
 echo
-echo "==== Prisma generate + migrate deploy ===="
+echo "==== Prisma generate + schema apply (migrate deploy OR db push) ===="
 run_prisma generate
-run_prisma migrate deploy
+
+# If there are committed migrations, deploy them; otherwise push schema (v1.4 runbook).
+if [[ -d "$REPO_DIR/prisma/migrations" ]] && [[ -n "$(ls -A "$REPO_DIR/prisma/migrations" 2>/dev/null || true)" ]]; then
+  # Treat "migration_lock.toml" as not-a-migration; require at least one migration.sql
+  if find "$REPO_DIR/prisma/migrations" -mindepth 2 -maxdepth 2 -name migration.sql | grep -q .; then
+    echo "Migrations detected -> prisma migrate deploy"
+    run_prisma migrate deploy
+  else
+    echo "No migration.sql detected -> prisma db push"
+    run_prisma db push
+  fi
+else
+  echo "No prisma/migrations found -> prisma db push"
+  run_prisma db push
+fi
+
 
 echo
 echo "==== Build ===="

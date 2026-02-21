@@ -21,6 +21,9 @@ database.sqlite
 .env
 .env.*
 
+#repositories
+*.zip
+
 
 /extensions/*/dist
 

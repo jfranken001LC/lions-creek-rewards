@@ -28,6 +28,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         result = await handlePrivacyWebhook(shop, topic, payload);
         break;
 
+      case "app/uninstalled":
+        result = await handleAppUninstalled(shop);
+        break;
+
       case "orders/paid":
         result = await handleOrdersPaid({ shop, payload, admin });
         break;
@@ -97,6 +101,8 @@ async function ensureWebhookEventRow(args: {
   }
 }
 
+
+
 function extractResourceId(topic: string, payload: any): string {
   switch (topic) {
     case "orders/paid":
@@ -104,6 +110,8 @@ function extractResourceId(topic: string, payload: any): string {
       return String(payload?.id ?? payload?.order_id ?? "unknown");
     case "refunds/create":
       return String(payload?.id ?? payload?.order_id ?? "unknown");
+    case "app/uninstalled":
+      return String(payload?.id ?? payload?.shop_id ?? "unknown");
     default:
       return String(payload?.id ?? "unknown");
   }
