@@ -6,6 +6,15 @@ function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
   const normalized = origin.replace(/\/$/, "");
 
+  // Customer Account UI extensions and Customer Account pages can be served from several
+  // Shopify-owned domains and can involve redirects/custom URLs depending on store configuration.
+  // These endpoints are still protected by a short-lived Customer Account session token (Bearer),
+  // so it is safe (and much more robust) to allow any HTTPS origin here.
+  if (normalized.startsWith("https://")) return true;
+
+  // Local tooling convenience.
+  if (normalized.startsWith("http://localhost") || normalized.startsWith("http://127.0.0.1")) return true;
+
   // Your app's own origin (useful for local testing/tools)
   if (SHOPIFY_APP_URL && normalized === SHOPIFY_APP_URL) return true;
 

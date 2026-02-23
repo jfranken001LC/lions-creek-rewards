@@ -42,6 +42,9 @@ export async function action({ request }: ActionFunctionArgs) {
     const res = Response.json(issued, { status: issued.ok ? 200 : 400 });
     return applyCustomerAccountCors(request, res);
   } catch (e: any) {
+    if (e instanceof Response) {
+      return applyCustomerAccountCors(request, e);
+    }
     const res = Response.json({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
     return applyCustomerAccountCors(request, res);
   }
