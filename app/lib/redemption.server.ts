@@ -262,7 +262,8 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
     eligibleCollectionGid,
     startsAt: now.toISOString(),
     endsAt: expires.toISOString(),
-    minOrderDollars: settings.redemptionMinOrder,
+    // Stored as cents in ShopSettings; Shopify expects dollars.
+    minOrderDollars: (settings.redemptionMinOrder ?? 0) / 100,
   });
 
   if (!created.ok) return { ok: false, error: created.error };

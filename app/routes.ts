@@ -36,5 +36,6 @@ export default [
     route("reports", "routes/app.reports.tsx"),
     route("settings", "routes/app.settings.tsx"),
     route("webhooks", "routes/app.webhooks.tsx"),
+    route("support", "routes/app.support.tsx"),
   ]),
 ] satisfies RouteConfig;

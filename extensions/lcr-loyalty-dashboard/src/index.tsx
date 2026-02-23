@@ -29,10 +29,23 @@ type LoyaltyPayloadOk = {
         createdAt: string;
       }
     | null;
+  redemptionOptions: Array<{
+    points: number;
+    valueDollars: number;
+    canRedeem: boolean;
+  }>;
+  recentActivity: Array<{
+    id: string;
+    type: string;
+    delta: number;
+    description: string | null;
+    createdAt: string;
+  }>;
   settings: {
     earnRate: number;
     minOrderDollars: number;
     redemptionExpiryHours: number;
+    preventMultipleActiveRedemptions: boolean;
     redemptionSteps: number[];
     redemptionValueMap: Record<string, number>;
   };
@@ -63,6 +76,7 @@ type RedemptionOption = {
   points: number;
   dollars: number;
   label: string;
+  canRedeem: boolean;
 };
 
 export default async () => {
@@ -93,6 +107,19 @@ function Extension() {
 
   const redemptionOptions = useMemo(() => {
     if (!payload) return [];
+    // Prefer server-provided options (already includes canRedeem logic).
+    if (Array.isArray((payload as any).redemptionOptions) && payload.redemptionOptions.length) {
+      return payload.redemptionOptions
+        .map((o) => ({
+          points: Number(o.points),
+          dollars: Number(o.valueDollars),
+          canRedeem: Boolean(o.canRedeem),
+          label: `${formatNumber(o.points)} points → ${formatCurrency(o.valueDollars)} off`,
+        }))
+        .filter((o) => o.points > 0 && o.dollars > 0)
+        .sort((a, b) => a.points - b.points);
+    }
+    // Backwards compatibility fallback.
     return buildRedemptionOptions(payload.settings);
   }, [payload]);
 
@@ -119,9 +146,8 @@ function Extension() {
 
       if (!appBaseUrl) {
         setLoading(false);
-        setError(
-          'Missing App Base URL. Ask the merchant to set the "App Base URL" setting for this extension.',
-        );
+        setPayload(null);
+        setError(null);
         return;
       }
 
@@ -201,6 +227,20 @@ function Extension() {
 
   return (
     <s-page heading="Lions Creek Rewards" subheading="Earn points on every order. Redeem points for discounts.">
+      {!appBaseUrl ? (
+        <s-banner tone="info" heading="Rewards not configured yet">
+          <s-stack direction="block" gap="base">
+            <s-text>
+              This rewards dashboard needs one store setting before it can load your points.
+            </s-text>
+            <s-text type="small">
+              Store staff: open Shopify Admin → Apps → Lions Creek Rewards → Support &amp; Setup, then set the Customer Account
+              extension setting “App Base URL” to your current environment.
+            </s-text>
+          </s-stack>
+        </s-banner>
+      ) : null}
+
       {error ? (
         <s-banner tone="critical" heading="Something went wrong">
           <s-text>{error}</s-text>
@@ -282,16 +322,26 @@ function Extension() {
 
                   <s-button
                     variant="primary"
-                    disabled={redeeming || !selectedPoints || selectedPoints > available}
+                    disabled={redeeming || !selectedPoints || !redemptionOptions.find((o) => o.points === selectedPoints)?.canRedeem}
                     loading={redeeming}
                     onClick={onRedeem}
                   >
                     Redeem
                   </s-button>
 
-                  {selectedPoints && selectedPoints > available ? (
-                    <s-text type="small">You don’t have enough points for that reward.</s-text>
-                  ) : null}
+                  {selectedPoints ? (() => {
+                    const opt = redemptionOptions.find((o) => o.points === selectedPoints) || null;
+                    if (!opt) return null;
+                    if (opt.canRedeem) return null;
+                    const hasActive = Boolean(payload.redemption && payload.redemption.status === 'ISSUED');
+                    if (hasActive && payload.settings.preventMultipleActiveRedemptions) {
+                      return <s-text type="small">You already have an active discount code. Use it at checkout before redeeming again.</s-text>;
+                    }
+                    if (opt.points > available) {
+                      return <s-text type="small">You don’t have enough points for that reward.</s-text>;
+                    }
+                    return <s-text type="small">This reward is not currently available.</s-text>;
+                  })() : null}
 
                   <s-text type="small">
                     Earn rate: {formatNumber(payload.settings.earnRate)} point(s) per {formatCurrency(1)} spent · Minimum
@@ -301,6 +351,23 @@ function Extension() {
               )}
             </s-stack>
           </s-section>
+
+          {Array.isArray(payload.recentActivity) && payload.recentActivity.length ? (
+            <s-section heading="Recent activity">
+              <s-stack direction="block" gap="base">
+                {payload.recentActivity.slice(0, 5).map((a) => (
+                  <s-stack key={a.id} direction="block" gap="tight">
+                    <s-text>
+                      {a.delta >= 0 ? '+' : ''}{formatNumber(a.delta)} ({a.type})
+                    </s-text>
+                    <s-text type="small">
+                      {a.description ? a.description : ''}{a.description ? ' · ' : ''}{formatDate(a.createdAt)}
+                    </s-text>
+                  </s-stack>
+                ))}
+              </s-stack>
+            </s-section>
+          ) : null}
         </>
       ) : null}
     </s-page>
@@ -369,6 +436,7 @@ function buildRedemptionOptions(settings: LoyaltyPayloadOk['settings']): Redempt
       return {
         points,
         dollars,
+        canRedeem: true,
         label: `${formatNumber(points)} points → ${formatCurrency(dollars)} off`,
       };
     })

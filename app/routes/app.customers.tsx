@@ -42,7 +42,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     expiredAt: r.expiredAt ? r.expiredAt.toISOString() : null,
   }));
 
-  return data({ q, rows: dataRows });
+  return data({ shop, q, rows: dataRows });
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -89,7 +89,7 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function CustomersPage() {
-  const { rows, q } = useLoaderData<typeof loader>();
+  const { shop, rows, q } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const nav = useNavigation();
@@ -103,10 +103,9 @@ export default function CustomersPage() {
   const busy = nav.state !== "idle";
 
   const runSearch = () => {
-    const url = new URL(window.location.href);
-    if (search.trim()) url.searchParams.set("q", search.trim());
-    else url.searchParams.delete("q");
-    window.location.assign(url.toString());
+    const fd = new FormData();
+    if (search.trim()) fd.set("q", search.trim());
+    submit(fd, { method: "get" });
   };
 
   const openAdjust = (customerId: string) => {
@@ -163,7 +162,18 @@ export default function CustomersPage() {
                     <IndexTable.Cell>{r.lifetimeRedeemed}</IndexTable.Cell>
                     <IndexTable.Cell>{new Date(r.lastActivityAt).toLocaleString()}</IndexTable.Cell>
                     <IndexTable.Cell>{r.expiredAt ? new Date(r.expiredAt).toLocaleDateString() : ""}</IndexTable.Cell>
-                    <IndexTable.Cell><Button size="micro" onClick={() => openAdjust(r.customerId)}>Adjust</Button></IndexTable.Cell>
+                    <IndexTable.Cell>
+                      <InlineStack gap="200">
+                        <Button
+                          size="micro"
+                          url={`https://${shop}/admin/customers/${encodeURIComponent(r.customerId)}`}
+                          external
+                        >
+                          Open
+                        </Button>
+                        <Button size="micro" onClick={() => openAdjust(r.customerId)}>Adjust</Button>
+                      </InlineStack>
+                    </IndexTable.Cell>
                   </IndexTable.Row>
                 ))}
               </IndexTable>

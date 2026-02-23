@@ -3,22 +3,43 @@ import { data, useLoaderData } from "react-router";
 import { Page, Layout, Card, Text, BlockStack, InlineStack, Badge } from "@shopify/polaris";
 import db from "../db.server";
 import { requireAdmin } from "../lib/shopify.server";
+import { getOrCreateShopSettings } from "../lib/shopSettings.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const session = await requireAdmin(request);
   const shop = session.shop;
 
-  const [customerCount, redemptionCount, unprocessedWebhooks] = await Promise.all([
+  const [settings, customerCount, redemptionCount, unprocessedWebhooks, lastWebhook] = await Promise.all([
+    getOrCreateShopSettings(shop),
     db.customerPointsBalance.count({ where: { shop } }),
     db.redemption.count({ where: { shop } }),
     db.webhookEvent.count({ where: { shop, processedAt: null } }),
+    db.webhookEvent.findFirst({ where: { shop }, orderBy: { receivedAt: "desc" }, select: { receivedAt: true, outcome: true } }),
   ]);
 
-  return data({ shop, customerCount, redemptionCount, unprocessedWebhooks });
+  return data({
+    shop,
+    customerCount,
+    redemptionCount,
+    unprocessedWebhooks,
+    lastWebhookAt: lastWebhook?.receivedAt ? lastWebhook.receivedAt.toISOString() : null,
+    lastWebhookOutcome: lastWebhook?.outcome ? String(lastWebhook.outcome) : null,
+    eligibleCollectionHandle: settings.eligibleCollectionHandle,
+    eligibleCollectionGid: settings.eligibleCollectionGid,
+  });
 }
 
 export default function AppIndex() {
-  const { shop, customerCount, redemptionCount, unprocessedWebhooks } = useLoaderData<typeof loader>();
+  const {
+    shop,
+    customerCount,
+    redemptionCount,
+    unprocessedWebhooks,
+    lastWebhookAt,
+    lastWebhookOutcome,
+    eligibleCollectionHandle,
+    eligibleCollectionGid,
+  } = useLoaderData<typeof loader>();
 
   return (
     <Page title="Lions Creek Rewards">
@@ -33,6 +54,50 @@ export default function AppIndex() {
               <InlineStack align="space-between"><Text as="p">Tracked customers</Text><Text as="p" variant="headingLg">{customerCount}</Text></InlineStack>
               <InlineStack align="space-between"><Text as="p">Redemptions</Text><Text as="p" variant="headingLg">{redemptionCount}</Text></InlineStack>
               <InlineStack align="space-between"><Text as="p">Unprocessed webhook events</Text><Text as="p" variant="headingLg">{unprocessedWebhooks}</Text></InlineStack>
+              <InlineStack align="space-between">
+                <Text as="p">Last webhook received</Text>
+                <Text as="p" variant="bodyMd">
+                  {lastWebhookAt ? new Date(lastWebhookAt).toLocaleString() : "(none)"}{" "}
+                  {lastWebhookOutcome ? <Badge tone={lastWebhookOutcome === "FAILED" ? "critical" : lastWebhookOutcome === "PROCESSED" ? "success" : "info"}>{lastWebhookOutcome}</Badge> : null}
+                </Text>
+              </InlineStack>
+            </BlockStack>
+          </Card>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card>
+            <BlockStack gap="300">
+              <Text as="h2" variant="headingMd">Getting started</Text>
+
+              <BlockStack gap="200">
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="p">1) Configure program settings</Text>
+                  <InlineStack gap="200" blockAlign="center">
+                    <Badge tone={eligibleCollectionHandle?.trim() ? "success" : "critical"}>{eligibleCollectionHandle?.trim() ? "Set" : "Missing"}</Badge>
+                    <Badge tone={eligibleCollectionGid ? "success" : "attention"}>{eligibleCollectionGid ? "GID cached" : "Needs save"}</Badge>
+                  </InlineStack>
+                </InlineStack>
+                <Text as="p" tone="subdued">Open <a href="/app/settings">Settings</a> to set your eligible collection handle, earn rate, and redemption mapping.</Text>
+
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="p">2) Enable customer account extension</Text>
+                  <Badge tone="info">Manual check</Badge>
+                </InlineStack>
+                <Text as="p" tone="subdued">Ensure the extension setting <b>App Base URL</b> points to the correct environment (dev tunnel vs production domain).</Text>
+
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="p">3) Verify webhooks</Text>
+                  <Badge tone={unprocessedWebhooks > 0 ? "attention" : "success"}>{unprocessedWebhooks > 0 ? "Queue" : "OK"}</Badge>
+                </InlineStack>
+                <Text as="p" tone="subdued">Use <a href="/app/webhooks">Webhooks</a> to confirm events are being processed and investigate failures.</Text>
+
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="p">4) Schedule expiry job</Text>
+                  <Badge tone="info">Manual check</Badge>
+                </InlineStack>
+                <Text as="p" tone="subdued">Schedule a daily call to <code>GET /jobs/expire</code> using your <code>JOB_TOKEN</code>.</Text>
+              </BlockStack>
             </BlockStack>
           </Card>
         </Layout.Section>

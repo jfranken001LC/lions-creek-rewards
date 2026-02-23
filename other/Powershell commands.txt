@@ -12,20 +12,5 @@ Stop-Transcript
 shopify app dev clean -s lions-creek-dev-3.myshopify.com
 
 
-shopify app dev --reset 
+shopify app dev --store lions-creek-dev-3.myshopify.com --reset
 
-
-
-shopify app dev --use-localhost
-
-shopify app dev --store lions-creek-dev-3.myshopify.com --tunnel-url https://loyalty.basketbooster.ca:433
-
-
-# Cloudflare not found
-Get-NetAdapter | Where-Object Status -eq "Up"
-Set-DnsClientServerAddress -InterfaceIndex <INDEX> -ServerAddresses ("1.1.1.1","1.0.0.1")
-ipconfig /flushdns
-
-
-cloudflared tunnel --url http://localhost:3010
-shopify app dev --store lions-creek-dev-3.myshopify.com --tunnel-url https://collaboration-conditional-versus-schedule.trycloudflare.com:443
