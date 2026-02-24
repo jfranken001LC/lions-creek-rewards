@@ -289,9 +289,18 @@ async function fetchProductEligibilityMap(args: {
     });
   }
 
+  // Ensure every requested product id has an entry.
+  // Shopify nodes() can return null (e.g., deleted product, permissions, transient API issues).
+  // We default unknown products to eligible-by-default with no tags and not excluded-by-collection.
+  // Tag include filters will still exclude these (since tags=[]), which is the safest default.
+  for (const pid of numericProductIds ?? []) {
+    if (!map.has(pid)) {
+      map.set(pid, { tags: [], isExcludedByCollection: false });
+    }
+  }
+
   return map;
 }
-
 
 function collectProductIdsFromOrder(orderPayload: any) {
   const ids = new Set<string>();
@@ -327,8 +336,8 @@ function computeEligibleNetMerchCents(args: {
 
     if (args.excludedProductIds.has(pid)) continue;
 
-    const info = args.productEligibility.get(pid);
-    if (info?.isExcludedByCollection) continue;
+    const info = args.productEligibility.get(pid) ?? { tags: [], isExcludedByCollection: false };
+    if (info.isExcludedByCollection) continue;
     if (!isProductEligibleByTags(info.tags, include, exclude)) continue;
 
     total += net;
@@ -370,8 +379,8 @@ function computeEligibleRefundCents(args: {
 
     if (args.excludedProductIds.has(pid)) continue;
 
-    const info = args.productEligibility.get(pid);
-    if (info?.isExcludedByCollection) continue;
+    const info = args.productEligibility.get(pid) ?? { tags: [], isExcludedByCollection: false };
+    if (info.isExcludedByCollection) continue;
     if (!isProductEligibleByTags(info.tags, include, exclude)) continue;
 
     total += net;
