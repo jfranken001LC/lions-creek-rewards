@@ -9,7 +9,7 @@ export default function Support() {
         <a href="mailto:Support@TwoMenOnAYellowCouch.com">Support@TwoMenOnAYellowCouch.com</a>.
       </p>
 
-      <h2>How it works (v1.2)</h2>
+      <h2>How it works (v1.6)</h2>
       <ul>
         <li>
           <strong>Earn:</strong> Points are awarded from Shopify order events (via webhooks), based on eligible net
@@ -24,8 +24,8 @@ export default function Support() {
           Account dashboard. One active code per customer at a time.
         </li>
         <li>
-          <strong>Expiry:</strong> Unused codes expire and points are restored. Points also expire after 12 months of
-          inactivity (enforced by a scheduled job).
+          <strong>Expiry:</strong> Issued discount codes expire after the configured window. Points expire after the
+          configured inactivity window (enforced by a scheduled job).
         </li>
       </ul>
 
@@ -54,11 +54,11 @@ export default function Support() {
           <strong>Webhooks:</strong> <code>/webhooks</code>
         </li>
         <li>
-          <strong>Expiry job:</strong> <code>POST /jobs/expire</code> (use <code>X-Job-Token</code> or{" "}
+          <strong>Expiry job:</strong> <code>GET /jobs/expire</code> (use <code>X-Job-Token</code> or{" "}
           <code>Authorization: Bearer</code> if <code>JOB_TOKEN</code> is set)
         </li>
         <li>
-          <strong>Customer Account API:</strong> <code>POST /api/customer/loyalty</code> and{" "}
+          <strong>Customer Account API:</strong> <code>GET /api/customer/loyalty</code> and{" "}
           <code>POST /api/customer/redeem</code> (requires customer account session token)
         </li>
       </ul>
@@ -66,8 +66,7 @@ export default function Support() {
       <h2>Setup checklist</h2>
       <ol>
         <li>
-          <strong>Admin settings:</strong> Open the app in Shopify Admin → configure earn rate, eligible collection
-          handle, redemption mapping (points → $ value), and exclusions (tags).
+          <strong>Admin settings:</strong> Open the app in Shopify Admin → configure earn rate, redemption mapping (points → $ value), and optional exclusions (excluded collections/products and/or tags). The discount-scope collection handle is optional (blank = discount applies to all products).
         </li>
         <li>
           <strong>Customer Account page:</strong> Ensure the Customer Account UI extension is deployed and enabled in the
@@ -78,28 +77,25 @@ export default function Support() {
           Shopify privacy topics). The app’s webhook handler is <code>/webhooks</code>.
         </li>
         <li>
-          <strong>Expiry job:</strong> Schedule a daily <code>POST</code> to <code>/jobs/expire</code>. If{" "}
-          <code>JOB_TOKEN</code> is configured on the server, include <code>X-Job-Token</code> (or Bearer auth).
+          <strong>Expiry job:</strong> Schedule a daily <code>GET</code> to <code>/jobs/expire</code>. If <code>JOB_TOKEN</code> is
+          configured on the server, include <code>X-Job-Token</code> (or Bearer auth).
         </li>
       </ol>
 
       <h2>Common issues</h2>
       <ul>
         <li>
-          <strong>Redemption fails:</strong> Common causes are insufficient points, a missing eligible collection handle,
-          or a points amount that isn’t in the configured redemption steps.
+          <strong>Redemption fails:</strong> Common causes are insufficient points, a points amount that isn’t in the configured redemption steps, or an overly-restrictive discount scope (if you set a discount-scope collection handle).
         </li>
         <li>
           <strong>“I already have a code”:</strong> The system enforces one active code at a time. Use the existing code
           before creating a new one.
         </li>
         <li>
-          <strong>No points awarded:</strong> The order must have a customer (not guest), and the customer/products must
-          not be excluded by configured tags.
+          <strong>No points awarded:</strong> The order must have a customer (not guest). Points are earned on all products by default, unless excluded by configured excluded collections/products and/or tags.
         </li>
         <li>
-          <strong>Code doesn’t apply at checkout:</strong> Ensure the cart contains eligible products (in the configured
-          eligible collection) and meets any minimum order requirement.
+          <strong>Code doesn’t apply at checkout:</strong> If you set a discount-scope collection handle, ensure the cart contains products from that collection and meets any minimum order requirement. If the discount scope is blank, the code applies to all products.
         </li>
       </ul>
     </main>

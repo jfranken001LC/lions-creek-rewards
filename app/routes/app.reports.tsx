@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { data, useLoaderData } from "react-router";
-import { Page, Layout, Card, BlockStack, Text, Button } from "@shopify/polaris";
+import { Page, Layout, Card, BlockStack, Text, Button, DataTable } from "@shopify/polaris";
 import db from "../db.server";
 import { requireAdmin } from "../lib/shopify.server";
 
@@ -78,6 +78,14 @@ export async function action({ request }: ActionFunctionArgs) {
 export default function ReportsPage() {
   const { shop, stats } = useLoaderData<typeof loader>();
 
+  const rows = [
+    ["EARN", String(stats.ledger.earn.count), String(stats.ledger.earn.sum)],
+    ["REDEEM", String(stats.ledger.redeem.count), String(stats.ledger.redeem.sum)],
+    ["EXPIRY", String(stats.ledger.expiry.count), String(stats.ledger.expiry.sum)],
+    ["REVERSAL", String(stats.ledger.reversal.count), String(stats.ledger.reversal.sum)],
+    ["ADJUST", String(stats.ledger.adjust.count), String(stats.ledger.adjust.sum)],
+  ];
+
   return (
     <Page title="Reports">
       <Layout>
@@ -88,42 +96,11 @@ export default function ReportsPage() {
                 Shop: <strong>{shop}</strong>
               </Text>
 
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    <th align="left">Type</th>
-                    <th align="right">Count</th>
-                    <th align="right">Delta</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>EARN</td>
-                    <td align="right">{stats.ledger.earn.count}</td>
-                    <td align="right">{stats.ledger.earn.sum}</td>
-                  </tr>
-                  <tr>
-                    <td>REDEEM</td>
-                    <td align="right">{stats.ledger.redeem.count}</td>
-                    <td align="right">{stats.ledger.redeem.sum}</td>
-                  </tr>
-                  <tr>
-                    <td>Expiry</td>
-                    <td align="right">{stats.ledger.expiry.count}</td>
-                    <td align="right">{stats.ledger.expiry.sum}</td>
-                  </tr>
-                  <tr>
-                    <td>REVERSAL</td>
-                    <td align="right">{stats.ledger.reversal.count}</td>
-                    <td align="right">{stats.ledger.reversal.sum}</td>
-                  </tr>
-                  <tr>
-                    <td>ADJUST</td>
-                    <td align="right">{stats.ledger.adjust.count}</td>
-                    <td align="right">{stats.ledger.adjust.sum}</td>
-                  </tr>
-                </tbody>
-              </table>
+              <DataTable
+                columnContentTypes={["text", "numeric", "numeric"]}
+                headings={["Type", "Count", "Delta"]}
+                rows={rows}
+              />
 
               <Text as="p" variant="bodyMd">
                 Customers: <strong>{stats.totalCustomers}</strong> • Redemptions: <strong>{stats.totalRedemptions}</strong>

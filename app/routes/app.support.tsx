@@ -26,6 +26,8 @@ type LoaderData = {
     pointsExpireInactivityDays: number;
     redemptionExpiryHours: number;
     preventMultipleActiveRedemptions: boolean;
+    excludedCollectionHandles: string[];
+    excludedProductIds: string[];
   };
   webhooks: {
     lastReceivedAt: string | null;
@@ -66,6 +68,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
       pointsExpireInactivityDays: settings.pointsExpireInactivityDays,
       redemptionExpiryHours: settings.redemptionExpiryHours,
       preventMultipleActiveRedemptions: settings.preventMultipleActiveRedemptions,
+      excludedCollectionHandles: settings.excludedCollectionHandles ?? [],
+      excludedProductIds: settings.excludedProductIds ?? [],
     },
     webhooks: {
       lastReceivedAt: lastEvent?.receivedAt ? lastEvent.receivedAt.toISOString() : null,
@@ -85,8 +89,9 @@ export default function AppSupportPage() {
   const { shop, settings, webhooks } = useLoaderData<typeof loader>();
 
   const setupWarnings: string[] = [];
-  if (!settings.eligibleCollectionHandle?.trim()) setupWarnings.push("Eligible collection handle is empty.");
-  if (!settings.eligibleCollectionGid) setupWarnings.push("Eligible collection GID is not cached yet (save settings to resolve).");
+  // Discount-scope collection is optional in v1.6+. Only warn if a handle is set but the GID is missing.
+  if (settings.eligibleCollectionHandle?.trim() && !settings.eligibleCollectionGid)
+    setupWarnings.push("Discount-scope collection handle is set but the collection GID is not cached yet (save settings to resolve).");
   if (webhooks.failedLast24h > 0) setupWarnings.push(`Webhook failures in last 24h: ${webhooks.failedLast24h}.`);
   if (webhooks.unprocessed > 0) setupWarnings.push(`Unprocessed webhook events: ${webhooks.unprocessed}.`);
 
@@ -139,8 +144,7 @@ export default function AppSupportPage() {
               </Text>
               <List type="number">
                 <List.Item>
-                  Configure the program in <Link to="/app/settings">Settings</Link> (earn rate, eligible collection handle,
-                  redemption steps/value map, and exclusions).
+                  Configure the program in <Link to="/app/settings">Settings</Link> (earn rate, redemption steps/value map, and optional exclusions). Set a discount-scope collection handle only if you want redemption codes to apply to a specific collection.
                 </List.Item>
                 <List.Item>
                   Enable the Customer Account UI extension in your store’s customer accounts. Ensure the extension setting
@@ -172,10 +176,10 @@ export default function AppSupportPage() {
                   Minimum order to redeem: <b>${dollarsFromCents(settings.redemptionMinOrderCents)}</b>
                 </List.Item>
                 <List.Item>
-                  Eligible collection handle: <b>{settings.eligibleCollectionHandle}</b>
+                  Discount-scope collection handle: <b>{settings.eligibleCollectionHandle}</b>
                 </List.Item>
                 <List.Item>
-                  Eligible collection GID cached: <b>{settings.eligibleCollectionGid ? "Yes" : "No"}</b>
+                  Discount-scope collection GID cached: <b>{settings.eligibleCollectionGid ? "Yes" : "No"}</b>
                 </List.Item>
                 <List.Item>
                   Discount code expiry: <b>{settings.redemptionExpiryHours}</b> hour(s)
@@ -185,6 +189,12 @@ export default function AppSupportPage() {
                 </List.Item>
                 <List.Item>
                   Prevent multiple active redemptions: <b>{settings.preventMultipleActiveRedemptions ? "On" : "Off"}</b>
+                </List.Item>
+                <List.Item>
+                  Excluded collections: <b>{settings.excludedCollectionHandles.length}</b>
+                </List.Item>
+                <List.Item>
+                  Excluded products: <b>{settings.excludedProductIds.length}</b>
                 </List.Item>
               </List>
             </BlockStack>

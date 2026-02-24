@@ -8,11 +8,13 @@ import {
   Select,
   TextField,
   Button,
+  Banner,
 } from "@shopify/polaris";
 import type { LoaderFunctionArgs } from "react-router";
-import { useLoaderData, useSubmit } from "react-router";
+import type { ActionFunctionArgs } from "react-router";
+import { data, Form, useActionData, useLoaderData, useSubmit } from "react-router";
 import { useMemo, useState } from "react";
-import { authenticate } from "../shopify.server";
+import { authenticate, registerWebhooks } from "../shopify.server";
 import db from "../db.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -47,8 +49,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return { events, filters: { outcome, topic, resourceId } };
 };
 
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+  const form = await request.formData();
+  const intent = String(form.get("intent") ?? "");
+
+  if (intent !== "register") {
+    return data({ ok: false, error: "Unknown action" }, { status: 400 });
+  }
+
+  try {
+    await registerWebhooks({ session });
+    return data({ ok: true, message: "Webhook subscriptions re-registered." });
+  } catch (e: any) {
+    return data({ ok: false, error: String(e?.message ?? e) }, { status: 500 });
+  }
+};
+
 export default function WebhooksLogPage() {
   const { events, filters } = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
   const submit = useSubmit();
 
   const [topic, setTopic] = useState(filters.topic);
@@ -111,7 +131,15 @@ export default function WebhooksLogPage() {
           <TextField label="Resource ID" value={resourceId} onChange={(v) => setResourceId(v)} autoComplete="off" />
 
           <Button onClick={runSearch}>Search</Button>
+
+          <Form method="post">
+            <input type="hidden" name="intent" value="register" />
+            <Button submit>Re-register webhooks</Button>
+          </Form>
         </InlineStack>
+
+        {actionData?.ok === true ? <Banner tone="success">{actionData.message}</Banner> : null}
+        {actionData?.ok === false ? <Banner tone="critical">{actionData.error}</Banner> : null}
 
         <Text as="p" tone="subdued">
           Latest webhook events received and how they were handled.
