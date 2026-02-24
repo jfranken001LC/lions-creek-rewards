@@ -66,20 +66,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return new Response("unauthorized", { status: 401 });
   }
 
-  const resourceId = extractResourceId(topic, payload);
+  const rawTopic = topic;
+  const topicNormalized = normalizeTopic(rawTopic);
+
+  const resourceId = extractResourceId(topicNormalized, payload);
 
   // Deduplicate first. If we already have this webhookId for this shop, do nothing.
-  const created = await ensureWebhookEventRow({ shop, webhookId, topic, resourceId, payload });
+  const created = await ensureWebhookEventRow({ shop, webhookId, topic: rawTopic, resourceId, payload });
   if (!created) return new Response("ok", { status: 200 });
 
   try {
     let result: HandleResult;
 
-    switch (topic) {
+    switch (topicNormalized) {
       case "customers/data_request":
       case "customers/redact":
       case "shop/redact":
-        result = await handlePrivacyWebhook(shop, topic, payload);
+        result = await handlePrivacyWebhook(shop, topicNormalized, payload);
         break;
 
       case "app/uninstalled":
@@ -99,7 +102,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         break;
 
       default:
-        result = { outcome: "SKIPPED", message: `Unhandled topic ${topic}` };
+        result = { outcome: "SKIPPED", message: `Unhandled topic ${rawTopic} (normalized=${topicNormalized})` };
         break;
     }
 
@@ -110,7 +113,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     return new Response("ok", { status: 200 });
   } catch (e: any) {
-    console.error("Webhook processing error:", { shop, topic, webhookId, error: e });
+    console.error("Webhook processing error:", { shop, topic: rawTopic, topicNormalized, webhookId, error: e });
 
     await db.webhookEvent.update({
       where: { shop_webhookId: { shop, webhookId } },
@@ -125,7 +128,7 @@ try {
   await db.webhookError.create({
     data: {
       shop,
-      topic,
+      topic: rawTopic,
       webhookId,
       resourceId,
       errorMessage: String(e?.message ?? e ?? "Unknown error").slice(0, 1000),
@@ -142,7 +145,7 @@ try {
     return new Response("error", { status: 200 });
   } finally {
     const ms = Date.now() - started.getTime();
-    if (ms > 4000) console.warn(`Webhook ${topic} (${webhookId}) took ${ms}ms`);
+    if (ms > 4000) console.warn(`Webhook ${rawTopic} (normalized=${topicNormalized}) (${webhookId}) took ${ms}ms`);
   }
 };
 
@@ -172,6 +175,28 @@ async function ensureWebhookEventRow(args: {
   }
 }
 
+
+
+function normalizeTopic(topic: string): string {
+  const t = (topic ?? "").trim();
+  if (!t) return t;
+  // REST-style topics like "orders/paid"
+  if (t.includes("/")) return t.toLowerCase();
+
+  // GraphQL enum topics like "ORDERS_PAID"
+  const upper = t.toUpperCase();
+  const map: Record<string, string> = {
+    ORDERS_PAID: "orders/paid",
+    ORDERS_CANCELLED: "orders/cancelled",
+    REFUNDS_CREATE: "refunds/create",
+    APP_UNINSTALLED: "app/uninstalled",
+    CUSTOMERS_DATA_REQUEST: "customers/data_request",
+    CUSTOMERS_REDACT: "customers/redact",
+    SHOP_REDACT: "shop/redact",
+  };
+
+  return map[upper] ?? t.toLowerCase();
+}
 
 
 function extractResourceId(topic: string, payload: any): string {
