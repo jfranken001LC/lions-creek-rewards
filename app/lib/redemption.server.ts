@@ -86,43 +86,101 @@ async function createDiscount(args: {
       ? { subtotal: { greaterThanOrEqualToSubtotal: formatMoney(minOrder) } }
       : undefined;
 
-  const variables: Record<string, any> = {
-    basicCodeDiscount: {
+  function buildBasicCodeDiscountInput(
+    mode: "customerSelection" | "context",
+    includeCombinesWith: boolean,
+  ): Record<string, any> {
+    const base: Record<string, any> = {
       title: args.title,
       code: args.discountCode,
       startsAt: args.startsAt,
       endsAt: args.endsAt,
 
-      // Required in modern API versions (deprecated customerSelection is intentionally avoided)
-      context: { all: "ALL" },
-
       // Minimum order requirement (subtotal) if configured
       ...(minimumRequirement ? { minimumRequirement } : {}),
 
-      // Fixed amount off (applies to eligible collection)
+      // Fixed amount off (optionally scoped to a collection)
       customerGets: {
-        value: { discountAmount: { amount: formatMoney(args.valueDollars), appliesOnEachItem: false } },
-        items: args.eligibleCollectionGid ? { collections: { add: [args.eligibleCollectionGid] } } : { all: true },
+        value: {
+          discountAmount: { amount: formatMoney(args.valueDollars), appliesOnEachItem: false },
+        },
+        items: args.eligibleCollectionGid
+          ? { collections: { add: [args.eligibleCollectionGid] } }
+          : { all: true },
       },
 
       usageLimit: 1,
+    };
 
-      combinesWith: {
+    // Buyer targeting: prefer deprecated customerSelection for maximum compatibility.
+    // If the store/API version doesn't support it, we fall back to context.
+    if (mode === "customerSelection") {
+      base.customerSelection = { all: true };
+    } else {
+      base.context = { all: "ALL" };
+    }
+
+    if (includeCombinesWith) {
+      base.combinesWith = {
         orderDiscounts: true,
         productDiscounts: true,
         shippingDiscounts: true,
-      },
-    },
-  };
+      };
+    }
 
-  const res = await args.adminGraphql(mutation, { variables });
-  const json = (await res.json().catch(() => null)) as any;
-
-  const topErr = json?.errors?.[0]?.message;
-  const userErr = json?.data?.discountCodeBasicCreate?.userErrors?.[0]?.message;
-  if (!res.ok || topErr || userErr) {
-    return { ok: false, error: String(userErr || topErr || `HTTP ${res.status}`) };
+    return base;
   }
+
+  async function runCreate(basicCodeDiscount: Record<string, any>): Promise<{ ok: true; json: any } | { ok: false; error: string }> {
+    const res = await args.adminGraphql(mutation, { variables: { basicCodeDiscount } });
+    const json = (await res.json().catch(() => null)) as any;
+
+    const topErr = json?.errors?.[0]?.message;
+    const userErr = json?.data?.discountCodeBasicCreate?.userErrors?.[0]?.message;
+    if (!res.ok || topErr || userErr) {
+      return { ok: false, error: String(userErr || topErr || `HTTP ${res.status}`) };
+    }
+
+    return { ok: true, json };
+  }
+
+  const fieldNotDefined = (msg: string) => /Field is not defined on DiscountCodeBasicInput/i.test(msg);
+
+  // Attempt 1: customerSelection (deprecated, but widely supported) + combinesWith
+  let mode: "customerSelection" | "context" = "customerSelection";
+  let includeCombinesWith = true;
+  let attempt = await runCreate(buildBasicCodeDiscountInput(mode, includeCombinesWith));
+
+  // Fallback A: some API versions don’t support combinesWith
+  if (!attempt.ok && fieldNotDefined(attempt.error) && /combinesWith/i.test(attempt.error)) {
+    includeCombinesWith = false;
+    attempt = await runCreate(buildBasicCodeDiscountInput(mode, includeCombinesWith));
+  }
+
+  // Fallback B: some API versions don’t support customerSelection; use context instead
+  if (!attempt.ok && fieldNotDefined(attempt.error) && /customerSelection/i.test(attempt.error)) {
+    mode = "context";
+    includeCombinesWith = true;
+    attempt = await runCreate(buildBasicCodeDiscountInput(mode, includeCombinesWith));
+
+    if (!attempt.ok && fieldNotDefined(attempt.error) && /combinesWith/i.test(attempt.error)) {
+      includeCombinesWith = false;
+      attempt = await runCreate(buildBasicCodeDiscountInput(mode, includeCombinesWith));
+    }
+  }
+
+  // Fallback C: if context is not supported (should be rare), retry customerSelection
+  if (!attempt.ok && fieldNotDefined(attempt.error) && /context/i.test(attempt.error)) {
+    mode = "customerSelection";
+    includeCombinesWith = false;
+    attempt = await runCreate(buildBasicCodeDiscountInput(mode, includeCombinesWith));
+  }
+
+  if (!attempt.ok) {
+    return { ok: false, error: attempt.error };
+  }
+
+  const json = attempt.json;
 
   const node = json?.data?.discountCodeBasicCreate?.codeDiscountNode;
   const code = node?.codeDiscount?.codes?.nodes?.[0]?.code;
