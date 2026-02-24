@@ -88,6 +88,10 @@ function dollarsFromCents(cents: number): string {
 export default function AppSupportPage() {
   const { shop, settings, webhooks } = useLoaderData<typeof loader>();
 
+  const { search } = useLocation();
+  const withSearch = (path: string) => (search ? `${path}${search}` : path);
+
+
   const setupWarnings: string[] = [];
   // Discount-scope collection is optional in v1.6+. Only warn if a handle is set but the GID is missing.
   if (settings.eligibleCollectionHandle?.trim() && !settings.eligibleCollectionGid)
@@ -144,14 +148,14 @@ export default function AppSupportPage() {
               </Text>
               <List type="number">
                 <List.Item>
-                  Configure the program in <Link to="/app/settings">Settings</Link> (earn rate, redemption steps/value map, and optional exclusions). Set a discount-scope collection handle only if you want redemption codes to apply to a specific collection.
+                  Configure the program in <Link to={withSearch("/app/settings")}>Settings</Link> (earn rate, redemption steps/value map, and optional exclusions). Set a discount-scope collection handle only if you want redemption codes to apply to a specific collection.
                 </List.Item>
                 <List.Item>
                   Enable the Customer Account UI extension in your store’s customer accounts. Ensure the extension setting
                   <b> App Base URL</b> points to your current environment (dev tunnel or production domain).
                 </List.Item>
                 <List.Item>
-                  Confirm webhooks are receiving and processing under <Link to="/app/webhooks">Webhooks</Link>.
+                  Confirm webhooks are receiving and processing under <Link to={withSearch("/app/webhooks")}>Webhooks</Link>.
                 </List.Item>
                 <List.Item>
                   Configure a daily scheduler to call <code>GET /jobs/expire</code> with your <code>JOB_TOKEN</code>.

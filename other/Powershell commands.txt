@@ -16,3 +16,10 @@ shopify app dev clean -s lions-creek-dev-3.myshopify.com
 
 shopify app dev --store lions-creek-dev-3.myshopify.com --reset
 
+
+
+===
+
+Start-Transcript -Path "C:\Users\janfr\source\Shopify\lions-creek-rewards\logfile.txt"
+
+Stop-Transcript

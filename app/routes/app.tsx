@@ -1,4 +1,4 @@
-import { data, Link, Outlet, useLoaderData } from "react-router";
+import { data, Link, Outlet, useLoaderData, useLocation } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 
 import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-router/react";
@@ -16,6 +16,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export default function App() {
   const { apiKey } = useLoaderData<typeof loader>();
 
+  const { search } = useLocation();
+  const withSearch = (path: string) => (search ? `${path}${search}` : path);
+
+
   // App Bridge React has had breaking changes across major versions:
   // - Legacy: `NavigationMenu` component (props: navigationLinks)
   // - Current: `NavMenu` component (children anchors/Links)
@@ -29,13 +33,13 @@ export default function App() {
     | React.ComponentType<{ navigationLinks: { label: string; destination: string }[] }>;
 
   const navLinks = [
-    { label: "Dashboard", destination: "/app" },
-    { label: "Settings", destination: "/app/settings" },
-    { label: "Customers", destination: "/app/customers" },
-    { label: "Redemptions", destination: "/app/redemptions" },
-    { label: "Webhooks", destination: "/app/webhooks" },
-    { label: "Reports", destination: "/app/reports" },
-    { label: "Support", destination: "/app/support" },
+    { label: "Dashboard", destination: withSearch("/app") },
+    { label: "Settings", destination: withSearch("/app/settings") },
+    { label: "Customers", destination: withSearch("/app/customers") },
+    { label: "Redemptions", destination: withSearch("/app/redemptions") },
+    { label: "Webhooks", destination: withSearch("/app/webhooks") },
+    { label: "Reports", destination: withSearch("/app/reports") },
+    { label: "Support", destination: withSearch("/app/support") },
   ];
 
   return (
@@ -44,15 +48,15 @@ export default function App() {
         {NavMenu ? (
           <NavMenu>
             {/* rel="home" helps Shopify treat this as the app root in some contexts */}
-            <Link to="/app" rel="home">
+            <Link to={withSearch("/app")} rel="home">
               Dashboard
             </Link>
-            <Link to="/app/settings">Settings</Link>
-            <Link to="/app/customers">Customers</Link>
-            <Link to="/app/redemptions">Redemptions</Link>
-            <Link to="/app/webhooks">Webhooks</Link>
-            <Link to="/app/reports">Reports</Link>
-            <Link to="/app/support">Support</Link>
+            <Link to={withSearch("/app/settings")}>Settings</Link>
+            <Link to={withSearch("/app/customers")}>Customers</Link>
+            <Link to={withSearch("/app/redemptions")}>Redemptions</Link>
+            <Link to={withSearch("/app/webhooks")}>Webhooks</Link>
+            <Link to={withSearch("/app/reports")}>Reports</Link>
+            <Link to={withSearch("/app/support")}>Support</Link>
           </NavMenu>
         ) : NavigationMenu ? (
           <NavigationMenu navigationLinks={navLinks} />

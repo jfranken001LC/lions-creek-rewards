@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { data, useLoaderData } from "react-router";
+import { data, Link, useLoaderData, useLocation } from "react-router";
 import { Page, Layout, Card, Text, BlockStack, InlineStack, Badge } from "@shopify/polaris";
 import db from "../db.server";
 import { requireAdmin } from "../lib/shopify.server";
@@ -45,6 +45,10 @@ export default function AppIndex() {
     excludedProductsCount,
   } = useLoaderData<typeof loader>();
 
+  const { search } = useLocation();
+  const withSearch = (path: string) => (search ? `${path}${search}` : path);
+
+
   return (
     <Page title="Lions Creek Rewards">
       <Layout>
@@ -82,7 +86,7 @@ export default function AppIndex() {
                     <Badge tone={eligibleCollectionHandle?.trim() ? "info" : "success"}>{eligibleCollectionHandle?.trim() ? "Discount scope set" : "Discount scope: ALL"}</Badge>
                   </InlineStack>
                 </InlineStack>
-                <Text as="p" tone="subdued">Open <a href="/app/settings">Settings</a> to set earn rate, redemption mapping, and optional exclusions. If you set a discount-scope collection handle, redemption codes will apply only to that collection.</Text>
+                <Text as="p" tone="subdued">Open <Link to={withSearch("/app/settings")}>Settings</Link> to set earn rate, redemption mapping, and optional exclusions. If you set a discount-scope collection handle, redemption codes will apply only to that collection.</Text>
 
                 <InlineStack align="space-between" blockAlign="center">
                   <Text as="p">Exclusions configured</Text>
@@ -102,7 +106,7 @@ export default function AppIndex() {
                   <Text as="p">3) Verify webhooks</Text>
                   <Badge tone={unprocessedWebhooks > 0 ? "attention" : "success"}>{unprocessedWebhooks > 0 ? "Queue" : "OK"}</Badge>
                 </InlineStack>
-                <Text as="p" tone="subdued">Use <a href="/app/webhooks">Webhooks</a> to confirm events are being processed and investigate failures.</Text>
+                <Text as="p" tone="subdued">Use <Link to={withSearch("/app/webhooks")}>Webhooks</Link> to confirm events are being processed and investigate failures.</Text>
 
                 <InlineStack align="space-between" blockAlign="center">
                   <Text as="p">4) Schedule expiry job</Text>
