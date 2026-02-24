@@ -10,7 +10,61 @@ type HandleResult = { outcome: WebhookOutcome; message?: string };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const started = new Date();
-  const { shop, topic, webhookId, payload, admin } = await authenticate.webhook(request);
+  let shop: string;
+  let topic: string;
+  let webhookId: string;
+  let payload: any;
+  let admin: any;
+
+  const cloned = request.clone();
+
+  try {
+    ({ shop, topic, webhookId, payload, admin } = await authenticate.webhook(request));
+  } catch (e: any) {
+    const hdrShop = cloned.headers.get("X-Shopify-Shop-Domain") ?? "unknown";
+    const hdrTopic = cloned.headers.get("X-Shopify-Topic") ?? "AUTH";
+    const hdrWebhookId = cloned.headers.get("X-Shopify-Webhook-Id");
+
+    let bodyText = "";
+    try {
+      bodyText = await cloned.text();
+    } catch {}
+
+    let parsedPayload: any = null;
+    try {
+      parsedPayload = bodyText ? JSON.parse(bodyText) : null;
+    } catch {
+      parsedPayload = bodyText ? { raw: bodyText } : null;
+    }
+
+    const errorMessage = `Webhook auth failed: ${String(e?.message ?? e ?? "Unknown error")}`;
+
+    console.error("Webhook auth failed:", {
+      shop: hdrShop,
+      topic: hdrTopic,
+      webhookId: hdrWebhookId,
+      error: e,
+    });
+
+    // Persist auth failures too, otherwise Support/Webhooks pages show "(none)" and hide the real cause.
+    try {
+      await db.webhookError.create({
+        data: {
+          shop: hdrShop,
+          topic: hdrTopic,
+          webhookId: hdrWebhookId,
+          resourceId: null,
+          errorMessage: errorMessage.slice(0, 1000),
+          stack: typeof e?.stack === "string" ? e.stack.slice(0, 4000) : null,
+          payload: parsedPayload ?? {},
+        },
+      });
+    } catch (persistErr) {
+      console.error("Failed to persist webhook auth error:", persistErr);
+    }
+
+    return new Response("unauthorized", { status: 401 });
+  }
 
   const resourceId = extractResourceId(topic, payload);
 
