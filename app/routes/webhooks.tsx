@@ -468,11 +468,83 @@ function computeEligibleRefundCents(args: {
   return Math.max(0, total);
 }
 
+function extractDiscountCodesFromOrderPayload(payload: any): string[] {
+  const codes: string[] = [];
+
+  const push = (v: any) => {
+    if (typeof v !== "string") return;
+    const c = v.trim().toUpperCase();
+    if (!c) return;
+    // Lions Creek discount codes are generated with an "LCR" prefix.
+    if (!/^LCR[0-9A-Z-]*$/.test(c)) return;
+    codes.push(c);
+  };
+
+  // 1) REST order payload shape
+  if (Array.isArray(payload?.discount_codes)) {
+    for (const d of payload.discount_codes) push(typeof d === "string" ? d : d?.code);
+  }
+
+  // 2) Common camelCase variants (GraphQL/event payloads)
+  if (Array.isArray(payload?.discountCodes)) {
+    for (const d of payload.discountCodes) push(typeof d === "string" ? d : d?.code);
+  }
+
+  // 3) Discount applications (REST)
+  if (Array.isArray(payload?.discount_applications)) {
+    for (const a of payload.discount_applications) {
+      // Some shapes include "code" directly for discount codes
+      push(a?.code);
+      // Sometimes nested
+      push(a?.discount_code);
+      push(a?.discountCode);
+    }
+  }
+
+  // 4) Discount applications (GraphQL-ish)
+  const da = payload?.discountApplications;
+  if (Array.isArray(da)) {
+    for (const a of da) push(a?.code);
+  } else if (da?.edges && Array.isArray(da.edges)) {
+    for (const e of da.edges) push(e?.node?.code);
+  }
+
+  // 5) Last-resort: walk payload for any { ... discount ... code: "LCR-..." } strings
+  if (!codes.length && payload && typeof payload === "object") {
+    const queue: Array<{ v: any; path: string[] }> = [{ v: payload, path: [] }];
+    const seen = new Set<any>();
+    let steps = 0;
+
+    while (queue.length && steps++ < 5000) {
+      const { v, path } = queue.shift()!;
+      if (!v || typeof v !== "object") continue;
+      if (seen.has(v)) continue;
+      seen.add(v);
+
+      if (Array.isArray(v)) {
+        for (const item of v) queue.push({ v: item, path });
+        continue;
+      }
+
+      for (const [k, val] of Object.entries(v)) {
+        const nextPath = [...path, String(k)];
+        if (typeof val === "string") {
+          const lk = String(k).toLowerCase();
+          const hasDiscountContext = nextPath.some((p) => p.toLowerCase().includes("discount"));
+          if (hasDiscountContext && lk.includes("code")) push(val);
+        } else if (val && typeof val === "object") {
+          queue.push({ v: val, path: nextPath });
+        }
+      }
+    }
+  }
+
+  // Deduplicate (preserve first occurrence)
+  return Array.from(new Set(codes));
+}
+
 async function consumeRedemptionsFromOrder(shop: string, customerId: string, orderId: string, payload: any) {
-  const codes = (payload?.discount_codes ?? [])
-    .map((d: any) => (typeof d === "string" ? d : d?.code))
-    .filter(Boolean)
-    .map((c: string) => String(c).trim().toUpperCase());
+  const codes = extractDiscountCodesFromOrderPayload(payload);
 
   if (!codes.length) return 0;
 
@@ -480,15 +552,31 @@ async function consumeRedemptionsFromOrder(shop: string, customerId: string, ord
   const now = new Date();
 
   for (const code of codes) {
-    // Your redemption codes are generated with an "LCR" prefix.
-    if (!code.startsWith("LCR")) continue;
-
-    const updated = await db.redemption.updateMany({
+    // First try strict match (expected case): shop + customer + code
+    const strict = await db.redemption.updateMany({
       where: { shop, customerId, code, status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] } },
       data: { status: RedemptionStatus.CONSUMED, appliedAt: now, consumedAt: now, consumedOrderId: orderId },
     });
 
-    consumed += updated.count;
+    if (strict.count > 0) {
+      consumed += strict.count;
+      continue;
+    }
+
+    // Fallback: if customerId formats drift (numeric vs GID), match by shop+code only, but update a single row by id.
+    const byCode = await db.redemption.findFirst({
+      where: { shop, code, status: { in: [RedemptionStatus.ISSUED, RedemptionStatus.APPLIED] } },
+      select: { id: true },
+    });
+
+    if (!byCode) continue;
+
+    await db.redemption.update({
+      where: { id: byCode.id },
+      data: { status: RedemptionStatus.CONSUMED, appliedAt: now, consumedAt: now, consumedOrderId: orderId },
+    });
+
+    consumed += 1;
   }
 
   return consumed;
