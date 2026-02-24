@@ -66,6 +66,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         outcomeMessage: String(e?.message ?? e ?? "Unknown error").slice(0, 500),
       },
     });
+// Persist a dedicated error record for easier diagnostics (separate from the WebhookEvent summary row).
+try {
+  await db.webhookError.create({
+    data: {
+      shop,
+      topic,
+      webhookId,
+      resourceId,
+      errorMessage: String(e?.message ?? e ?? "Unknown error").slice(0, 1000),
+      stack: typeof e?.stack === "string" ? e.stack.slice(0, 4000) : null,
+      payload: payload ?? {},
+    },
+  });
+} catch (logErr) {
+  console.error("Failed to log WebhookError:", logErr);
+}
+
 
     // Shopify expects 200 for webhooks; we log outcome as FAILED in DB.
     return new Response("error", { status: 200 });
@@ -124,6 +141,24 @@ async function handlePrivacyWebhook(shop: string, topic: string, payload: any): 
   return { outcome: "PROCESSED", message: "Stored privacy event" };
 }
 
+async function handleAppUninstalled(shop: string): Promise<HandleResult> {
+  // NOTE: Do NOT delete WebhookEvent rows here; the caller updates the current webhook row after this handler returns.
+  // We intentionally remove all other shop-scoped data to prevent stale growth and ensure a clean reinstall.
+  await db.$transaction([
+    db.session.deleteMany({ where: { shop } }),
+    db.shopSettings.deleteMany({ where: { shop } }),
+    db.customerPointsBalance.deleteMany({ where: { shop } }),
+    db.pointsLedger.deleteMany({ where: { shop } }),
+    db.orderPointsSnapshot.deleteMany({ where: { shop } }),
+    db.redemption.deleteMany({ where: { shop } }),
+    db.privacyEvent.deleteMany({ where: { shop } }),
+    db.webhookError.deleteMany({ where: { shop } }),
+  ]);
+
+  return { outcome: "PROCESSED", message: "App uninstalled: shop data cleaned up (sessions/settings/points/redemptions)." };
+}
+
+
 /* ---------------- Shared helpers ---------------- */
 
 function makeAdminGraphql(admin: any): AdminGraphql {
@@ -154,6 +189,31 @@ async function adminGraphqlJson(adminGraphql: AdminGraphql, query: string, varia
 function normalizeTags(tags: any) {
   return new Set((tags ?? []).map((t: any) => String(t).trim().toLowerCase()).filter(Boolean));
 }
+
+function normalizeProductId(id: unknown): string | null {
+  if (id == null) return null;
+  const s = String(id).trim();
+  if (!s) return null;
+
+  // Accept either numeric ids ("123") or full Shopify GIDs ("gid://shopify/Product/123").
+  const m = s.match(/gid:\/\/shopify\/Product\/(\d+)/i);
+  if (m?.[1]) return m[1];
+  return s;
+}
+
+function makeProductIdSet(ids: string[]): Set<string> {
+  const set = new Set<string>();
+  for (const raw of ids ?? []) {
+    const norm = normalizeProductId(raw);
+    if (!norm) continue;
+
+    // Store both forms so we can match either numeric ids or GIDs in payloads/settings.
+    set.add(norm);
+    set.add(`gid://shopify/Product/${norm}`);
+  }
+  return set;
+}
+
 
 function isProductEligibleByTags(productTags: string[], include: Set<string>, exclude: Set<string>) {
   const tags = new Set(productTags.map((t) => String(t).trim().toLowerCase()).filter(Boolean));
@@ -403,7 +463,7 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
       productEligibility,
       includeProductTags: settings.includeProductTags,
       excludeProductTags: settings.excludeProductTags,
-      excludedProductIds: new Set(settings.excludedProductIds),
+      excludedProductIds: makeProductIdSet(settings.excludedProductIds),
     });
   }
 
@@ -465,18 +525,20 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
 
   const refundId = String(payload?.id ?? "");
   const orderId = String(payload?.order_id ?? "");
-  const customerId = payload?.order?.customer?.id ? String(payload.order.customer.id) : null;
 
-  if (!refundId || !orderId || !customerId) {
-    return { outcome: "SKIPPED", message: "Missing refund/order/customer ids" };
+  if (!refundId || !orderId) {
+    return { outcome: "SKIPPED", message: "Missing refund/order ids" };
   }
 
   const snapshot = await db.orderPointsSnapshot.findUnique({ where: { shop_orderId: { shop, orderId } } });
   if (!snapshot || snapshot.pointsAwarded <= 0) return { outcome: "SKIPPED", message: "No awarded points" };
 
+  const customerId = String(snapshot.customerId);
+
   const remaining = Math.max(0, snapshot.pointsAwarded - snapshot.pointsReversedToDate);
   if (remaining <= 0) return { outcome: "SKIPPED", message: "Nothing to reverse" };
 
+  // Idempotency guard. (We also have a DB unique constraint for refund dedupe.)
   const already = await db.pointsLedger.findFirst({
     where: { shop, type: LedgerType.REVERSAL, source: "REFUND", sourceId: refundId },
   });
@@ -485,10 +547,13 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
   if (!admin) return { outcome: "FAILED", message: "Missing admin client in webhook context" };
   const adminGraphql = makeAdminGraphql(admin);
 
-
   const refundLines = payload?.refund_line_items ?? [];
+
   const productIds = new Set<string>();
-  for (const rli of refundLines) if (rli?.line_item?.product_id) productIds.add(String(rli.line_item.product_id));
+  for (const rli of refundLines) {
+    const pid = rli?.line_item?.product_id;
+    if (pid) productIds.add(String(pid));
+  }
 
   const productEligibility = productIds.size
     ? await fetchProductEligibilityMap({
@@ -503,6 +568,7 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
     productEligibility,
     includeProductTags: settings.includeProductTags,
     excludeProductTags: settings.excludeProductTags,
+    excludedProductIds: makeProductIdSet(settings.excludedProductIds),
   });
 
   if (eligibleRefundCents <= 0) return { outcome: "SKIPPED", message: "No eligible refund cents" };
@@ -510,6 +576,7 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
   const baseUnits = Math.floor(snapshot.eligibleNetMerchandise / 100);
   const refundUnits = Math.floor(eligibleRefundCents / 100);
 
+  // Reverse proportionally to the original eligibility snapshot.
   const perDollar = baseUnits > 0 ? snapshot.pointsAwarded / baseUnits : 0;
   const computed = Math.floor(refundUnits * perDollar + 1e-9);
   const pointsToReverse = Math.min(remaining, Math.max(0, computed));
@@ -543,6 +610,7 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
 }
 
 /* ---------------- Orders / Cancelled ---------------- */
+
 
 async function handleOrdersCancelled(args: { shop: string; payload: any }): Promise<HandleResult> {
   const { shop, payload } = args;

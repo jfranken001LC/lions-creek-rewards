@@ -166,6 +166,22 @@ model WebhookEvent {
   @@index([shop, topic, receivedAt])
 }
 
+model WebhookError {
+  id          String   @id @default(cuid())
+  shop        String
+  topic       String
+  webhookId   String?
+  resourceId  String?
+  errorMessage String
+  stack       String?
+  payload     Json?
+  createdAt   DateTime @default(now())
+
+  @@index([shop, topic, createdAt])
+  @@index([shop, createdAt])
+}
+
+
 model PrivacyEvent {
   id          String   @id @default(cuid())
   shop        String

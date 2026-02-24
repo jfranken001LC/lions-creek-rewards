@@ -46,7 +46,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     },
   });
 
-  return { events, filters: { outcome, topic, resourceId } };
+const errorWhere: any = { shop };
+if (topic) errorWhere.topic = { contains: topic };
+if (resourceId) errorWhere.resourceId = resourceId;
+
+const errors = await db.webhookError.findMany({
+  where: errorWhere,
+  orderBy: { createdAt: "desc" },
+  take: 200,
+  select: {
+    id: true,
+    topic: true,
+    webhookId: true,
+    resourceId: true,
+    createdAt: true,
+    errorMessage: true,
+  },
+});
+
+  return { events, errors, filters: { outcome, topic, resourceId } };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -67,7 +85,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function WebhooksLogPage() {
-  const { events, filters } = useLoaderData<typeof loader>();
+  const { events, errors, filters } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
 
@@ -100,6 +118,18 @@ export default function WebhooksLogPage() {
         e.outcomeMessage || "—",
       ]),
     [events],
+
+const errorRows = useMemo(
+  () =>
+    errors.map((e) => [
+      new Date(e.createdAt).toLocaleString(),
+      e.topic,
+      e.webhookId || "—",
+      e.resourceId || "—",
+      e.errorMessage,
+    ]),
+  [errors],
+);
   );
 
   const runSearch = () => {
@@ -152,6 +182,17 @@ export default function WebhooksLogPage() {
           headings={["Webhook ID", "Topic", "Resource", "Received", "Processed", "Outcome", "Message"]}
           rows={rows}
         />
+<Card>
+  <Text as="h2" variant="headingMd">
+    Webhook Errors (latest)
+  </Text>
+  <DataTable
+    columnContentTypes={["text", "text", "text", "text", "text"]}
+    headings={["When", "Topic", "Webhook ID", "Resource", "Error"]}
+    rows={errorRows}
+  />
+</Card>
+
       </Card>
     </Page>
   );
