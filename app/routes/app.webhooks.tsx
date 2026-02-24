@@ -9,9 +9,9 @@ import {
   TextField,
   Button,
   Banner,
+  BlockStack,
 } from "@shopify/polaris";
-import type { LoaderFunctionArgs } from "react-router";
-import type { ActionFunctionArgs } from "react-router";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { data, Form, useActionData, useLoaderData, useSubmit } from "react-router";
 import { useMemo, useState } from "react";
 import { authenticate, registerWebhooks } from "../shopify.server";
@@ -46,25 +46,26 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     },
   });
 
-const errorWhere: any = { shop };
-if (topic) errorWhere.topic = { contains: topic };
-if (resourceId) errorWhere.resourceId = resourceId;
+  // Errors are filtered by shop + (optional) topic/resource. Outcome doesn't apply.
+  const errorWhere: any = { shop };
+  if (topic) errorWhere.topic = { contains: topic };
+  if (resourceId) errorWhere.resourceId = resourceId;
 
-const errors = await db.webhookError.findMany({
-  where: errorWhere,
-  orderBy: { createdAt: "desc" },
-  take: 200,
-  select: {
-    id: true,
-    topic: true,
-    webhookId: true,
-    resourceId: true,
-    createdAt: true,
-    errorMessage: true,
-  },
-});
+  const errors = await db.webhookError.findMany({
+    where: errorWhere,
+    orderBy: { createdAt: "desc" },
+    take: 200,
+    select: {
+      id: true,
+      topic: true,
+      webhookId: true,
+      resourceId: true,
+      createdAt: true,
+      errorMessage: true,
+    },
+  });
 
-  return { events, errors, filters: { outcome, topic, resourceId } };
+  return data({ events, errors, filters: { outcome, topic, resourceId } });
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -118,18 +119,18 @@ export default function WebhooksLogPage() {
         e.outcomeMessage || "—",
       ]),
     [events],
+  );
 
-const errorRows = useMemo(
-  () =>
-    errors.map((e) => [
-      new Date(e.createdAt).toLocaleString(),
-      e.topic,
-      e.webhookId || "—",
-      e.resourceId || "—",
-      e.errorMessage,
-    ]),
-  [errors],
-);
+  const errorRows = useMemo(
+    () =>
+      errors.map((e) => [
+        new Date(e.createdAt).toLocaleString(),
+        e.topic,
+        e.webhookId || "—",
+        e.resourceId || "—",
+        e.errorMessage,
+      ]),
+    [errors],
   );
 
   const runSearch = () => {
@@ -142,58 +143,82 @@ const errorRows = useMemo(
 
   return (
     <Page title="Webhook Processing Log">
-      <Card sectioned>
-        <InlineStack gap="400" align="start" blockAlign="center">
-          <Select
-            label="Outcome"
-            options={[
-              { label: "All", value: "ALL" },
-              { label: "Received", value: "RECEIVED" },
-              { label: "Processed", value: "PROCESSED" },
-              { label: "Skipped", value: "SKIPPED" },
-              { label: "Failed", value: "FAILED" },
-            ]}
-            value={outcome}
-            onChange={(value) => setOutcome(value)}
+      <BlockStack gap="400">
+        <Card padding="400">
+          <InlineStack gap="400" align="start" blockAlign="center" wrap>
+            <Select
+              label="Outcome"
+              options={[
+                { label: "All", value: "ALL" },
+                { label: "Received", value: "RECEIVED" },
+                { label: "Processed", value: "PROCESSED" },
+                { label: "Skipped", value: "SKIPPED" },
+                { label: "Failed", value: "FAILED" },
+              ]}
+              value={outcome}
+              onChange={(value) => setOutcome(value)}
+            />
+
+            <TextField
+              label="Topic contains"
+              value={topic}
+              onChange={(v) => setTopic(v)}
+              autoComplete="off"
+            />
+
+            <TextField
+              label="Resource ID"
+              value={resourceId}
+              onChange={(v) => setResourceId(v)}
+              autoComplete="off"
+            />
+
+            <Button onClick={runSearch}>Search</Button>
+
+            <Form method="post">
+              <input type="hidden" name="intent" value="register" />
+              <Button submit>Re-register webhooks</Button>
+            </Form>
+          </InlineStack>
+        </Card>
+
+        {actionData?.ok === true ? (
+          <Card padding="400">
+            <Banner tone="success">{actionData.message}</Banner>
+          </Card>
+        ) : null}
+
+        {actionData?.ok === false ? (
+          <Card padding="400">
+            <Banner tone="critical">{actionData.error}</Banner>
+          </Card>
+        ) : null}
+
+        <Card padding="400">
+          <Text as="p" tone="subdued">
+            Latest webhook events received and how they were handled.
+          </Text>
+        </Card>
+
+        <Card padding="400">
+          <DataTable
+            columnContentTypes={["text", "text", "text", "text", "text", "text", "text"]}
+            headings={["Webhook ID", "Topic", "Resource", "Received", "Processed", "Outcome", "Message"]}
+            rows={rows}
           />
+        </Card>
 
-          <TextField label="Topic contains" value={topic} onChange={(v) => setTopic(v)} autoComplete="off" />
-          <TextField label="Resource ID" value={resourceId} onChange={(v) => setResourceId(v)} autoComplete="off" />
-
-          <Button onClick={runSearch}>Search</Button>
-
-          <Form method="post">
-            <input type="hidden" name="intent" value="register" />
-            <Button submit>Re-register webhooks</Button>
-          </Form>
-        </InlineStack>
-
-        {actionData?.ok === true ? <Banner tone="success">{actionData.message}</Banner> : null}
-        {actionData?.ok === false ? <Banner tone="critical">{actionData.error}</Banner> : null}
-
-        <Text as="p" tone="subdued">
-          Latest webhook events received and how they were handled.
-        </Text>
-      </Card>
-
-      <Card>
-        <DataTable
-          columnContentTypes={["text", "text", "text", "text", "text", "text", "text"]}
-          headings={["Webhook ID", "Topic", "Resource", "Received", "Processed", "Outcome", "Message"]}
-          rows={rows}
-        />
-<Card>
-  <Text as="h2" variant="headingMd">
-    Webhook Errors (latest)
-  </Text>
-  <DataTable
-    columnContentTypes={["text", "text", "text", "text", "text"]}
-    headings={["When", "Topic", "Webhook ID", "Resource", "Error"]}
-    rows={errorRows}
-  />
-</Card>
-
-      </Card>
+        <Card padding="400">
+          <Text as="h2" variant="headingMd">
+            Webhook Errors (latest)
+          </Text>
+          <DataTable
+            columnContentTypes={["text", "text", "text", "text", "text"]}
+            headings={["When", "Topic", "Webhook ID", "Resource", "Error"]}
+            rows={errorRows}
+          />
+        </Card>
+      </BlockStack>
     </Page>
   );
 }
