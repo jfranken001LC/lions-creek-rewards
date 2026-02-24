@@ -59,7 +59,7 @@ async function createDiscount(args: {
   title: string;
   discountCode: string;
   valueDollars: number;
-  eligibleCollectionGid: string;
+  eligibleCollectionGid?: string | null;
   startsAt: string;
   endsAt: string;
   minOrderDollars: number;
@@ -102,7 +102,7 @@ async function createDiscount(args: {
       // Fixed amount off (applies to eligible collection)
       customerGets: {
         value: { discountAmount: { amount: formatMoney(args.valueDollars), appliesOnEachItem: false } },
-        items: { collections: { add: [args.eligibleCollectionGid] } },
+        items: args.eligibleCollectionGid ? { collections: { add: [args.eligibleCollectionGid] } } : { all: true },
       },
 
       usageLimit: 1,
@@ -209,11 +209,14 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
     }
   }
 
-  // Ensure the eligible collection GID is cached/resolved.
-  const eligibleCollectionGid = await resolveEligibleCollectionGid(admin, shop, {
-    eligibleCollectionHandle: settings.eligibleCollectionHandle,
-    eligibleCollectionGid: settings.eligibleCollectionGid,
-  });
+  // Optional: scope redemption discount codes to a collection.
+  // If blank, discounts apply to all products.
+  const eligibleCollectionGid = settings.eligibleCollectionHandle
+    ? await resolveEligibleCollectionGid(admin, shop, {
+        eligibleCollectionHandle: settings.eligibleCollectionHandle,
+        eligibleCollectionGid: settings.eligibleCollectionGid,
+      })
+    : null;
 
   // Fetch points balance (create row if missing).
   const bal = await db.customerPointsBalance.upsert({
@@ -262,8 +265,7 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
     eligibleCollectionGid,
     startsAt: now.toISOString(),
     endsAt: expires.toISOString(),
-    // Stored as cents in ShopSettings; Shopify expects dollars.
-    minOrderDollars: (settings.redemptionMinOrder ?? 0) / 100,
+    minOrderDollars: settings.redemptionMinOrder,
   });
 
   if (!created.ok) return { ok: false, error: created.error };

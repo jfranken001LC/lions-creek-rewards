@@ -183,54 +183,24 @@ function customerIsExcluded(customerTags: string[], excluded: string[]): boolean
   return excluded.some((t) => have.has(String(t).trim().toLowerCase()));
 }
 
-type ProductEligibility = { tags: string[]; inEligibleCollection: boolean };
+type ProductEligibility = { tags: string[]; isExcludedByCollection: boolean };
 
 async function fetchProductEligibilityMap(args: {
   adminGraphql: AdminGraphql;
   numericProductIds: string[];
-  eligibleCollectionHandle: string;
-  eligibleCollectionGid: string | null;
+  excludedCollectionHandles: string[];
 }): Promise<Map<string, ProductEligibility>> {
-  const { adminGraphql, numericProductIds, eligibleCollectionHandle, eligibleCollectionGid } = args;
+  const { adminGraphql, numericProductIds, excludedCollectionHandles } = args;
 
   const gids = numericProductIds.map((id) => `gid://shopify/Product/${id}`);
+  const excludedHandles = new Set(
+    (excludedCollectionHandles ?? []).map((h) => String(h).trim().toLowerCase()).filter(Boolean),
+  );
 
-  // Fast path if we have a cached collection GID: use Product.inCollection(id:)
-  if (eligibleCollectionGid) {
-    const query = `#graphql
-      query ProductEligibility($ids: [ID!]!, $collectionId: ID!) {
-        nodes(ids: $ids) {
-          ... on Product {
-            id
-            tags
-            inCollection(id: $collectionId)
-          }
-        }
-      }
-    `;
-
-    try {
-      const data = await adminGraphqlJson(adminGraphql, query, { ids: gids, collectionId: eligibleCollectionGid });
-
-      const map = new Map<string, ProductEligibility>();
-      for (const node of data?.nodes ?? []) {
-        const numeric = String(node?.id ?? "").replace("gid://shopify/Product/", "");
-        if (!numeric) continue;
-        map.set(numeric, {
-          tags: (node?.tags ?? []).map((t: any) => String(t)),
-          inEligibleCollection: Boolean(node?.inCollection),
-        });
-      }
-      return map;
-    } catch (e) {
-      // If inCollection isn't available / errors, fall back to collections-by-handle below.
-      console.warn("ProductEligibility inCollection query failed; falling back to collections list:", e);
-    }
-  }
-
-  // Fallback: check collection membership by handle via Product.collections
+  // We intentionally query Product.collections and match by handle(s).
+  // This supports "include all by default" with exclusions via collection handle(s).
   const query = `#graphql
-    query ProductEligibilityByHandle($ids: [ID!]!) {
+    query ProductEligibilityAllByDefault($ids: [ID!]!) {
       nodes(ids: $ids) {
         ... on Product {
           id
@@ -243,7 +213,6 @@ async function fetchProductEligibilityMap(args: {
 
   const data = await adminGraphqlJson(adminGraphql, query, { ids: gids });
 
-  const handleLower = String(eligibleCollectionHandle || "").trim().toLowerCase();
   const map = new Map<string, ProductEligibility>();
 
   for (const node of data?.nodes ?? []) {
@@ -251,16 +220,18 @@ async function fetchProductEligibilityMap(args: {
     if (!numeric) continue;
 
     const collections = (node?.collections?.nodes ?? []).map((c: any) => String(c?.handle ?? "").trim().toLowerCase());
-    const inEligibleCollection = handleLower ? collections.includes(handleLower) : true;
+    const isExcludedByCollection =
+      excludedHandles.size === 0 ? false : collections.some((h: string) => excludedHandles.has(h));
 
     map.set(numeric, {
       tags: (node?.tags ?? []).map((t: any) => String(t)),
-      inEligibleCollection,
+      isExcludedByCollection,
     });
   }
 
   return map;
 }
+
 
 function collectProductIdsFromOrder(orderPayload: any) {
   const ids = new Set<string>();
@@ -275,6 +246,7 @@ function computeEligibleNetMerchCents(args: {
   productEligibility: Map<string, ProductEligibility>;
   includeProductTags: string[];
   excludeProductTags: string[];
+  excludedProductIds: Set<string>;
 }): number {
   const include = normalizeTags(args.includeProductTags);
   const exclude = normalizeTags(args.excludeProductTags);
@@ -293,8 +265,10 @@ function computeEligibleNetMerchCents(args: {
     const pid = li?.product_id ? String(li.product_id) : null;
     if (!pid) continue;
 
+    if (args.excludedProductIds.has(pid)) continue;
+
     const info = args.productEligibility.get(pid);
-    if (!info?.inEligibleCollection) continue;
+    if (info?.isExcludedByCollection) continue;
     if (!isProductEligibleByTags(info.tags, include, exclude)) continue;
 
     total += net;
@@ -308,6 +282,7 @@ function computeEligibleRefundCents(args: {
   productEligibility: Map<string, ProductEligibility>;
   includeProductTags: string[];
   excludeProductTags: string[];
+  excludedProductIds: Set<string>;
 }): number {
   const include = normalizeTags(args.includeProductTags);
   const exclude = normalizeTags(args.excludeProductTags);
@@ -333,8 +308,10 @@ function computeEligibleRefundCents(args: {
     const pid = li?.product_id ? String(li.product_id) : null;
     if (!pid) continue;
 
+    if (args.excludedProductIds.has(pid)) continue;
+
     const info = args.productEligibility.get(pid);
-    if (!info?.inEligibleCollection) continue;
+    if (info?.isExcludedByCollection) continue;
     if (!isProductEligibleByTags(info.tags, include, exclude)) continue;
 
     total += net;
@@ -407,15 +384,6 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
   }
   const excluded = customerIsExcluded(customerTags, settings.excludedCustomerTags);
 
-  // Best-effort: resolve/cache eligible collection GID. If it fails, we can still evaluate membership by handle.
-  let eligibleCollectionGid: string | null = settings.eligibleCollectionGid;
-  if (!eligibleCollectionGid) {
-    try {
-      eligibleCollectionGid = await resolveEligibleCollectionGid(adminGraphql, shop, settings);
-    } catch {
-      eligibleCollectionGid = null;
-    }
-  }
 
   let eligibleNetCents = 0;
 
@@ -426,8 +394,7 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
       ? await fetchProductEligibilityMap({
           adminGraphql,
           numericProductIds: productIds,
-          eligibleCollectionHandle: settings.eligibleCollectionHandle,
-          eligibleCollectionGid,
+          excludedCollectionHandles: settings.excludedCollectionHandles,
         })
       : new Map<string, ProductEligibility>();
 
@@ -436,6 +403,7 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
       productEligibility,
       includeProductTags: settings.includeProductTags,
       excludeProductTags: settings.excludeProductTags,
+      excludedProductIds: new Set(settings.excludedProductIds),
     });
   }
 
@@ -517,15 +485,6 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
   if (!admin) return { outcome: "FAILED", message: "Missing admin client in webhook context" };
   const adminGraphql = makeAdminGraphql(admin);
 
-  // Best-effort: resolve/cache eligible collection GID. If it fails, we can still evaluate membership by handle.
-  let eligibleCollectionGid: string | null = settings.eligibleCollectionGid;
-  if (!eligibleCollectionGid) {
-    try {
-      eligibleCollectionGid = await resolveEligibleCollectionGid(adminGraphql, shop, settings);
-    } catch {
-      eligibleCollectionGid = null;
-    }
-  }
 
   const refundLines = payload?.refund_line_items ?? [];
   const productIds = new Set<string>();
@@ -535,8 +494,7 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
     ? await fetchProductEligibilityMap({
         adminGraphql,
         numericProductIds: Array.from(productIds),
-        eligibleCollectionHandle: settings.eligibleCollectionHandle,
-        eligibleCollectionGid,
+        excludedCollectionHandles: settings.excludedCollectionHandles,
       })
     : new Map<string, ProductEligibility>();
 

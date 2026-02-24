@@ -38,8 +38,6 @@ export default function App() {
 }
 
 function formatRouteError(error: unknown): { title: string; details?: string } {
-  const showDetails = process.env.NODE_ENV !== "production";
-
   if (isRouteErrorResponse(error)) {
     const details =
       "data" in error && error.data
@@ -48,28 +46,26 @@ function formatRouteError(error: unknown): { title: string; details?: string } {
 
     return {
       title: `${error.status} ${error.statusText}`,
-      details: showDetails ? details : undefined,
+      details,
     };
   }
 
   if (error instanceof Error) {
     return {
       title: error.name || "Unexpected error",
-      details: showDetails ? (error.stack ?? error.message) : undefined,
+      details: error.stack ?? error.message,
     };
   }
 
   return {
     title: "Unexpected error",
-    details: showDetails ? (error ? JSON.stringify(error, null, 2) : undefined) : undefined,
+    details: error ? JSON.stringify(error, null, 2) : undefined,
   };
 }
 
 export function ErrorBoundary() {
   const error = useRouteError();
   const { title, details } = formatRouteError(error);
-
-  const isProd = process.env.NODE_ENV === "production";
 
   return (
     <div style={{
@@ -83,11 +79,6 @@ export function ErrorBoundary() {
       <p style={{ margin: "0 0 16px", opacity: 0.8 }}>
         If you reached this page via Shopify CLI preview, it usually means your preview URL is pointing at the production domain instead of the active dev tunnel.
       </p>
-      {isProd ? (
-        <p style={{ margin: "0 0 16px", opacity: 0.8 }}>
-          If this persists, contact support and include the time this occurred and your shop domain.
-        </p>
-      ) : null}
       {details ? (
         <pre style={{
           whiteSpace: "pre-wrap",

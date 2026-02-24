@@ -178,8 +178,7 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
     recentActivity,
     settings: {
       earnRate: settings.earnRate,
-      // Stored as cents in ShopSettings; UI/discount API expects dollars.
-      minOrderDollars: (settings.redemptionMinOrder ?? 0) / 100,
+      minOrderDollars: settings.redemptionMinOrder,
       redemptionExpiryHours: settings.redemptionExpiryHours,
       preventMultipleActiveRedemptions: settings.preventMultipleActiveRedemptions,
       redemptionSteps: settings.redemptionSteps,

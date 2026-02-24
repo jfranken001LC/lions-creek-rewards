@@ -1,21 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { data, Form, Link, useActionData, useLoaderData } from "react-router";
-import React from "react";
-import {
-  Page,
-  Layout,
-  Card,
-  BlockStack,
-  InlineStack,
-  Text,
-  TextField,
-  Checkbox,
-  FormLayout,
-  Button,
-  Banner,
-  List,
-  Divider,
-} from "@shopify/polaris";
 import db from "../db.server";
 import { apiVersion, authenticate } from "../shopify.server";
 import type { ShopSettingsNormalized } from "../lib/shopSettings.server";
@@ -82,20 +66,6 @@ function clampInt(n: any, min: number, max: number): number {
   const x = Math.floor(Number(n));
   if (!Number.isFinite(x)) return min;
   return Math.max(min, Math.min(max, x));
-}
-
-function parseMoneyToCents(raw: FormDataEntryValue | null, fallbackCents: number): number {
-  const s = String(raw ?? "").trim();
-  if (!s) return fallbackCents;
-
-  // Accept values like "25", "25.00", "$25", "1,234.56"
-  const cleaned = s.replace(/[^0-9.\-]/g, "");
-  const n = Number(cleaned);
-  if (!Number.isFinite(n) || n < 0) return fallbackCents;
-
-  // Keep v1 bounds sane
-  const cents = Math.round(n * 100);
-  return Math.max(0, Math.min(100000000, cents));
 }
 
 function csvToList(raw: FormDataEntryValue | null): string[] {
@@ -500,11 +470,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   try {
     const earnRate = clampInt(form.get("earnRate"), 1, 100);
-    // Stored as cents; UI submits dollars. Backwards-compatible with older "redemptionMinOrder" (cents) field.
-    const redemptionMinOrder =
-      form.get("redemptionMinOrderDollars") != null
-        ? parseMoneyToCents(form.get("redemptionMinOrderDollars"), existing.redemptionMinOrder)
-        : clampInt(form.get("redemptionMinOrder"), 0, 100000000);
+    const redemptionMinOrder = clampInt(form.get("redemptionMinOrder"), 0, 100000);
 
     const pointsExpireInactivityDays = clampInt(form.get("pointsExpireInactivityDays"), 1, 3650);
     const redemptionExpiryHours = clampInt(form.get("redemptionExpiryHours"), 1, 720);
@@ -514,14 +480,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const includeProductTags = normalizeTagList(csvToList(form.get("includeProductTags")));
     const excludeProductTags = normalizeTagList(csvToList(form.get("excludeProductTags")));
 
+    const excludedCollectionHandles = normalizeTagList(csvToList(form.get("excludedCollectionHandles")));
+    const excludedProductIds = normalizeTagList(csvToList(form.get("excludedProductIds")));
+
     const redemptionSteps = parseRedemptionSteps(form.get("redemptionSteps"), existing.redemptionSteps);
     const redemptionValueMap = parseRedemptionValueMap(form.get("redemptionValueMap"), existing.redemptionValueMap);
 
     // Collection handle/GID
-    const eligibleCollectionHandleRaw = String(form.get("eligibleCollectionHandle") ?? "").trim();
-    const eligibleCollectionHandle = eligibleCollectionHandleRaw || existing.eligibleCollectionHandle;
+    const eligibleCollectionHandle = String(form.get("eligibleCollectionHandle") ?? "").trim();
 
-    const resolveCollectionNow = String(form.get("resolveCollectionNow") ?? "") === "on";
+    const resolveCollectionNow = String(form.get("resolveCollectionNow") ?? "on") === "on";
     const submittedGid = String(form.get("eligibleCollectionGid") ?? "").trim() || null;
 
     const handleChanged = eligibleCollectionHandle !== existing.eligibleCollectionHandle;
@@ -531,12 +499,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // If handle changed, never keep old cached gid unless we resolve it now.
     if (handleChanged) eligibleCollectionGid = null;
 
-    if (resolveCollectionNow) {
+    if (resolveCollectionNow && eligibleCollectionHandle) {
       const res = await shopifyGraphql(shop, COLLECTION_BY_HANDLE_ONLY_QUERY, { handle: eligibleCollectionHandle });
       const col = res?.collectionByHandle ?? null;
-      if (!col?.id) throw new Error(`Eligible collection not found for handle "${eligibleCollectionHandle}".`);
+      if (!col?.id) throw new Error(`Discount-scope collection not found for handle "${eligibleCollectionHandle}".`);
       eligibleCollectionGid = String(col.id);
     }
+
+    if (!eligibleCollectionHandle) eligibleCollectionGid = null;
 
     await upsertShopSettings(shop, {
       earnRate,
@@ -549,6 +519,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       excludedCustomerTags,
       includeProductTags,
       excludeProductTags,
+      excludedCollectionHandles,
+      excludedProductIds,
       redemptionSteps,
       redemptionValueMap,
     });
@@ -563,290 +535,284 @@ export default function SettingsPage() {
   const { shop, settings, diagnostics } = useLoaderData<typeof loader>();
   const actionData = useActionData<ActionData>();
 
-  const [earnRate, setEarnRate] = React.useState(String(settings.earnRate));
-  const [minOrderDollars, setMinOrderDollars] = React.useState(((settings.redemptionMinOrder ?? 0) / 100).toFixed(2));
-  const [pointsExpireInactivityDays, setPointsExpireInactivityDays] = React.useState(String(settings.pointsExpireInactivityDays));
-  const [redemptionExpiryHours, setRedemptionExpiryHours] = React.useState(String(settings.redemptionExpiryHours));
-  const [preventMultipleActiveRedemptions, setPreventMultipleActiveRedemptions] = React.useState(Boolean(settings.preventMultipleActiveRedemptions));
-
-  const [eligibleCollectionHandle, setEligibleCollectionHandle] = React.useState(settings.eligibleCollectionHandle ?? "");
-  const [eligibleCollectionGid, setEligibleCollectionGid] = React.useState(settings.eligibleCollectionGid ?? "");
-  const [resolveCollectionNow, setResolveCollectionNow] = React.useState(true);
-
-  const [excludedCustomerTags, setExcludedCustomerTags] = React.useState(listToCsv(settings.excludedCustomerTags));
-  const [includeProductTags, setIncludeProductTags] = React.useState(listToCsv(settings.includeProductTags));
-  const [excludeProductTags, setExcludeProductTags] = React.useState(listToCsv(settings.excludeProductTags));
-
-  const [redemptionSteps, setRedemptionSteps] = React.useState(settings.redemptionSteps.join(", "));
-  const [redemptionValueMap, setRedemptionValueMap] = React.useState(JSON.stringify(settings.redemptionValueMap, null, 2));
-
   const hasWarnings = diagnostics.warnings.length > 0;
   const hasNotes = diagnostics.notes.length > 0;
 
-  const collectionAdminUrl = eligibleCollectionHandle?.trim()
-    ? `https://${shop}/admin/collections?query=${encodeURIComponent(eligibleCollectionHandle.trim())}`
-    : `https://${shop}/admin/collections`;
-
   return (
-    <Page
-      title="Program Settings"
-      subtitle={`Shop: ${shop}`}
-      backAction={{ content: "Back", url: "/app" }}
-      primaryAction={{ content: "Save", onAction: () => {
-        const el = document.getElementById("settings-form") as HTMLFormElement | null;
-        el?.requestSubmit();
-      } }}
-    >
-      <Layout>
-        <Layout.Section>
-          {actionData ? (
-            <Banner tone={actionData.ok ? "success" : "critical"} title={actionData.ok ? "Saved" : "Could not save"}>
-              {actionData.ok ? actionData.message : actionData.error}
-            </Banner>
+    <div style={{ padding: 18, maxWidth: 980 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <h1 style={{ margin: 0 }}>Program Settings</h1>
+        <Link to="/app" style={{ opacity: 0.8 }}>
+          ← Back
+        </Link>
+      </div>
+
+      <div style={{ opacity: 0.7, marginTop: 6, marginBottom: 14 }}>Shop: {shop}</div>
+
+      {actionData ? (
+        <div
+          style={{
+            border: `1px solid ${actionData.ok ? "#b7e4c7" : "#ffccd5"}`,
+            background: actionData.ok ? "#ecfdf5" : "#fff1f2",
+            padding: 12,
+            borderRadius: 12,
+            marginBottom: 14,
+          }}
+        >
+          {actionData.ok ? actionData.message : actionData.error}
+        </div>
+      ) : null}
+
+      <Form method="post" style={{ display: "grid", gap: 14 }}>
+        <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
+          <h2 style={{ marginTop: 0 }}>Core</h2>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Earn rate (points per $1 eligible net merchandise)</div>
+              <input type="number" name="earnRate" defaultValue={settings.earnRate} min={1} max={100} />
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Redemption minimum order subtotal (cents)</div>
+              <input type="number" name="redemptionMinOrder" defaultValue={settings.redemptionMinOrder} min={0} />
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Points expiry inactivity window (days)</div>
+              <input
+                type="number"
+                name="pointsExpireInactivityDays"
+                defaultValue={settings.pointsExpireInactivityDays}
+                min={1}
+                max={3650}
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Points expire after this many days with no qualifying activity (earn or redeem).
+              </div>
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Redemption code expiry (hours)</div>
+              <input
+                type="number"
+                name="redemptionExpiryHours"
+                defaultValue={settings.redemptionExpiryHours}
+                min={1}
+                max={720}
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>Issued discount codes expire after this many hours.</div>
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Prevent multiple active redemptions</div>
+              <input
+                type="checkbox"
+                name="preventMultipleActiveRedemptions"
+                defaultChecked={settings.preventMultipleActiveRedemptions}
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                If enabled, a customer may only have one active redemption code at a time. Attempts to redeem again will
+                return the existing active code.
+              </div>
+            </label>
+          </div>
+        </section>
+
+        <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
+          <h2 style={{ marginTop: 0 }}>Eligibility filters</h2>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Discount-scope collection handle (optional)</div>
+              <input
+                type="text"
+                name="eligibleCollectionHandle"
+                defaultValue={settings.eligibleCollectionHandle}
+                placeholder="(blank = all products)"
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Optional collection used to scope discount codes. Leave blank to apply discount codes to ALL products.
+              </div>
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Eligible collection GID (cached)</div>
+              <input
+                type="text"
+                name="eligibleCollectionGid"
+                defaultValue={settings.eligibleCollectionGid ?? ""}
+                placeholder="gid://shopify/Collection/1234567890"
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Normally auto-resolved from handle. Leave blank to auto-resolve on save.
+              </div>
+            </label>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Excluded collection handles (comma-separated)</div>
+              <input
+                type="text"
+                name="excludedCollectionHandles"
+                defaultValue={listToCsv(settings.excludedCollectionHandles)}
+                placeholder="lcr_loyalty_excluded"
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Products in any of these collections will NOT earn points. Leave blank to include all products.
+              </div>
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Excluded product IDs (comma-separated)</div>
+              <textarea
+                name="excludedProductIds"
+                defaultValue={listToCsv(settings.excludedProductIds)}
+                rows={3}
+                placeholder="1234567890, gid://shopify/Product/1234567890"
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Explicit per-product exclusions (numeric ID or GID). These products will NOT earn points.
+              </div>
+            </label>
+          </div>
+
+          <label style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}>
+            <input type="checkbox" name="resolveCollectionNow" defaultChecked />
+            <span>Resolve + refresh discount-scope collection GID from handle on save (if handle is set)</span>
+          </label>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Excluded customer tags (comma-separated)</div>
+              <textarea
+                name="excludedCustomerTags"
+                defaultValue={listToCsv(settings.excludedCustomerTags)}
+                rows={3}
+                placeholder="Wholesale"
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Customers with any of these tags cannot earn or redeem.
+              </div>
+            </label>
+
+            <div style={{ display: "grid", gap: 12 }}>
+              <label style={{ display: "grid", gap: 6 }}>
+                <div>Include product tags (comma-separated)</div>
+                <textarea name="includeProductTags" defaultValue={listToCsv(settings.includeProductTags)} rows={3} />
+                <div style={{ fontSize: 12, opacity: 0.75 }}>
+                  If set, a product must have at least one include tag (subject to exclude tags).
+                </div>
+              </label>
+
+              <label style={{ display: "grid", gap: 6 }}>
+                <div>Exclude product tags (comma-separated)</div>
+                <textarea name="excludeProductTags" defaultValue={listToCsv(settings.excludeProductTags)} rows={3} />
+                <div style={{ fontSize: 12, opacity: 0.75 }}>If set, any excluded tag makes a product ineligible.</div>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14 }}>
+          <h2 style={{ marginTop: 0 }}>Redemption options</h2>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Redemption steps (points, comma-separated)</div>
+              <input type="text" name="redemptionSteps" defaultValue={settings.redemptionSteps.join(", ")} />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>Example: 500, 1000, 1500</div>
+            </label>
+
+            <label style={{ display: "grid", gap: 6 }}>
+              <div>Redemption value map (JSON: points → dollars)</div>
+              <textarea
+                name="redemptionValueMap"
+                defaultValue={JSON.stringify(settings.redemptionValueMap, null, 2)}
+                rows={6}
+              />
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                Keys must match the step values. Example: {"{"}"500": 10, "1000": 25{"}"}.
+              </div>
+            </label>
+          </div>
+        </section>
+
+        <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+          <button
+            type="submit"
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #222",
+              background: "#111",
+              color: "white",
+              cursor: "pointer",
+            }}
+          >
+            Save settings
+          </button>
+        </div>
+      </Form>
+
+      <section style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 14, marginTop: 14 }}>
+        <h2 style={{ marginTop: 0 }}>Diagnostics</h2>
+        <div style={{ opacity: 0.7, fontSize: 12, marginBottom: 10 }}>Computed: {diagnostics.computedAt}</div>
+
+        <div style={{ display: "grid", gap: 8 }}>
+          <div>
+            <b>Eligible collection</b>:{" "}
+            {diagnostics.eligibleCollectionFound
+              ? `${diagnostics.eligibleCollectionHandle} (${diagnostics.eligibleCollectionTitle ?? ""})`
+              : diagnostics.eligibleCollectionHandle}
+          </div>
+
+          {diagnostics.eligibleCollectionFound ? (
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              Collection sample:{" "}
+              {diagnostics.collectionProductSample.length
+                ? diagnostics.collectionProductSample.map((p) => p.title).join(", ") +
+                  (diagnostics.collectionProductSampleHasMore ? " …" : "")
+                : "(no products in collection sample)"}
+            </div>
           ) : null}
 
-          {hasWarnings ? (
-            <Banner tone="warning" title="Warnings">
-              <List type="bullet">
-                {diagnostics.warnings.map((w, i) => (
-                  <List.Item key={i}>{w}</List.Item>
-                ))}
-              </List>
-            </Banner>
+          <div style={{ fontSize: 13, opacity: 0.85 }}>
+            Tag filter query: {diagnostics.effectiveProductQuery ?? "(none)"}
+          </div>
+
+          {diagnostics.eligibleProductSample.length ? (
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              Tag-filter sample:{" "}
+              {diagnostics.eligibleProductSample.map((p) => p.title).join(", ")}
+              {diagnostics.eligibleProductSampleHasMore ? " …" : ""}
+            </div>
           ) : null}
+        </div>
 
-          {hasNotes ? (
-            <Banner tone="info" title="Notes">
-              <List type="bullet">
-                {diagnostics.notes.map((n, i) => (
-                  <List.Item key={i}>{n}</List.Item>
-                ))}
-              </List>
-            </Banner>
-          ) : null}
-        </Layout.Section>
+        {hasWarnings ? (
+          <div style={{ marginTop: 12 }}>
+            <h3 style={{ marginBottom: 6 }}>Warnings</h3>
+            <ul style={{ marginTop: 0 }}>
+              {diagnostics.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
 
-        <Layout.Section>
-          <Form id="settings-form" method="post">
-            <Layout>
-              <Layout.Section>
-                <Card>
-                  <BlockStack gap="400">
-                    <Text as="h2" variant="headingMd">Core</Text>
-
-                    <FormLayout>
-                      <TextField
-                        label="Earn rate (points per $1 eligible net merchandise)"
-                        type="number"
-                        name="earnRate"
-                        value={earnRate}
-                        onChange={setEarnRate}
-                        autoComplete="off"
-                        min={"1"}
-                        max={"100"}
-                      />
-
-                      <TextField
-                        label="Minimum order subtotal to redeem ($)"
-                        type="number"
-                        name="redemptionMinOrderDollars"
-                        value={minOrderDollars}
-                        onChange={setMinOrderDollars}
-                        autoComplete="off"
-                        helpText="Example: 25.00 means a $25 minimum subtotal requirement on the discount code."
-                      />
-
-                      <InlineStack gap="400">
-                        <div style={{ flex: 1 }}>
-                          <TextField
-                            label="Points expiry inactivity window (days)"
-                            type="number"
-                            name="pointsExpireInactivityDays"
-                            value={pointsExpireInactivityDays}
-                            onChange={setPointsExpireInactivityDays}
-                            autoComplete="off"
-                            min={"1"}
-                            max={"3650"}
-                            helpText="Points expire after this many days with no qualifying activity (earn or redeem)."
-                          />
-                        </div>
-
-                        <div style={{ flex: 1 }}>
-                          <TextField
-                            label="Discount code expiry (hours)"
-                            type="number"
-                            name="redemptionExpiryHours"
-                            value={redemptionExpiryHours}
-                            onChange={setRedemptionExpiryHours}
-                            autoComplete="off"
-                            min={"1"}
-                            max={"720"}
-                            helpText="Issued discount codes expire after this many hours."
-                          />
-                        </div>
-                      </InlineStack>
-
-                      <Checkbox
-                        label="Prevent multiple active redemptions"
-                        name="preventMultipleActiveRedemptions"
-                        checked={preventMultipleActiveRedemptions}
-                        onChange={(checked) => setPreventMultipleActiveRedemptions(checked)}
-                        helpText="If enabled, a customer may only have one active redemption code at a time. Redeeming again returns the existing active code."
-                      />
-                    </FormLayout>
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-
-              <Layout.Section>
-                <Card>
-                  <BlockStack gap="400">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="h2" variant="headingMd">Eligibility filters</Text>
-                      <InlineStack gap="200">
-                        <Button url={collectionAdminUrl} external>Open collections</Button>
-                      </InlineStack>
-                    </InlineStack>
-
-                    <FormLayout>
-                      <InlineStack gap="400">
-                        <div style={{ flex: 1 }}>
-                          <TextField
-                            label="Eligible collection handle (required)"
-                            name="eligibleCollectionHandle"
-                            value={eligibleCollectionHandle}
-                            onChange={setEligibleCollectionHandle}
-                            autoComplete="off"
-                            placeholder="lcr_loyalty_eligible"
-                            helpText="Collection used to scope discount codes (and earning if enabled). Must exist in the shop."
-                          />
-                        </div>
-                        <div style={{ flex: 1 }}>
-                          <TextField
-                            label="Eligible collection GID (cached)"
-                            name="eligibleCollectionGid"
-                            value={eligibleCollectionGid}
-                            onChange={setEligibleCollectionGid}
-                            autoComplete="off"
-                            helpText="Normally resolved from handle. Leave blank and save to auto-resolve."
-                          />
-                        </div>
-                      </InlineStack>
-
-                      <Checkbox
-                        label="Resolve + refresh collection GID from handle on save"
-                        name="resolveCollectionNow"
-                        checked={resolveCollectionNow}
-                        onChange={(checked) => setResolveCollectionNow(checked)}
-                      />
-
-                      <Divider />
-
-                      <TextField
-                        label="Excluded customer tags (comma-separated)"
-                        name="excludedCustomerTags"
-                        value={excludedCustomerTags}
-                        onChange={setExcludedCustomerTags}
-                        multiline={3}
-                        autoComplete="off"
-                        helpText="Customers with any of these tags cannot earn or redeem."
-                        placeholder="Wholesale"
-                      />
-
-                      <InlineStack gap="400">
-                        <div style={{ flex: 1 }}>
-                          <TextField
-                            label="Include product tags (comma-separated)"
-                            name="includeProductTags"
-                            value={includeProductTags}
-                            onChange={setIncludeProductTags}
-                            multiline={3}
-                            autoComplete="off"
-                            helpText="If set, a product must have at least one include tag (subject to exclude tags)."
-                          />
-                        </div>
-                        <div style={{ flex: 1 }}>
-                          <TextField
-                            label="Exclude product tags (comma-separated)"
-                            name="excludeProductTags"
-                            value={excludeProductTags}
-                            onChange={setExcludeProductTags}
-                            multiline={3}
-                            autoComplete="off"
-                            helpText="If set, any excluded tag makes a product ineligible."
-                          />
-                        </div>
-                      </InlineStack>
-                    </FormLayout>
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-
-              <Layout.Section>
-                <Card>
-                  <BlockStack gap="400">
-                    <Text as="h2" variant="headingMd">Redemption options</Text>
-                    <FormLayout>
-                      <TextField
-                        label="Redemption steps (points, comma-separated)"
-                        name="redemptionSteps"
-                        value={redemptionSteps}
-                        onChange={setRedemptionSteps}
-                        autoComplete="off"
-                        helpText="Example: 500, 1000, 1500"
-                      />
-                      <TextField
-                        label="Redemption value map (JSON: points → dollars)"
-                        name="redemptionValueMap"
-                        value={redemptionValueMap}
-                        onChange={setRedemptionValueMap}
-                        multiline={6}
-                        autoComplete="off"
-                        helpText='Keys must match the step values. Example: {"500": 10, "1000": 25}.'
-                      />
-                    </FormLayout>
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-
-              <Layout.Section>
-                <Card>
-                  <BlockStack gap="200">
-                    <InlineStack align="space-between" blockAlign="center">
-                      <Text as="h2" variant="headingMd">Diagnostics</Text>
-                      <Text as="span" tone="subdued">Computed: {diagnostics.computedAt}</Text>
-                    </InlineStack>
-
-                    <Text as="p" variant="bodyMd">
-                      <b>Eligible collection</b>: {diagnostics.eligibleCollectionFound
-                        ? `${diagnostics.eligibleCollectionHandle} (${diagnostics.eligibleCollectionTitle ?? ""})`
-                        : diagnostics.eligibleCollectionHandle}
-                    </Text>
-
-                    {diagnostics.eligibleCollectionFound ? (
-                      <Text as="p" tone="subdued">
-                        Collection sample: {diagnostics.collectionProductSample.length
-                          ? diagnostics.collectionProductSample.map((p) => p.title).join(", ") + (diagnostics.collectionProductSampleHasMore ? " …" : "")
-                          : "(no products in sample)"}
-                      </Text>
-                    ) : null}
-
-                    <Text as="p" tone="subdued">
-                      Tag filter query: {diagnostics.effectiveProductQuery ?? "(none)"}
-                    </Text>
-
-                    {diagnostics.eligibleProductSample.length ? (
-                      <Text as="p" tone="subdued">
-                        Tag-filter sample: {diagnostics.eligibleProductSample.map((p) => p.title).join(", ")}{diagnostics.eligibleProductSampleHasMore ? " …" : ""}
-                      </Text>
-                    ) : null}
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-            </Layout>
-          </Form>
-        </Layout.Section>
-      </Layout>
-    </Page>
+        {hasNotes ? (
+          <div style={{ marginTop: 12 }}>
+            <h3 style={{ marginBottom: 6 }}>Notes</h3>
+            <ul style={{ marginTop: 0 }}>
+              {diagnostics.notes.map((n, i) => (
+                <li key={i}>{n}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </section>
+    </div>
   );
 }

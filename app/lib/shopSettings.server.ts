@@ -8,8 +8,13 @@ export type ShopSettingsNormalized = {
   redemptionExpiryHours: number;
   preventMultipleActiveRedemptions: boolean;
 
+  // Optional: scope redemption discount codes to a collection handle. Blank => all products.
   eligibleCollectionHandle: string;
   eligibleCollectionGid: string | null;
+
+  // Exclusions: default include all products; exclude by collection handles and/or explicit product ids.
+  excludedCollectionHandles: string[];
+  excludedProductIds: string[];
 
   excludedCustomerTags: string[];
   includeProductTags: string[];
@@ -93,13 +98,14 @@ export function normalizeShopSettings(row: any, shop: string): ShopSettingsNorma
     preventMultipleActiveRedemptions: typeof row?.preventMultipleActiveRedemptions === "boolean" ? row.preventMultipleActiveRedemptions : true,
 
     eligibleCollectionHandle:
-      typeof row?.eligibleCollectionHandle === "string" && row.eligibleCollectionHandle.trim()
-        ? row.eligibleCollectionHandle.trim()
-        : "lcr_loyalty_eligible",
+      typeof row?.eligibleCollectionHandle === "string" ? row.eligibleCollectionHandle.trim() : "",
     eligibleCollectionGid:
       typeof row?.eligibleCollectionGid === "string" && row.eligibleCollectionGid.trim()
         ? row.eligibleCollectionGid.trim()
         : null,
+
+    excludedCollectionHandles: toStringArray(row?.excludedCollectionHandles),
+    excludedProductIds: toStringArray(row?.excludedProductIds),
 
     excludedCustomerTags: toStringArray(row?.excludedCustomerTags),
     includeProductTags: toStringArray(row?.includeProductTags),
@@ -131,6 +137,8 @@ export async function upsertShopSettings(shop: string, input: Partial<ShopSettin
     preventMultipleActiveRedemptions: input.preventMultipleActiveRedemptions,
     eligibleCollectionHandle: input.eligibleCollectionHandle,
     eligibleCollectionGid: input.eligibleCollectionGid,
+    excludedCollectionHandles: input.excludedCollectionHandles,
+    excludedProductIds: input.excludedProductIds,
     excludedCustomerTags: input.excludedCustomerTags,
     includeProductTags: input.includeProductTags,
     excludeProductTags: input.excludeProductTags,

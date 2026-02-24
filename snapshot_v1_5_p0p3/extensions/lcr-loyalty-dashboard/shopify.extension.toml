@@ -1,0 +1,22 @@
+api_version = "2026-01"
+
+[[extensions]]
+
+uid = "a63729b7-9ab6-9ea6-a95f-8e942344efb1cf5ed67d"
+type = "ui_extension"
+name = "lcr-loyalty-dashboard"
+handle = "lcr-loyalty-dashboard"
+
+[[extensions.targeting]]
+module = "./src/index.tsx"
+target = "customer-account.page.render"
+
+[extensions.capabilities]
+api_access = true
+network_access = true
+
+[[extensions.settings.fields]]
+key = "app_base_url"
+name = "LCR Base URL"
+type = "single_line_text_field"
+description = "Public base URL for the app (used by the customer account extension to call /api/customer/*). Example: https://loyalty.basketbooster.ca"

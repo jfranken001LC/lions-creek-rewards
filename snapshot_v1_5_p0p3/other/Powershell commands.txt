@@ -1,0 +1,16 @@
+npm run dev
+npm run deploy
+
+shopify app deploy
+
+shopify app dev --reset --use-localhost -s lions-creek-dev-3.myshopify.com 
+
+
+Start-Transcript -Path ".\shopify-dev-log.txt" -Append
+Stop-Transcript
+
+shopify app dev clean -s lions-creek-dev-3.myshopify.com
+
+
+shopify app dev --store lions-creek-dev-3.myshopify.com --reset
+

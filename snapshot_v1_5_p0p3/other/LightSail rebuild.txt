@@ -1,0 +1,67 @@
+git fetch --all --prune
+
+git checkout main
+
+git reset --hard origin/main
+
+git log --oneline --decorate --graph --all
+
+===
+
+TROUBLESHOOTING
+# 1) Is nginx complaining about upstream?
+sudo tail -n 200 /var/log/nginx/error.log
+
+# 2) Is your node service running?
+sudo systemctl status basketbooster -l --no-pager
+journalctl -u basketbooster -n 200 -l --no-pager
+
+# 3) Is anything actually listening on port 3000?
+sudo ss -ltnp | grep ':3000' || true
+
+# 4) Can we hit the app locally (bypassing nginx)?
+curl -sv http://127.0.0.1:3000/ -o /dev/null
+
+
+===
+
+Setting box environment variables
+1) Identify the systemd unit for the running Node process
+
+Run:
+
+cat /proc/$(pgrep -f "react-router-serve ./build/server/index.js" | head -n 1)/cgroup | sed -n 's#.*system.slice/\(.*\.service\).*#\1#p' | head -n 1
+
+
+This prints something like: basketbooster.service (or similar).
+
+Save it as UNIT:
+
+UNIT=$(cat /proc/$(pgrep -f "react-router-serve ./build/server/index.js" | head -n 1)/cgroup | sed -n 's#.*system.slice/\(.*\.service\).*#\1#p' | head -n 1)
+echo $UNIT
+
+2) Show where the environment is defined
+sudo systemctl show "$UNIT" -p FragmentPath -p EnvironmentFiles -p Environment -p ExecStart
+
+3) sudo systemctl cat "$UNIT"
+
+
+from inside file =>  EnvironmentFile=/var/www/basketbooster/.env
+===
+
+If the box becomes unresponsive again: quick recovery
+
+When you can get in via the Lightsail browser SSH:
+
+# see if you had an out-of-memory kill
+dmesg | egrep -i 'killed process|oom' | tail -n 50
+
+# kill any stuck npm/node
+sudo pkill -f npm || true
+sudo pkill -f node || true
+
+
+Check disk:
+
+df -h
+du -sh /var/www/basketbooster/node_modules 2>/dev/null

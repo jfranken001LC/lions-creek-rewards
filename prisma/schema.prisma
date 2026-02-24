@@ -64,9 +64,17 @@ model ShopSettings {
   // If true, customers may have at most one active redemption at a time.
   preventMultipleActiveRedemptions Boolean @default(true)
 
-  eligibleCollectionHandle   String   @default("lcr_loyalty_eligible")
+  /// Optional collection handle used to scope *discount codes* (redemptions).
+  /// If blank, discount codes apply to all products.
+  eligibleCollectionHandle   String   @default("")
   // Cached GID for the eligible collection (optional)
   eligibleCollectionGid      String?
+
+  /// Optional list of collection handles that EXCLUDE products from earning.
+  excludedCollectionHandles  Json?
+
+  /// Optional list of Product numeric IDs or GIDs to EXCLUDE from earning.
+  excludedProductIds         Json?
 
   excludedCustomerTags       Json?
   includeProductTags         Json?
