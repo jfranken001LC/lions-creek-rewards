@@ -1,0 +1,12 @@
+api_version = "2026-01"
+
+[[extensions]]
+
+uid = "9c2c4b6c-88a1-4f1f-9a9c-8d2e6a9f6c2b3f6e"
+type = "ui_extension"
+name = "lcr-loyalty-nav"
+handle = "lcr-loyalty-nav"
+
+[[extensions.targeting]]
+module = "./src/index.tsx"
+target = "customer-account.footer.render-after"
