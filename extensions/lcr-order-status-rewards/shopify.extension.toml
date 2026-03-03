@@ -1,0 +1,21 @@
+api_version = "2026-01"
+
+[[extensions]]
+uid = "c7a3f52c-7b2b-4c64-bf2c-2a8e6b0d8f22"
+type = "ui_extension"
+name = "lcr-order-status-rewards"
+handle = "lcr-order-status-rewards"
+
+[[extensions.targeting]]
+module = "./src/index.tsx"
+target = "customer-account.order-status.block.render"
+
+[extensions.capabilities]
+api_access = true
+network_access = true
+
+[[extensions.settings.fields]]
+key = "app_base_url"
+name = "LCR Base URL"
+type = "single_line_text_field"
+description = "Public base URL for the app (used to call /api/order/rewards). Example: https://loyalty.basketbooster.ca"

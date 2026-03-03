@@ -11,9 +11,13 @@ export type IssueRedemptionArgs = {
   idempotencyKey?: string;
 };
 
+export type RedemptionClientStatus = "ISSUED" | "APPLIED" | "EXPIRED" | "CANCELED";
+
 export type IssueRedemptionResult =
   | {
       ok: true;
+      redemptionId: string;
+      status: RedemptionClientStatus;
       code: string;
       expiresAt: string;
       pointsRedeemed: number;
@@ -42,6 +46,31 @@ function makeAdminGraphql(shop: string, accessToken: string): AdminGraphql {
       body: JSON.stringify({ query, variables: args?.variables ?? {} }),
     });
   };
+}
+
+function toClientRedemptionStatus(status: RedemptionStatus | string): RedemptionClientStatus {
+  switch (status) {
+    case RedemptionStatus.ISSUED:
+    case "ISSUED":
+      return "ISSUED";
+    case RedemptionStatus.APPLIED:
+    case "APPLIED":
+      return "APPLIED";
+    case RedemptionStatus.EXPIRED:
+    case "EXPIRED":
+      return "EXPIRED";
+    case RedemptionStatus.CANCELLED:
+    case "CANCELLED":
+    case RedemptionStatus.VOID:
+    case "VOID":
+      return "CANCELED";
+    case RedemptionStatus.CONSUMED:
+    case "CONSUMED":
+      // UI contract doesn't expose a distinct "CONSUMED"; treat as applied.
+      return "APPLIED";
+    default:
+      return "CANCELED";
+  }
 }
 
 function isInt(n: unknown): n is number {
@@ -228,7 +257,7 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
     if (idemKey) {
       const existing = await db.redemption.findFirst({
         where: { shop, customerId, idempotencyKey: idemKey },
-        select: { code: true, expiresAt: true, points: true, valueDollars: true },
+        select: { id: true, code: true, status: true, expiresAt: true, points: true, valueDollars: true },
       });
 
       if (existing) {
@@ -241,6 +270,8 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
 
         return {
           ok: true,
+          redemptionId: existing.id,
+          status: toClientRedemptionStatus(existing.status),
           code: existing.code,
           expiresAt: (existing.expiresAt ?? new Date()).toISOString(),
           pointsRedeemed: existing.points,
@@ -297,6 +328,8 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
 
       return {
         ok: true,
+        redemptionId: active.id,
+        status: toClientRedemptionStatus(active.status),
         code: active.code,
         expiresAt: (active.expiresAt ?? new Date()).toISOString(),
         pointsRedeemed: active.points,
@@ -329,6 +362,7 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
   if (!created.ok) return { ok: false, error: created.error };
 
   let newBalance: number | null = null;
+  let redemptionId: string | null = null;
 
   try {
     await db.$transaction(async (tx) => {
@@ -361,6 +395,8 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
         select: { id: true },
       });
 
+      redemptionId = redemption.id;
+
       await tx.pointsLedger.create({
         data: {
           shop,
@@ -376,10 +412,12 @@ export async function issueRedemptionCode(args: IssueRedemptionArgs): Promise<Is
     return { ok: false, error: e?.message ?? "Failed to record redemption" };
   }
 
-  if (newBalance === null) return { ok: false, error: "Failed to compute new balance" };
+  if (newBalance === null || !redemptionId) return { ok: false, error: "Failed to compute redemption result" };
 
   return {
     ok: true,
+    redemptionId: redemptionId ?? "",
+    status: "ISSUED",
     code: created.code,
     expiresAt: expires.toISOString(),
     pointsRedeemed: pointsRequested,

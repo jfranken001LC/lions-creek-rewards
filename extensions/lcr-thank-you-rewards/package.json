@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@shopify/ui-extensions-react/checkout": "2026.1.1",
+    "react": "18.3.1"
+  }
+}

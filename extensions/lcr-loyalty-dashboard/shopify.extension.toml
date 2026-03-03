@@ -11,6 +11,10 @@ handle = "lcr-loyalty-dashboard"
 module = "./src/index.tsx"
 target = "customer-account.page.render"
 
+
+[extensions.targeting.capabilities]
+allow_direct_linking = true
+
 [extensions.capabilities]
 api_access = true
 network_access = true

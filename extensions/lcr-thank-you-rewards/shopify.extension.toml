@@ -1,0 +1,26 @@
+api_version = "2026-01"
+
+[[extensions]]
+uid = "0d2e4a75-2b73-4a69-8c7b-3f7f1f6dd0e1"
+type = "ui_extension"
+name = "lcr-thank-you-rewards"
+handle = "lcr-thank-you-rewards"
+
+[[extensions.targeting]]
+module = "./src/index.tsx"
+target = "purchase.thank-you.block.render"
+
+[extensions.capabilities]
+network_access = true
+
+[[extensions.settings.fields]]
+key = "app_base_url"
+name = "LCR Base URL"
+type = "single_line_text_field"
+description = "Public base URL for the app (used to call /api/order/rewards). Example: https://loyalty.basketbooster.ca"
+
+[[extensions.settings.fields]]
+key = "rewards_page_url"
+name = "Rewards page URL (optional)"
+type = "single_line_text_field"
+description = "Optional full URL for the Rewards customer account page (use this if your store uses a different accounts domain or market prefixes). Example: https://yourstore.com/account/lcr-loyalty-dashboard/"

@@ -14,8 +14,14 @@ export default [
   route("api/customer/loyalty", "routes/api.customer.loyalty.tsx"),
   route("api/customer/redeem", "routes/api.customer.redeem.tsx"),
 
+  // Post-checkout (Thank you / Order Status) rewards polling (v1.8)
+  route("api/order/rewards", "routes/api.order.rewards.tsx"),
+
   // Signed app-proxy JSON endpoint (optional)
   route("loyalty.json", "routes/loyalty.json.tsx"),
+
+  // Signed app-proxy action endpoint (v1.8)
+  route("redeem.json", "routes/redeem.json.tsx"),
 
   // Legacy/demo page (optional)
   route("loyalty", "routes/loyalty.tsx"),

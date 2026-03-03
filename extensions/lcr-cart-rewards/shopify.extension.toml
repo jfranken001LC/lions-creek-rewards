@@ -1,0 +1,6 @@
+api_version = "2026-01"
+
+[[extensions]]
+type = "theme_app_extension"
+name = "lcr-cart-rewards"
+handle = "lcr-cart-rewards"

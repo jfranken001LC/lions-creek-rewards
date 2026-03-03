@@ -1,0 +1,44 @@
+<div
+  class="lcr-cart-rewards shopify-block"
+  data-lcr-cart-rewards
+  data-proxy-path="{{ block.settings.app_proxy_path }}"
+  data-cart-subtotal-cents="{{ cart.items_subtotal_price | default: cart.total_price }}"
+>
+  <div class="lcr-title">Lions Creek Rewards</div>
+  <div class="lcr-status" data-lcr-status>Loading…</div>
+  <div class="lcr-body" data-lcr-body></div>
+</div>
+
+<style>
+  .lcr-cart-rewards { padding: 12px; border: 1px solid rgba(0,0,0,.12); border-radius: 10px; }
+  .lcr-title { font-weight: 700; margin-bottom: 6px; }
+  .lcr-status { font-size: 0.95em; margin-bottom: 8px; }
+  .lcr-muted { opacity: 0.8; font-size: 0.9em; }
+  .lcr-row { margin: 6px 0; }
+  .lcr-options { display: grid; gap: 6px; margin: 10px 0; }
+  .lcr-option { display: flex; gap: 8px; align-items: center; font-size: 0.95em; }
+  .lcr-btn { padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(0,0,0,.2); cursor: pointer; }
+  .lcr-btn[disabled] { opacity: 0.6; cursor: not-allowed; }
+  .lcr-active { margin: 8px 0; padding: 8px; border-radius: 8px; background: rgba(0,0,0,.04); }
+  .lcr-hint { margin-top: 8px; }
+</style>
+
+{% schema %}
+{
+  "name": "Lions Creek Rewards (Cart)",
+  "target": "section",
+  "javascript": "lcr-cart-rewards.js",
+  "enabled_on": {
+    "templates": ["cart"]
+  },
+  "settings": [
+    {
+      "type": "text",
+      "id": "app_proxy_path",
+      "label": "App proxy path",
+      "default": "/apps/lions-creek-rewards",
+      "info": "The storefront path for your app proxy. Example: /apps/lions-creek-rewards"
+    }
+  ]
+}
+{% endschema %}
