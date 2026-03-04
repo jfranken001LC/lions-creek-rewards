@@ -1,64 +1,45 @@
-import { data, Link, Outlet, useLoaderData, useLocation } from "react-router";
-import type { LoaderFunctionArgs } from "react-router";
+import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
+import { Link, Outlet, useLoaderData, useRouteError } from "react-router";
 
-import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-router/react";
-import * as AppBridgeReact from "@shopify/app-bridge-react";
+import { boundary } from "@shopify/shopify-app-react-router/server";
+import { NavMenu } from "@shopify/app-bridge-react";
+import { AppProvider } from "@shopify/shopify-app-react-router/react";
 
 import { authenticate } from "../shopify.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
-  return data({ apiKey: process.env.SHOPIFY_API_KEY ?? "" });
+  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
 };
 
 export default function App() {
   const { apiKey } = useLoaderData<typeof loader>();
 
-  const { search } = useLocation();
-  const withSearch = (path: string) => (search ? `${path}${search}` : path);
-
-
-  // App Bridge React has had breaking changes across major versions:
-  // - Legacy: `NavigationMenu` component (props: navigationLinks)
-  // - Current: `NavMenu` component (children anchors/Links)
-  // This compatibility wrapper lets the app build on environments that have
-  // either version installed, avoiding production-only build failures.
-  const NavMenu = (AppBridgeReact as any).NavMenu as
-    | undefined
-    | React.ComponentType<{ children: React.ReactNode }>;
-  const NavigationMenu = (AppBridgeReact as any).NavigationMenu as
-    | undefined
-    | React.ComponentType<{ navigationLinks: { label: string; destination: string }[] }>;
-
-  const navLinks = [
-    { label: "Dashboard", destination: withSearch("/app") },
-    { label: "Settings", destination: withSearch("/app/settings") },
-    { label: "Customers", destination: withSearch("/app/customers") },
-    { label: "Redemptions", destination: withSearch("/app/redemptions") },
-    { label: "Webhooks", destination: withSearch("/app/webhooks") },
-    { label: "Reports", destination: withSearch("/app/reports") },
-    { label: "Support", destination: withSearch("/app/support") },
-  ];
-
   return (
-    <ShopifyAppProvider embedded apiKey={apiKey}>
-        {NavMenu ? (
-          <NavMenu>
-            {/* rel="home" helps Shopify treat this as the app root in some contexts */}
-            <Link to={withSearch("/app")} rel="home">
-              Dashboard
-            </Link>
-            <Link to={withSearch("/app/settings")}>Settings</Link>
-            <Link to={withSearch("/app/customers")}>Customers</Link>
-            <Link to={withSearch("/app/redemptions")}>Redemptions</Link>
-            <Link to={withSearch("/app/webhooks")}>Webhooks</Link>
-            <Link to={withSearch("/app/reports")}>Reports</Link>
-            <Link to={withSearch("/app/support")}>Support</Link>
-          </NavMenu>
-        ) : NavigationMenu ? (
-          <NavigationMenu navigationLinks={navLinks} />
-        ) : null}
-        <Outlet />
-    </ShopifyAppProvider>
+    <AppProvider embedded apiKey={apiKey}>
+      <NavMenu>
+        {/* rel="home" helps Shopify treat this as the app root */}
+        <Link to="/app" rel="home">
+          Dashboard
+        </Link>
+        <Link to="/app/settings">Settings</Link>
+        <Link to="/app/customers">Customers</Link>
+        <Link to="/app/redemptions">Redemptions</Link>
+        <Link to="/app/webhooks">Webhooks</Link>
+        <Link to="/app/reports">Reports</Link>
+        <Link to="/app/support">Support</Link>
+      </NavMenu>
+
+      <Outlet />
+    </AppProvider>
   );
 }
+
+// Shopify needs React Router to catch some thrown responses, so that their headers are included in the response.
+export function ErrorBoundary() {
+  return boundary.error(useRouteError());
+}
+
+export const headers: HeadersFunction = (headersArgs) => {
+  return boundary.headers(headersArgs);
+};
