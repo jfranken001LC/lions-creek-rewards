@@ -23,3 +23,14 @@ shopify app dev --store lions-creek-dev-3.myshopify.com --reset
 Start-Transcript -Path "C:\Users\janfr\source\Shopify\lions-creek-rewards\logfile.txt"
 
 Stop-Transcript
+
+
+===
+
+ipconfig /flushdns
+nslookup api.trycloudflare.com
+
+---
+
+Set-DnsClientServerAddress -InterfaceAlias "Wi-Fi" -ServerAddresses ("1.1.1.1","1.0.0.1")
+ipconfig /flushdns

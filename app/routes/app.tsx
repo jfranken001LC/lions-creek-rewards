@@ -2,8 +2,6 @@ import { data, Link, Outlet, useLoaderData, useLocation } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 
 import { AppProvider as ShopifyAppProvider } from "@shopify/shopify-app-react-router/react";
-import { AppProvider as PolarisAppProvider } from "@shopify/polaris";
-import enTranslations from "@shopify/polaris/locales/en.json";
 import * as AppBridgeReact from "@shopify/app-bridge-react";
 
 import { authenticate } from "../shopify.server";
@@ -44,7 +42,6 @@ export default function App() {
 
   return (
     <ShopifyAppProvider embedded apiKey={apiKey}>
-      <PolarisAppProvider i18n={enTranslations}>
         {NavMenu ? (
           <NavMenu>
             {/* rel="home" helps Shopify treat this as the app root in some contexts */}
@@ -62,7 +59,6 @@ export default function App() {
           <NavigationMenu navigationLinks={navLinks} />
         ) : null}
         <Outlet />
-      </PolarisAppProvider>
     </ShopifyAppProvider>
   );
 }

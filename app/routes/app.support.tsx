@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { data, Link, useLoaderData } from "react-router";
+import { data, Link, useLoaderData, useLocation } from "react-router";
 import {
   Page,
   Layout,

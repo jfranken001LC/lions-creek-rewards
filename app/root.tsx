@@ -9,6 +9,8 @@ import {
   ScrollRestoration,
 } from "react-router";
 
+import { AppProvider as PolarisAppProvider } from "@shopify/polaris";
+import enTranslations from "@shopify/polaris/locales/en.json";
 import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
 
 export const links = () => [
@@ -34,7 +36,11 @@ export function Layout({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
-  return <Outlet />;
+  return (
+    <PolarisAppProvider i18n={enTranslations}>
+      <Outlet />
+    </PolarisAppProvider>
+  );
 }
 
 function formatRouteError(error: unknown): { title: string; details?: string } {
