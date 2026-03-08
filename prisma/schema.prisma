@@ -54,36 +54,49 @@ enum WebhookOutcome {
 }
 
 model ShopSettings {
-  shop                      String   @id
-  earnRate                   Int      @default(1)
-  redemptionMinOrder         Int      @default(0)
-
-  pointsExpireInactivityDays Int      @default(365)
-  redemptionExpiryHours      Int      @default(72)
-
-  // If true, customers may have at most one active redemption at a time.
-  preventMultipleActiveRedemptions Boolean @default(true)
+  shop                              String   @id
+  earnRate                          Int      @default(1)
+  redemptionMinOrder                Int      @default(0)
+  pointsExpireInactivityDays        Int      @default(365)
+  redemptionExpiryHours             Int      @default(72)
+  preventMultipleActiveRedemptions  Boolean  @default(true)
 
   /// Optional collection handle used to scope *discount codes* (redemptions).
   /// If blank, discount codes apply to all products.
-  eligibleCollectionHandle   String   @default("")
-  // Cached GID for the eligible collection (optional)
-  eligibleCollectionGid      String?
+  eligibleCollectionHandle          String   @default("")
+  eligibleCollectionGid             String?
 
   /// Optional list of collection handles that EXCLUDE products from earning.
-  excludedCollectionHandles  Json?
+  excludedCollectionHandles         Json?
+  excludedProductIds                Json?
 
-  /// Optional list of Product numeric IDs or GIDs to EXCLUDE from earning.
-  excludedProductIds         Json?
+  excludedCustomerTags              Json?
+  includeProductTags                Json?
+  excludeProductTags                Json?
+  redemptionSteps                   Json?
+  redemptionValueMap                Json?
 
-  excludedCustomerTags       Json?
-  includeProductTags         Json?
-  excludeProductTags         Json?
-  redemptionSteps            Json?
-  redemptionValueMap         Json?
+  createdAt                         DateTime @default(now())
+  updatedAt                         DateTime @updatedAt
+}
 
-  createdAt                  DateTime @default(now())
-  updatedAt                  DateTime @updatedAt
+model TierDefinition {
+  id                    String   @id @default(cuid())
+  shop                  String
+  tierId                String
+  name                  String
+  sortOrder             Int      @default(0)
+  thresholdType         String   @default("lifetimeEarned")
+  thresholdValue        Int      @default(0)
+  earnRateMultiplier    Float    @default(1)
+  pointsPerDollarOverride Int?
+  effectiveFrom         DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([shop, tierId], name: "shop_tierId")
+  @@unique([shop, sortOrder], name: "shop_sortOrder")
+  @@index([shop, thresholdType, thresholdValue])
 }
 
 model CustomerPointsBalance {
@@ -93,6 +106,10 @@ model CustomerPointsBalance {
   balance          Int      @default(0)
   lifetimeEarned   Int      @default(0)
   lifetimeRedeemed Int      @default(0)
+
+  currentTierId    String?
+  currentTierName  String?
+  tierComputedAt   DateTime?
 
   lastActivityAt   DateTime @default(now())
   expiredAt        DateTime?
@@ -143,7 +160,7 @@ model Redemption {
   restoredAt      DateTime?
   restoreReason   String?
 
-  idempotencyKey         String?
+  idempotencyKey  String?
 
   @@unique([shop, customerId, idempotencyKey], name: "redemption_idem")
   @@unique([shop, code], name: "shop_code")
@@ -167,20 +184,19 @@ model WebhookEvent {
 }
 
 model WebhookError {
-  id          String   @id @default(cuid())
-  shop        String
-  topic       String
-  webhookId   String?
-  resourceId  String?
+  id           String   @id @default(cuid())
+  shop         String
+  topic        String
+  webhookId    String?
+  resourceId   String?
   errorMessage String
-  stack       String?
-  payload     Json?
-  createdAt   DateTime @default(now())
+  stack        String?
+  payload      Json?
+  createdAt    DateTime @default(now())
 
   @@index([shop, topic, createdAt])
   @@index([shop, createdAt])
 }
-
 
 model PrivacyEvent {
   id          String   @id @default(cuid())
@@ -199,9 +215,13 @@ model OrderPointsSnapshot {
   orderName              String?
   customerId             String
 
-  eligibleNetMerchandise Int      @default(0) // cents
+  eligibleNetMerchandise Int      @default(0)
   pointsAwarded          Int      @default(0)
   pointsReversedToDate   Int      @default(0)
+
+  effectiveTierId        String?
+  effectiveTierName      String?
+  effectiveEarnRate      Int?
 
   paidAt                 DateTime
   cancelledAt            DateTime?

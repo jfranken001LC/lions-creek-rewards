@@ -4,6 +4,7 @@ import { LedgerType, RedemptionStatus, WebhookOutcome } from "@prisma/client";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getShopSettings } from "../lib/shopSettings.server";
+import { buildTierProgress, computeEffectiveEarnRate, refreshCustomerTierSnapshot } from "../lib/tier.server";
 import { fetchCustomerTags, resolveEligibleCollectionGid, type AdminGraphql } from "../lib/shopifyQueries.server";
 
 type HandleResult = { outcome: WebhookOutcome; message?: string };
@@ -644,7 +645,13 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
   }
 
   const eligibleDollarUnits = Math.floor(eligibleNetCents / 100);
-  const pointsEarned = excluded ? 0 : Math.max(0, eligibleDollarUnits * settings.earnRate);
+  const existingBalance = await db.customerPointsBalance.findUnique({
+    where: { shop_customerId: { shop, customerId } },
+    select: { lifetimeEarned: true },
+  } as any);
+  const progressBeforeAward = buildTierProgress(settings, Number((existingBalance as any)?.lifetimeEarned ?? 0));
+  const effectiveEarnRate = excluded ? 0 : computeEffectiveEarnRate(settings, progressBeforeAward.currentTier);
+  const pointsEarned = excluded ? 0 : Math.max(0, eligibleDollarUnits * effectiveEarnRate);
 
   await db.$transaction(async (tx) => {
     await tx.orderPointsSnapshot.create({
@@ -656,12 +663,14 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
         eligibleNetMerchandise: eligibleNetCents,
         pointsAwarded: pointsEarned,
         pointsReversedToDate: 0,
+        effectiveTierId: progressBeforeAward.currentTier.tierId,
+        effectiveTierName: progressBeforeAward.currentTier.name,
+        effectiveEarnRate,
         paidAt: new Date(),
         discountCodesJson: payload?.discount_codes ? payload.discount_codes : null,
-      },
-    });
+      } as any,
+    } as any);
 
-    // Always treat a paid order as "activity" for non-excluded customers (prevents inactivity expiry even if 0 points earned)
     if (!excluded) {
       await applyBalanceDelta(tx, shop, customerId, 0, {});
     }
@@ -675,11 +684,12 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
           delta: pointsEarned,
           source: "ORDER",
           sourceId: orderId,
-          description: `Earned ${pointsEarned} point(s) from order ${orderName}.`,
+          description: `Earned ${pointsEarned} point(s) from order ${orderName} as ${progressBeforeAward.currentTier.name}.`,
         },
       });
 
       await applyBalanceDelta(tx, shop, customerId, pointsEarned, { incEarned: pointsEarned });
+      await refreshCustomerTierSnapshot(shop, customerId, tx);
     }
   });
 
@@ -773,6 +783,7 @@ async function handleRefundCreate(args: { shop: string; payload: any; admin: any
     });
 
     await applyBalanceDelta(tx, shop, customerId, -pointsToReverse, {});
+    await refreshCustomerTierSnapshot(shop, customerId, tx);
     await tx.orderPointsSnapshot.update({
       where: { shop_orderId: { shop, orderId } },
       data: { pointsReversedToDate: { increment: pointsToReverse } },
@@ -820,6 +831,7 @@ async function handleOrdersCancelled(args: { shop: string; payload: any }): Prom
     });
 
     await applyBalanceDelta(tx, shop, customerId, -remaining, {});
+    await refreshCustomerTierSnapshot(shop, customerId, tx);
     await tx.orderPointsSnapshot.update({
       where: { shop_orderId: { shop, orderId } },
       data: { pointsReversedToDate: snapshot.pointsAwarded, cancelledAt: new Date() },
@@ -853,6 +865,9 @@ async function applyBalanceDelta(
         balance: Math.max(0, delta),
         lifetimeEarned: opts.incEarned ?? 0,
         lifetimeRedeemed: opts.incRedeemed ?? 0,
+        currentTierId: null,
+        currentTierName: null,
+        tierComputedAt: now,
         lastActivityAt: now,
         expiredAt: null,
       },
@@ -866,6 +881,7 @@ async function applyBalanceDelta(
       balance: Math.max(0, existing.balance + delta),
       ...(opts.incEarned ? { lifetimeEarned: { increment: opts.incEarned } } : {}),
       ...(opts.incRedeemed ? { lifetimeRedeemed: { increment: opts.incRedeemed } } : {}),
+      tierComputedAt: now,
       lastActivityAt: now,
       expiredAt: null,
     },

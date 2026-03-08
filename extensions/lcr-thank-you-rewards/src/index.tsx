@@ -1,4 +1,3 @@
-/* eslint-disable react/self-closing-comp */
 import "@shopify/ui-extensions/preact";
 
 import { render } from "preact";
@@ -11,6 +10,10 @@ type RewardsPending = {
   status: "pending";
   pointsEarned: null;
   balance: null;
+  currentTierName: null;
+  effectiveEarnRate: null;
+  nextTierName: null;
+  remainingToNext: null;
   nextRewardMessage: string | null;
 };
 
@@ -19,6 +22,10 @@ type RewardsReady = {
   status: "ready";
   pointsEarned: number;
   balance: number;
+  currentTierName: string | null;
+  effectiveEarnRate: number | null;
+  nextTierName: string | null;
+  remainingToNext: number | null;
   nextRewardMessage: string | null;
 };
 
@@ -30,88 +37,57 @@ export default async () => {
   render(<Extension />, document.body);
 };
 
-function normalizeUrl(u: string): string {
-  return String(u || "").trim();
-}
-
 function normalizeBaseUrl(u: string): string {
-  return normalizeUrl(u).replace(/\/+$/, "");
-}
-
-function getSettingsCurrent(): any {
-  // Per Shopify 2025-10+ UI extensions, settings are exposed on global shopify object.
-  return shopify?.settings?.current ?? shopify?.settings ?? null;
+  return String(u || "").trim().replace(/\/+$/, "");
 }
 
 function getAppBaseUrlFromSettings(): string {
-  const s = getSettingsCurrent();
+  const s = shopify?.settings?.current ?? shopify?.settings?.value ?? {};
   const raw = (s && (s.app_base_url || s.appBaseUrl || s.baseUrl)) || "";
   return normalizeBaseUrl(String(raw || ""));
 }
 
 function getRewardsPageUrlFromSettings(): string {
-  const s = getSettingsCurrent();
+  const s = shopify?.settings?.current ?? shopify?.settings?.value ?? {};
   const raw = (s && (s.rewards_page_url || s.rewardsPageUrl || s.rewards_url)) || "";
-  const u = normalizeUrl(String(raw || ""));
-
-  // Default: customer accounts deep link to the full-page extension.
-  // Merchant can override to absolute URL if their account URL differs.
-  return u || "/account/lcr-loyalty-dashboard/";
+  const normalized = String(raw || "").trim();
+  return normalized || "extension:lcr-loyalty-dashboard/";
 }
 
-function useSettingsBaseUrl(): { appBaseUrl: string; rewardsPageUrl: string } {
+function Extension() {
   const [appBaseUrl, setAppBaseUrl] = useState<string>(() => getAppBaseUrlFromSettings());
   const [rewardsPageUrl, setRewardsPageUrl] = useState<string>(() => getRewardsPageUrlFromSettings());
+  const [orderId, setOrderId] = useState<string | null>(null);
+  const [state, setState] = useState<RewardsResponse | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
 
   useEffect(() => {
-    const sig = shopify?.settings;
-    if (sig && typeof sig.subscribe === "function") {
-      return sig.subscribe((next: any) => {
+    const signal = shopify?.settings;
+    if (signal && typeof signal.subscribe === "function") {
+      return signal.subscribe((next: any) => {
         const rawBase = next?.app_base_url ?? next?.appBaseUrl ?? next?.baseUrl ?? "";
         setAppBaseUrl(normalizeBaseUrl(String(rawBase || "")));
-
         const rawRewards = next?.rewards_page_url ?? next?.rewardsPageUrl ?? next?.rewards_url ?? "";
-        const u = normalizeUrl(String(rawRewards || ""));
-        setRewardsPageUrl(u || "/account/lcr-loyalty-dashboard/");
+        setRewardsPageUrl(String(rawRewards || "").trim() || "extension:lcr-loyalty-dashboard/");
       });
     }
   }, []);
-
-  return { appBaseUrl, rewardsPageUrl };
-}
-
-function useOrderId(): string | null {
-  const initial = shopify?.orderConfirmation?.value?.order?.id ?? null;
-  const [orderId, setOrderId] = useState<string | null>(initial ? String(initial) : null);
 
   useEffect(() => {
     const sig = shopify?.orderConfirmation;
     if (sig && typeof sig.subscribe === "function") {
-      return sig.subscribe((oc: any) => {
-        const id = oc?.order?.id ?? null;
-        setOrderId(id ? String(id) : null);
+      return sig.subscribe((payload: any) => {
+        const id = payload?.id ?? payload?.order?.id ?? null;
+        if (id) setOrderId(String(id));
       });
     }
   }, []);
-
-  return orderId;
-}
-
-function Extension() {
-  const { appBaseUrl, rewardsPageUrl } = useSettingsBaseUrl();
-  const orderId = useOrderId();
-
-  const [state, setState] = useState<RewardsResponse | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
-
-  const canPoll = useMemo(() => Boolean(appBaseUrl && orderId), [appBaseUrl, orderId]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function poll() {
-      if (!canPoll) return;
-
+      if (!appBaseUrl || !orderId) return;
       setLoading(true);
 
       const maxAttempts = 20;
@@ -127,11 +103,11 @@ function Extension() {
           });
 
           const data = (await res.json().catch(() => null)) as RewardsResponse | null;
-
           if (cancelled) return;
 
           if (!data) {
             setState({ ok: false, error: "Invalid response from server" });
+            setLoading(false);
             return;
           }
 
@@ -155,60 +131,35 @@ function Extension() {
     }
 
     poll();
-
     return () => {
       cancelled = true;
     };
-  }, [canPoll, appBaseUrl, orderId]);
+  }, [appBaseUrl, orderId]);
 
-  if (!appBaseUrl) {
-    return (
-      <s-section>
-        <s-banner status="warning">
-          <s-text emphasis="bold">Lions Creek Rewards</s-text>
-          <s-text>Missing extension setting: app_base_url</s-text>
-        </s-banner>
-      </s-section>
-    );
-  }
+  const message = useMemo(() => {
+    if (!appBaseUrl) return "Rewards block is missing its base URL configuration.";
+    if (!orderId) return "Loading order…";
+    if (!state || (state.ok === true && state.status === "pending")) return "Processing rewards…";
+    if (state.ok === false) return `Rewards: ${state.error}`;
+    const tierText = state.currentTierName ? ` Tier: ${state.currentTierName}.` : "";
+    const nextTierText =
+      state.nextTierName && state.remainingToNext != null
+        ? ` ${state.remainingToNext} point(s) to reach ${state.nextTierName}.`
+        : "";
+    return `You earned ${state.pointsEarned} point(s). Balance: ${state.balance}.${tierText}${nextTierText}`;
+  }, [appBaseUrl, orderId, state]);
 
   return (
     <s-section>
       <s-stack direction="block" spacing="tight">
         <s-text emphasis="bold">Lions Creek Rewards</s-text>
-
-        {loading && (
-          <s-stack direction="inline" spacing="tight" align="center">
-            <s-spinner size="small"></s-spinner>
-            <s-text>Updating your rewards…</s-text>
-          </s-stack>
-        )}
-
-        {!state && !loading && <s-text>Checking your rewards…</s-text>}
-
-        {state && state.ok === false && (
-          <s-banner status="critical">
-            <s-text>{state.error}</s-text>
-            {state.hint ? <s-text>{state.hint}</s-text> : null}
-          </s-banner>
-        )}
-
-        {state && state.ok === true && state.status === "pending" && (
-          <s-banner status="info">
-            <s-text>Rewards are being finalized for this order. Please check back shortly.</s-text>
-          </s-banner>
-        )}
-
-        {state && state.ok === true && state.status === "ready" && (
-          <s-stack direction="block" spacing="tight">
-            <s-text>Points earned: {state.pointsEarned}</s-text>
-            <s-text>Your balance: {state.balance}</s-text>
-            {state.nextRewardMessage ? <s-text>{state.nextRewardMessage}</s-text> : null}
-          </s-stack>
-        )}
-
+        {loading ? <s-text>Updating your rewards…</s-text> : null}
+        <s-text>{message}</s-text>
+        {state && state.ok === true && state.status === "ready" && state.nextRewardMessage ? (
+          <s-text>{state.nextRewardMessage}</s-text>
+        ) : null}
         <s-button variant="secondary" href={rewardsPageUrl}>
-          View Rewards
+          View rewards
         </s-button>
       </s-stack>
     </s-section>

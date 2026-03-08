@@ -10,6 +10,10 @@ type RewardsPending = {
   status: "pending";
   pointsEarned: null;
   balance: null;
+  currentTierName: null;
+  effectiveEarnRate: null;
+  nextTierName: null;
+  remainingToNext: null;
   nextRewardMessage: string | null;
 };
 
@@ -18,6 +22,10 @@ type RewardsReady = {
   status: "ready";
   pointsEarned: number;
   balance: number;
+  currentTierName: string | null;
+  effectiveEarnRate: number | null;
+  nextTierName: string | null;
+  remainingToNext: number | null;
   nextRewardMessage: string | null;
 };
 
@@ -34,47 +42,42 @@ function normalizeBaseUrl(u: string): string {
 }
 
 function getAppBaseUrlFromSettings(): string {
-  const s = shopify?.settings?.current;
-  const raw =
-    (s && (s.app_base_url || s.appBaseUrl || s.baseUrl)) ||
-    shopify?.settings?.app_base_url ||
-    "";
+  const s = shopify?.settings?.current ?? shopify?.settings?.value ?? {};
+  const raw = (s && (s.app_base_url || s.appBaseUrl || s.baseUrl)) || "";
   return normalizeBaseUrl(String(raw || ""));
+}
+
+function getRewardsPageUrlFromSettings(): string {
+  const s = shopify?.settings?.current ?? shopify?.settings?.value ?? {};
+  const raw = (s && (s.rewards_page_url || s.rewardsPageUrl || s.rewards_url)) || "";
+  const normalized = String(raw || "").trim();
+  return normalized || "extension:lcr-loyalty-dashboard/";
 }
 
 function Extension() {
   const [appBaseUrl, setAppBaseUrl] = useState<string>(() => getAppBaseUrlFromSettings());
+  const [rewardsPageUrl, setRewardsPageUrl] = useState<string>(() => getRewardsPageUrlFromSettings());
   const [orderId, setOrderId] = useState<string | null>(null);
-
   const [state, setState] = useState<RewardsResponse | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
 
   useEffect(() => {
-    // Settings signal updates in dev preview
     const signal = shopify?.settings;
     if (signal && typeof signal.subscribe === "function") {
       return signal.subscribe((next: any) => {
-        const raw = next?.app_base_url ?? next?.appBaseUrl ?? next?.baseUrl ?? "";
-        setAppBaseUrl(normalizeBaseUrl(String(raw)));
+        const rawBase = next?.app_base_url ?? next?.appBaseUrl ?? next?.baseUrl ?? "";
+        setAppBaseUrl(normalizeBaseUrl(String(rawBase || "")));
+        const rawRewards = next?.rewards_page_url ?? next?.rewardsPageUrl ?? next?.rewards_url ?? "";
+        setRewardsPageUrl(String(rawRewards || "").trim() || "extension:lcr-loyalty-dashboard/");
       });
     }
   }, []);
 
   useEffect(() => {
-    // Order API in customer account Order Status targets
     const sig = shopify?.order;
     if (sig && typeof sig.subscribe === "function") {
-      return sig.subscribe((o: any) => {
-        const id = o?.id ?? o?.order?.id ?? null;
-        if (id) setOrderId(String(id));
-      });
-    }
-
-    // Fallback: sometimes API is nested
-    const api = shopify?.api;
-    const sig2 = api?.order;
-    if (sig2 && typeof sig2.subscribe === "function") {
-      return sig2.subscribe((o: any) => {
-        const id = o?.id ?? o?.order?.id ?? null;
+      return sig.subscribe((payload: any) => {
+        const id = payload?.id ?? payload?.order?.id ?? null;
         if (id) setOrderId(String(id));
       });
     }
@@ -85,6 +88,7 @@ function Extension() {
 
     async function poll() {
       if (!appBaseUrl || !orderId) return;
+      setLoading(true);
 
       const maxAttempts = 20;
       const delayMs = 1500;
@@ -92,56 +96,69 @@ function Extension() {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
           const token = await shopify.sessionToken.get();
-          const url = `${appBaseUrl}/api/order/rewards?orderId=${encodeURIComponent(orderId)}`;
+          const url = `${appBaseUrl}/api/order/rewards?orderId=${encodeURIComponent(String(orderId))}`;
           const res = await fetch(url, {
             method: "GET",
             headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
           });
+
           const data = (await res.json().catch(() => null)) as RewardsResponse | null;
           if (cancelled) return;
 
           if (!data) {
             setState({ ok: false, error: "Invalid response from server" });
+            setLoading(false);
             return;
           }
 
           setState(data);
 
-          if (data.ok === true && data.status === "ready") return;
+          if (data.ok === true && data.status === "ready") {
+            setLoading(false);
+            return;
+          }
 
           await new Promise((r) => setTimeout(r, delayMs));
         } catch (e: any) {
           if (cancelled) return;
           setState({ ok: false, error: e?.message ?? String(e) });
+          setLoading(false);
           return;
         }
       }
+
+      if (!cancelled) setLoading(false);
     }
 
     poll();
-
     return () => {
       cancelled = true;
     };
   }, [appBaseUrl, orderId]);
 
   const message = useMemo(() => {
-    if (!appBaseUrl) return { kind: "warn", text: "Rewards block is missing its base URL configuration." };
-    if (!orderId) return { kind: "loading", text: "Loading order…" };
-    if (!state || (state.ok === true && state.status === "pending")) return { kind: "loading", text: "Processing rewards…" };
-    if (state.ok === false) return { kind: "warn", text: `Rewards: ${state.error}` };
-    return { kind: "ok", text: `You earned ${state.pointsEarned} point(s). Balance: ${state.balance}.` };
+    if (!appBaseUrl) return "Rewards block is missing its base URL configuration.";
+    if (!orderId) return "Loading order…";
+    if (!state || (state.ok === true && state.status === "pending")) return "Processing rewards…";
+    if (state.ok === false) return `Rewards: ${state.error}`;
+    const tierText = state.currentTierName ? ` Tier: ${state.currentTierName}.` : "";
+    const nextTierText =
+      state.nextTierName && state.remainingToNext != null
+        ? ` ${state.remainingToNext} point(s) to reach ${state.nextTierName}.`
+        : "";
+    return `You earned ${state.pointsEarned} point(s). Balance: ${state.balance}.${tierText}${nextTierText}`;
   }, [appBaseUrl, orderId, state]);
 
   return (
     <s-section>
       <s-stack direction="block" spacing="tight">
         <s-text emphasis="bold">Lions Creek Rewards</s-text>
-        <s-text>{message.text}</s-text>
+        {loading ? <s-text>Updating your rewards…</s-text> : null}
+        <s-text>{message}</s-text>
         {state && state.ok === true && state.status === "ready" && state.nextRewardMessage ? (
           <s-text>{state.nextRewardMessage}</s-text>
         ) : null}
-        <s-button variant="secondary" href="extension:lcr-loyalty-dashboard/">
+        <s-button variant="secondary" href={rewardsPageUrl}>
           View rewards
         </s-button>
       </s-stack>

@@ -1,18 +1,29 @@
 import db from "../db.server";
 
+export type TierDefinitionNormalized = {
+  id?: string;
+  tierId: string;
+  name: string;
+  sortOrder: number;
+  thresholdType: "lifetimeEarned";
+  thresholdValue: number;
+  earnRateMultiplier: number;
+  pointsPerDollarOverride: number | null;
+  effectiveFrom: string | null;
+};
+
 export type ShopSettingsNormalized = {
   shop: string;
   earnRate: number;
+  baseEarnRate: number;
   redemptionMinOrder: number;
   pointsExpireInactivityDays: number;
   redemptionExpiryHours: number;
   preventMultipleActiveRedemptions: boolean;
 
-  // Optional: scope redemption discount codes to a collection handle. Blank => all products.
   eligibleCollectionHandle: string;
   eligibleCollectionGid: string | null;
 
-  // Exclusions: default include all products; exclude by collection handles and/or explicit product ids.
   excludedCollectionHandles: string[];
   excludedProductIds: string[];
 
@@ -22,6 +33,7 @@ export type ShopSettingsNormalized = {
 
   redemptionSteps: number[];
   redemptionValueMap: Record<string, number>;
+  tiers: TierDefinitionNormalized[];
 };
 
 const DEFAULT_STEPS = [500, 1000];
@@ -73,7 +85,102 @@ function toValueMap(value: unknown, fallback: Record<string, number>): Record<st
   return fallback;
 }
 
-export function normalizeShopSettings(row: any, shop: string): ShopSettingsNormalized {
+function normalizeTier(input: any, idx: number, defaultEarnRate: number): TierDefinitionNormalized | null {
+  if (!input || typeof input !== "object") return null;
+  const name = String(input.name ?? "").trim();
+  if (!name) return null;
+
+  const thresholdValue = Math.max(0, Math.floor(Number(input.thresholdValue ?? 0)));
+  const sortOrder = Number.isFinite(Number(input.sortOrder)) ? Math.floor(Number(input.sortOrder)) : idx;
+  const tierId =
+    String(input.tierId ?? "")
+      .trim()
+      .replace(/\s+/g, "-")
+      .toLowerCase() || `tier-${idx + 1}`;
+
+  const multiplier =
+    input.pointsPerDollarOverride != null && input.pointsPerDollarOverride !== ""
+      ? 1
+      : Number.isFinite(Number(input.earnRateMultiplier))
+      ? Number(input.earnRateMultiplier)
+      : 1;
+
+  const override =
+    input.pointsPerDollarOverride != null && input.pointsPerDollarOverride !== ""
+      ? Math.max(1, Math.floor(Number(input.pointsPerDollarOverride)))
+      : null;
+
+  return {
+    id: input.id ? String(input.id) : undefined,
+    tierId,
+    name,
+    sortOrder,
+    thresholdType: "lifetimeEarned",
+    thresholdValue,
+    earnRateMultiplier: override != null ? 1 : Math.max(0.01, multiplier || 1),
+    pointsPerDollarOverride: override,
+    effectiveFrom: input.effectiveFrom ? String(input.effectiveFrom) : null,
+  };
+}
+
+function defaultTiers(baseEarnRate: number): TierDefinitionNormalized[] {
+  return [
+    {
+      tierId: "member",
+      name: "Member",
+      sortOrder: 0,
+      thresholdType: "lifetimeEarned",
+      thresholdValue: 0,
+      earnRateMultiplier: 1,
+      pointsPerDollarOverride: Math.max(1, Math.floor(Number(baseEarnRate || 1))),
+      effectiveFrom: null,
+    },
+  ];
+}
+
+function normalizeTierList(raw: unknown, baseEarnRate: number): TierDefinitionNormalized[] {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out = arr
+    .map((item, idx) => normalizeTier(item, idx, baseEarnRate))
+    .filter((x): x is TierDefinitionNormalized => Boolean(x));
+
+  if (!out.length) return defaultTiers(baseEarnRate);
+
+  const sorted = out.sort((a, b) => {
+    if (a.thresholdValue !== b.thresholdValue) return a.thresholdValue - b.thresholdValue;
+    if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+    return a.name.localeCompare(b.name);
+  });
+
+  if (sorted[0].thresholdValue !== 0) {
+    sorted.unshift({
+      tierId: "member",
+      name: "Member",
+      sortOrder: -1,
+      thresholdType: "lifetimeEarned",
+      thresholdValue: 0,
+      earnRateMultiplier: 1,
+      pointsPerDollarOverride: Math.max(1, Math.floor(Number(baseEarnRate || 1))),
+      effectiveFrom: null,
+    });
+  }
+
+  return sorted.map((tier, idx) => ({ ...tier, sortOrder: idx }));
+}
+
+async function loadTierDefinitions(shop: string, baseEarnRate: number): Promise<TierDefinitionNormalized[]> {
+  const prismaAny: any = db as any;
+  if (!prismaAny.tierDefinition) return defaultTiers(baseEarnRate);
+
+  const rows = await prismaAny.tierDefinition.findMany({
+    where: { shop },
+    orderBy: [{ thresholdValue: "asc" }, { sortOrder: "asc" }, { name: "asc" }],
+  });
+
+  return normalizeTierList(rows, baseEarnRate);
+}
+
+export function normalizeShopSettings(row: any, shop: string, tiers?: TierDefinitionNormalized[]): ShopSettingsNormalized {
   const redemptionSteps = toNumberArray(row?.redemptionSteps, DEFAULT_STEPS);
   const redemptionValueMap = toValueMap(row?.redemptionValueMap, { ...DEFAULT_VALUE_MAP });
 
@@ -84,9 +191,12 @@ export function normalizeShopSettings(row: any, shop: string): ShopSettingsNorma
     }
   }
 
+  const baseEarnRate = Number.isFinite(row?.earnRate) ? Number(row.earnRate) : 1;
+
   return {
     shop,
-    earnRate: Number.isFinite(row?.earnRate) ? Number(row.earnRate) : 1,
+    earnRate: baseEarnRate,
+    baseEarnRate,
     redemptionMinOrder: Number.isFinite(row?.redemptionMinOrder) ? Number(row.redemptionMinOrder) : 0,
     pointsExpireInactivityDays: Number.isFinite(row?.pointsExpireInactivityDays)
       ? Number(row.pointsExpireInactivityDays)
@@ -94,8 +204,8 @@ export function normalizeShopSettings(row: any, shop: string): ShopSettingsNorma
     redemptionExpiryHours: Number.isFinite(row?.redemptionExpiryHours)
       ? Number(row.redemptionExpiryHours)
       : 72,
-
-    preventMultipleActiveRedemptions: typeof row?.preventMultipleActiveRedemptions === "boolean" ? row.preventMultipleActiveRedemptions : true,
+    preventMultipleActiveRedemptions:
+      typeof row?.preventMultipleActiveRedemptions === "boolean" ? row.preventMultipleActiveRedemptions : true,
 
     eligibleCollectionHandle:
       typeof row?.eligibleCollectionHandle === "string" ? row.eligibleCollectionHandle.trim() : "",
@@ -113,24 +223,28 @@ export function normalizeShopSettings(row: any, shop: string): ShopSettingsNorma
 
     redemptionSteps,
     redemptionValueMap,
+    tiers: normalizeTierList(tiers, baseEarnRate),
   };
 }
 
 export async function getShopSettings(shop: string): Promise<ShopSettingsNormalized> {
   const row = await db.shopSettings.findUnique({ where: { shop } });
-  return normalizeShopSettings(row, shop);
+  const baseEarnRate = Number.isFinite((row as any)?.earnRate) ? Number((row as any).earnRate) : 1;
+  const tiers = await loadTierDefinitions(shop, baseEarnRate);
+  return normalizeShopSettings(row, shop, tiers);
 }
 
 export async function getOrCreateShopSettings(shop: string): Promise<ShopSettingsNormalized> {
   const row =
     (await db.shopSettings.findUnique({ where: { shop } })) ??
     (await db.shopSettings.create({ data: { shop } }));
-  return normalizeShopSettings(row, shop);
+  const tiers = await loadTierDefinitions(shop, Number((row as any)?.earnRate ?? 1));
+  return normalizeShopSettings(row, shop, tiers);
 }
 
 export async function upsertShopSettings(shop: string, input: Partial<ShopSettingsNormalized>) {
   const data: any = {
-    earnRate: input.earnRate,
+    earnRate: input.baseEarnRate ?? input.earnRate,
     redemptionMinOrder: input.redemptionMinOrder,
     pointsExpireInactivityDays: input.pointsExpireInactivityDays,
     redemptionExpiryHours: input.redemptionExpiryHours,
@@ -150,11 +264,37 @@ export async function upsertShopSettings(shop: string, input: Partial<ShopSettin
     if (data[k] === undefined) delete data[k];
   }
 
-  const row = await db.shopSettings.upsert({
-    where: { shop },
-    create: { shop, ...data },
-    update: data,
+  const normalizedTiers = input.tiers ? normalizeTierList(input.tiers, Number(data.earnRate ?? 1)) : undefined;
+  const prismaAny: any = db as any;
+
+  const row = await db.$transaction(async (tx) => {
+    const nextRow = await tx.shopSettings.upsert({
+      where: { shop },
+      create: { shop, ...data },
+      update: data,
+    });
+
+    if (normalizedTiers && prismaAny.tierDefinition) {
+      const txAny: any = tx as any;
+      await txAny.tierDefinition.deleteMany({ where: { shop } });
+      await txAny.tierDefinition.createMany({
+        data: normalizedTiers.map((tier) => ({
+          shop,
+          tierId: tier.tierId,
+          name: tier.name,
+          sortOrder: tier.sortOrder,
+          thresholdType: tier.thresholdType,
+          thresholdValue: tier.thresholdValue,
+          earnRateMultiplier: tier.earnRateMultiplier,
+          pointsPerDollarOverride: tier.pointsPerDollarOverride,
+          effectiveFrom: tier.effectiveFrom ? new Date(tier.effectiveFrom) : null,
+        })),
+      });
+    }
+
+    return nextRow;
   });
 
-  return normalizeShopSettings(row, shop);
+  const tiers = normalizedTiers ?? (await loadTierDefinitions(shop, Number((row as any)?.earnRate ?? 1)));
+  return normalizeShopSettings(row, shop, tiers);
 }

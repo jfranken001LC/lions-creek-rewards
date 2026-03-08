@@ -18,7 +18,7 @@ import {
 } from "@shopify/polaris";
 import db from "../db.server";
 import { apiVersion, authenticate } from "../shopify.server";
-import type { ShopSettingsNormalized } from "../lib/shopSettings.server";
+import type { ShopSettingsNormalized, TierDefinitionNormalized } from "../lib/shopSettings.server";
 
 /**
  * Lions Creek Rewards — Admin Settings (canonical ShopSettings UI)
@@ -167,6 +167,41 @@ function parseRedemptionSteps(raw: FormDataEntryValue | null, fallback: number[]
   // keep sane bounds for v1
   const bounded = uniq.filter((n) => n <= 200000).slice(0, 12);
   return bounded.length ? bounded : fallback;
+}
+
+
+function parseTierDefinitions(
+  raw: FormDataEntryValue | null,
+  fallback: TierDefinitionNormalized[],
+): TierDefinitionNormalized[] {
+  const s = String(raw ?? "").trim();
+  if (!s) return fallback;
+  try {
+    const parsed = JSON.parse(s);
+    if (!Array.isArray(parsed)) return fallback;
+    return parsed
+      .map((row: any, idx: number) => ({
+        tierId: String(row?.tierId ?? row?.name ?? `tier-${idx + 1}`).trim().toLowerCase().replace(/\s+/g, "-"),
+        name: String(row?.name ?? "").trim(),
+        sortOrder: Number.isFinite(Number(row?.sortOrder)) ? Math.floor(Number(row.sortOrder)) : idx,
+        thresholdType: "lifetimeEarned" as const,
+        thresholdValue: Math.max(0, Math.floor(Number(row?.thresholdValue ?? 0))),
+        earnRateMultiplier:
+          row?.pointsPerDollarOverride != null && row?.pointsPerDollarOverride !== ""
+            ? 1
+            : Number.isFinite(Number(row?.earnRateMultiplier))
+            ? Number(row.earnRateMultiplier)
+            : 1,
+        pointsPerDollarOverride:
+          row?.pointsPerDollarOverride != null && row?.pointsPerDollarOverride !== ""
+            ? Math.max(1, Math.floor(Number(row.pointsPerDollarOverride)))
+            : null,
+        effectiveFrom: row?.effectiveFrom ? String(row.effectiveFrom) : null,
+      }))
+      .filter((tier: TierDefinitionNormalized) => Boolean(tier.name));
+  } catch {
+    return fallback;
+  }
 }
 
 function parseRedemptionValueMap(
@@ -547,6 +582,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     const redemptionSteps = parseRedemptionSteps(form.get("redemptionSteps"), existing.redemptionSteps);
     const redemptionValueMap = parseRedemptionValueMap(form.get("redemptionValueMap"), existing.redemptionValueMap);
+    const tiers = parseTierDefinitions(form.get("tiersJson"), existing.tiers);
 
     // Discount-scope collection handle/GID (optional)
     const eligibleCollectionHandle = String(form.get("eligibleCollectionHandle") ?? "").trim();
@@ -572,6 +608,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     await upsertShopSettings(shop, {
+      baseEarnRate: earnRate,
       earnRate,
       redemptionMinOrder,
       pointsExpireInactivityDays,
@@ -586,6 +623,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       excludeProductTags,
       redemptionSteps,
       redemptionValueMap,
+      tiers,
     });
 
     return data<ActionData>({ ok: true, message: "Settings saved." });
@@ -617,6 +655,7 @@ export default function SettingsPage() {
 
   const [redemptionSteps, setRedemptionSteps] = React.useState(settings.redemptionSteps.join(", "));
   const [redemptionValueMap, setRedemptionValueMap] = React.useState(JSON.stringify(settings.redemptionValueMap, null, 2));
+  const [tiersJson, setTiersJson] = React.useState(JSON.stringify(settings.tiers, null, 2));
 
   const hasWarnings = diagnostics.warnings.length > 0;
   const hasNotes = diagnostics.notes.length > 0;
@@ -674,7 +713,7 @@ export default function SettingsPage() {
 
                     <FormLayout>
                       <TextField
-                        label="Earn rate (points per $1 eligible net merchandise)"
+                        label="Base earn rate (points per $1 eligible net merchandise)"
                         type="number"
                         name="earnRate"
                         value={earnRate}
@@ -868,6 +907,16 @@ export default function SettingsPage() {
                         multiline={6}
                         autoComplete="off"
                         helpText='Keys must match the step values. Example: {"500": 10, "1000": 25}.'
+                      />
+
+                      <TextField
+                        label="Tier definitions (JSON)"
+                        name="tiersJson"
+                        value={tiersJson}
+                        onChange={setTiersJson}
+                        multiline={8}
+                        autoComplete="off"
+                        helpText='Ordered tier configuration. Example: [{"name":"Member","thresholdValue":0,"pointsPerDollarOverride":1},{"name":"Gold","thresholdValue":1000,"earnRateMultiplier":1.5}]'
                       />
                     </FormLayout>
                   </BlockStack>

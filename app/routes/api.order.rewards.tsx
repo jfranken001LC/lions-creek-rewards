@@ -4,23 +4,33 @@ import { authenticate } from "../shopify.server";
 import { shopFromDest } from "../lib/proxy.server";
 import { normalizeCustomerId } from "../lib/loyalty.server";
 import { getOrCreateShopSettings } from "../lib/shopSettings.server";
+import { buildTierProgress, computeEffectiveEarnRate, resolveTierForMetric } from "../lib/tier.server";
 
-type RewardsResponse =
-  | {
-      ok: true;
-      status: "pending";
-      pointsEarned: null;
-      balance: null;
-      nextRewardMessage: string | null;
-    }
-  | {
-      ok: true;
-      status: "ready";
-      pointsEarned: number;
-      balance: number;
-      nextRewardMessage: string | null;
-    }
-  | { ok: false; error: string; hint?: string };
+type ReadyPayload = {
+  ok: true;
+  status: "ready";
+  pointsEarned: number;
+  balance: number;
+  currentTierName: string | null;
+  effectiveEarnRate: number | null;
+  nextTierName: string | null;
+  remainingToNext: number | null;
+  nextRewardMessage: string | null;
+};
+
+type PendingPayload = {
+  ok: true;
+  status: "pending";
+  pointsEarned: null;
+  balance: null;
+  currentTierName: null;
+  effectiveEarnRate: null;
+  nextTierName: null;
+  remainingToNext: null;
+  nextRewardMessage: string | null;
+};
+
+type RewardsResponse = PendingPayload | ReadyPayload | { ok: false; error: string; hint?: string };
 
 function normOrderId(raw: string): string {
   const s = String(raw || "").trim();
@@ -34,9 +44,6 @@ function normOrderId(raw: string): string {
 }
 
 function buildNextRewardMessage(args: { balance: number; steps: number[]; valueMap: Record<string, any> }): string | null {
-  // v1.8 spec intent:
-  // - If balance >= lowest redemption step -> "You have enough points for $X off next order"
-  // - Else -> "You are Y points away" (optionally mention the first reward value)
   const bal = Number(args.balance);
   if (!Number.isFinite(bal)) return null;
 
@@ -66,7 +73,6 @@ function buildNextRewardMessage(args: { balance: number; steps: number[]; valueM
 }
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  // Preflight for extensions (cross-origin fetch from checkout/customer account UIs)
   if (request.method === "OPTIONS") {
     try {
       const { cors } = await authenticate.public.checkout(request);
@@ -89,7 +95,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   if (request.method !== "GET") return Response.json({ ok: false, error: "Method Not Allowed" }, { status: 405 });
 
-  // Authenticate session token: checkout OR customer-account.
   let cors: ((resp: Response) => Response) | null = null;
   let sessionToken: any = null;
 
@@ -117,8 +122,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   }
 
   const url = new URL(request.url);
-  const rawOrderId = url.searchParams.get("orderId") ?? "";
-  const orderId = normOrderId(rawOrderId);
+  const orderId = normOrderId(url.searchParams.get("orderId") ?? "");
   if (!orderId) {
     return cors!(
       Response.json(
@@ -130,26 +134,33 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const snapshot = await db.orderPointsSnapshot.findUnique({
     where: { shop_orderId: { shop, orderId } },
-    select: { pointsAwarded: true, customerId: true },
-  });
+    select: {
+      pointsAwarded: true,
+      customerId: true,
+      effectiveTierName: true,
+      effectiveEarnRate: true,
+    } as any,
+  } as any);
 
   if (!snapshot) {
-    const pending: RewardsResponse = {
+    const pending: PendingPayload = {
       ok: true,
       status: "pending",
       pointsEarned: null,
       balance: null,
+      currentTierName: null,
+      effectiveEarnRate: null,
+      nextTierName: null,
+      remainingToNext: null,
       nextRewardMessage: null,
     };
 
-    // Still return 200 so the UI can poll.
     return cors!(Response.json(pending, { status: 200 }));
   }
 
   const tokenCustomerId = token?.sub ? normalizeCustomerId(String(token.sub)) : "";
-  const snapshotCustomerId = normalizeCustomerId(snapshot.customerId);
+  const snapshotCustomerId = normalizeCustomerId((snapshot as any).customerId);
 
-  // If the token includes a customer identity, enforce it matches the order’s customer.
   if (tokenCustomerId && snapshotCustomerId && tokenCustomerId !== snapshotCustomerId) {
     return cors!(
       Response.json(
@@ -161,21 +172,32 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const bal = await db.customerPointsBalance.findUnique({
     where: { shop_customerId: { shop, customerId: snapshotCustomerId } },
-    select: { balance: true },
-  });
+    select: {
+      balance: true,
+      lifetimeEarned: true,
+      currentTierName: true,
+    } as any,
+  } as any);
 
   const settings = await getOrCreateShopSettings(shop);
+  const progress = buildTierProgress(settings, Number((bal as any)?.lifetimeEarned ?? 0));
   const nextRewardMessage = buildNextRewardMessage({
-    balance: bal?.balance ?? 0,
+    balance: (bal as any)?.balance ?? 0,
     steps: Array.isArray(settings.redemptionSteps) ? (settings.redemptionSteps as any) : [],
     valueMap: (settings.redemptionValueMap as any) ?? {},
   });
 
-  const ready: RewardsResponse = {
+  const ready: ReadyPayload = {
     ok: true,
     status: "ready",
-    pointsEarned: snapshot.pointsAwarded ?? 0,
-    balance: bal?.balance ?? 0,
+    pointsEarned: (snapshot as any).pointsAwarded ?? 0,
+    balance: (bal as any)?.balance ?? 0,
+    currentTierName: (bal as any)?.currentTierName ?? (snapshot as any).effectiveTierName ?? progress.currentTier.name,
+    effectiveEarnRate:
+      (snapshot as any).effectiveEarnRate ??
+      computeEffectiveEarnRate(settings, resolveTierForMetric(settings, Number((bal as any)?.lifetimeEarned ?? 0))),
+    nextTierName: progress.nextTier?.name ?? null,
+    remainingToNext: progress.nextTier ? progress.remainingToNext : null,
     nextRewardMessage,
   };
 

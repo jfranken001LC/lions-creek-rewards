@@ -5,4 +5,4 @@ Description=Lions Creek Rewards - Expire job (calls /jobs/expire)
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/lions-creek-rewards/lions-creek-rewards.env
-ExecStart=/usr/bin/curl -fsS -H "x-job-token: ${JOB_TOKEN}" "http://127.0.0.1:3000/jobs/expire?shop=${PRIMARY_SHOP}"
+ExecStart=/usr/bin/curl -fsS -H "x-job-token: ${JOB_TOKEN}" "http://127.0.0.1:3000/jobs/expire?all=1"

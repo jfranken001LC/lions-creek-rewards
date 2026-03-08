@@ -18,6 +18,15 @@ type LoyaltyPayloadOk = {
     lastActivityAt: string | null;
     expireAfterDays: number | null;
   };
+  tier: {
+    currentTierId: string;
+    currentTierName: string;
+    effectiveEarnRate: number;
+    nextTierName: string | null;
+    remainingToNext: number;
+    currentMetric: number;
+    tierComputedAt: string | null;
+  };
   redemption:
     | {
         id: string;
@@ -43,11 +52,19 @@ type LoyaltyPayloadOk = {
   }>;
   settings: {
     earnRate: number;
+    baseEarnRate: number;
     minOrderDollars: number;
     redemptionExpiryHours: number;
     preventMultipleActiveRedemptions: boolean;
     redemptionSteps: number[];
     redemptionValueMap: Record<string, number>;
+    tiers: Array<{
+      tierId: string;
+      name: string;
+      thresholdValue: number;
+      earnRateMultiplier: number;
+      pointsPerDollarOverride: number | null;
+    }>;
   };
 };
 
@@ -72,13 +89,6 @@ type RedeemResponseErr = {
   details?: unknown;
 };
 
-type RedemptionOption = {
-  points: number;
-  dollars: number;
-  label: string;
-  canRedeem: boolean;
-};
-
 export default async () => {
   render(<Extension />, document.body);
 };
@@ -93,7 +103,6 @@ function Extension() {
   const [redeeming, setRedeeming] = useState<boolean>(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  // React to settings changes while in dev preview (Shopify config editor updates are signals).
   useEffect(() => {
     const signal = shopify?.settings;
     if (signal && typeof signal.subscribe === 'function') {
@@ -107,8 +116,7 @@ function Extension() {
 
   const redemptionOptions = useMemo(() => {
     if (!payload) return [];
-    // Prefer server-provided options (already includes canRedeem logic).
-    if (Array.isArray((payload as any).redemptionOptions) && payload.redemptionOptions.length) {
+    if (Array.isArray(payload.redemptionOptions) && payload.redemptionOptions.length) {
       return payload.redemptionOptions
         .map((o) => ({
           points: Number(o.points),
@@ -119,11 +127,20 @@ function Extension() {
         .filter((o) => o.points > 0 && o.dollars > 0)
         .sort((a, b) => a.points - b.points);
     }
-    // Backwards compatibility fallback.
-    return buildRedemptionOptions(payload.settings);
+
+    const steps = Array.isArray(payload.settings.redemptionSteps) ? payload.settings.redemptionSteps : [];
+    const map = payload.settings.redemptionValueMap ?? {};
+    return steps
+      .map((points) => ({
+        points,
+        dollars: Number(map[String(points)] ?? 0),
+        canRedeem: true,
+        label: `${formatNumber(points)} points → ${formatCurrency(Number(map[String(points)] ?? 0))} off`,
+      }))
+      .filter((o) => o.points > 0 && o.dollars > 0)
+      .sort((a, b) => a.points - b.points);
   }, [payload]);
 
-  // Keep selectedPoints valid as options change.
   useEffect(() => {
     if (!redemptionOptions.length) {
       setSelectedPoints(null);
@@ -135,7 +152,6 @@ function Extension() {
     });
   }, [redemptionOptions]);
 
-  // Load loyalty data.
   useEffect(() => {
     let cancelled = false;
 
@@ -179,8 +195,7 @@ function Extension() {
   }, [appBaseUrl]);
 
   async function onRedeem() {
-    if (!payload || !appBaseUrl) return;
-    if (!selectedPoints) return;
+    if (!payload || !appBaseUrl || !selectedPoints) return;
 
     setRedeeming(true);
     setError(null);
@@ -194,7 +209,6 @@ function Extension() {
         return;
       }
 
-      // Optimistically update local state (server already deducted points + issued/returned the active code).
       setPayload((prev) => {
         if (!prev) return prev;
         return {
@@ -230,12 +244,10 @@ function Extension() {
       {!appBaseUrl ? (
         <s-banner tone="info" heading="Rewards not configured yet">
           <s-stack direction="block" gap="base">
-            <s-text>
-              This rewards dashboard needs one store setting before it can load your points.
-            </s-text>
+            <s-text>This rewards dashboard needs one store setting before it can load your points.</s-text>
             <s-text type="small">
-              Store staff: open Shopify Admin → Apps → Lions Creek Rewards → Support &amp; Setup, then set the Customer Account
-              extension setting “App Base URL” to your current environment.
+              Store staff: open Shopify Admin → Apps → Lions Creek Rewards → Support &amp; Setup, then set the Customer
+              Account extension setting “App Base URL” to your current environment.
             </s-text>
           </s-stack>
         </s-banner>
@@ -269,6 +281,19 @@ function Extension() {
               <s-text>
                 Available points: <s-badge tone="info">{formatNumber(available)}</s-badge>
               </s-text>
+              <s-text>
+                Tier: <s-badge tone="success">{payload.tier.currentTierName}</s-badge>
+              </s-text>
+              <s-text type="small">
+                Earn rate: {formatNumber(payload.tier.effectiveEarnRate)} point(s) per {formatCurrency(1)} spent
+              </s-text>
+              {payload.tier.nextTierName ? (
+                <s-text type="small">
+                  {formatNumber(payload.tier.remainingToNext)} lifetime point(s) to reach {payload.tier.nextTierName}
+                </s-text>
+              ) : (
+                <s-text type="small">You are at the highest available tier.</s-text>
+              )}
 
               <s-text type="small">
                 Lifetime earned: {formatNumber(payload.points.lifetimeEarned)} · Lifetime redeemed:{' '}
@@ -344,7 +369,7 @@ function Extension() {
                   })() : null}
 
                   <s-text type="small">
-                    Earn rate: {formatNumber(payload.settings.earnRate)} point(s) per {formatCurrency(1)} spent · Minimum
+                    Base earn rate: {formatNumber(payload.settings.baseEarnRate)} point(s) per {formatCurrency(1)} spent · Minimum
                     order: {formatCurrency(payload.settings.minOrderDollars)}
                   </s-text>
                 </>
@@ -426,26 +451,6 @@ async function redeemPoints(appBaseUrl: string, pointsToRedeem: number): Promise
   return body as RedeemResponseOk;
 }
 
-function buildRedemptionOptions(settings: LoyaltyPayloadOk['settings']): RedemptionOption[] {
-  const steps = Array.isArray(settings.redemptionSteps) ? settings.redemptionSteps : [];
-  const map = settings.redemptionValueMap ?? {};
-
-  const opts = steps
-    .map((points) => {
-      const dollars = Number(map[String(points)] ?? 0);
-      return {
-        points,
-        dollars,
-        canRedeem: true,
-        label: `${formatNumber(points)} points → ${formatCurrency(dollars)} off`,
-      };
-    })
-    .filter((o) => o.points > 0 && o.dollars > 0)
-    .sort((a, b) => a.points - b.points);
-
-  return opts;
-}
-
 function getAppBaseUrlFromSettings(): string {
   const signal = shopify?.settings;
   const current = signal?.value ?? signal?.current ?? {};
@@ -461,31 +466,18 @@ function normalizeBaseUrl(input: string): string {
 function formatCurrency(amount: number): string {
   const n = Number(amount);
   if (!Number.isFinite(n)) return '$0.00';
-
   try {
-    // In customer account UI extensions, i18n provides currency formatting.
-    if (shopify?.i18n?.formatCurrency) {
-      return shopify.i18n.formatCurrency(n);
-    }
-  } catch {
-    // fall through
-  }
-
+    if (shopify?.i18n?.formatCurrency) return shopify.i18n.formatCurrency(n);
+  } catch {}
   return `$${n.toFixed(2)}`;
 }
 
 function formatNumber(value: number): string {
   const n = Number(value);
   if (!Number.isFinite(n)) return String(value);
-
   try {
-    if (shopify?.i18n?.formatNumber) {
-      return shopify.i18n.formatNumber(n);
-    }
-  } catch {
-    // fall through
-  }
-
+    if (shopify?.i18n?.formatNumber) return shopify.i18n.formatNumber(n);
+  } catch {}
   return String(n);
 }
 
