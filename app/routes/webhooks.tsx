@@ -4,7 +4,7 @@ import { LedgerType, RedemptionStatus, WebhookOutcome } from "@prisma/client";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getShopSettings } from "../lib/shopSettings.server";
-import { buildTierProgress, computeEffectiveEarnRate, refreshCustomerTierSnapshot } from "../lib/tier.server";
+import { buildTierProgress, computeEffectiveEarnRate, getCustomerTierMetrics, refreshCustomerTierSnapshot } from "../lib/tier.server";
 import { fetchCustomerTags, resolveEligibleCollectionGid, type AdminGraphql } from "../lib/shopifyQueries.server";
 
 type HandleResult = { outcome: WebhookOutcome; message?: string };
@@ -224,16 +224,20 @@ async function handlePrivacyWebhook(shop: string, topic: string, payload: any): 
 async function handleAppUninstalled(shop: string): Promise<HandleResult> {
   // NOTE: Do NOT delete WebhookEvent rows here; the caller updates the current webhook row after this handler returns.
   // We intentionally remove all other shop-scoped data to prevent stale growth and ensure a clean reinstall.
-  await db.$transaction([
-    db.session.deleteMany({ where: { shop } }),
-    db.shopSettings.deleteMany({ where: { shop } }),
-    db.customerPointsBalance.deleteMany({ where: { shop } }),
-    db.pointsLedger.deleteMany({ where: { shop } }),
-    db.orderPointsSnapshot.deleteMany({ where: { shop } }),
-    db.redemption.deleteMany({ where: { shop } }),
-    db.privacyEvent.deleteMany({ where: { shop } }),
-    db.webhookError.deleteMany({ where: { shop } }),
-  ]);
+  await db.$transaction(async (tx) => {
+    const txAny: any = tx as any;
+    await tx.session.deleteMany({ where: { shop } });
+    await tx.shopSettings.deleteMany({ where: { shop } });
+    if (txAny.tierDefinition) {
+      await txAny.tierDefinition.deleteMany({ where: { shop } });
+    }
+    await tx.customerPointsBalance.deleteMany({ where: { shop } });
+    await tx.pointsLedger.deleteMany({ where: { shop } });
+    await tx.orderPointsSnapshot.deleteMany({ where: { shop } });
+    await tx.redemption.deleteMany({ where: { shop } });
+    await tx.privacyEvent.deleteMany({ where: { shop } });
+    await tx.webhookError.deleteMany({ where: { shop } });
+  });
 
   return { outcome: "PROCESSED", message: "App uninstalled: shop data cleaned up (sessions/settings/points/redemptions)." };
 }
@@ -645,11 +649,8 @@ async function handleOrdersPaid(args: { shop: string; payload: any; admin: any }
   }
 
   const eligibleDollarUnits = Math.floor(eligibleNetCents / 100);
-  const existingBalance = await db.customerPointsBalance.findUnique({
-    where: { shop_customerId: { shop, customerId } },
-    select: { lifetimeEarned: true },
-  } as any);
-  const progressBeforeAward = buildTierProgress(settings, Number((existingBalance as any)?.lifetimeEarned ?? 0));
+  const currentMetrics = await getCustomerTierMetrics(shop, customerId);
+  const progressBeforeAward = buildTierProgress(settings, currentMetrics);
   const effectiveEarnRate = excluded ? 0 : computeEffectiveEarnRate(settings, progressBeforeAward.currentTier);
   const pointsEarned = excluded ? 0 : Math.max(0, eligibleDollarUnits * effectiveEarnRate);
 

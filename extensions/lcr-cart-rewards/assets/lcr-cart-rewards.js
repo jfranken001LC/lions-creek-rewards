@@ -1,2 +1,259 @@
-(()=>{const $=(e,s)=>e.querySelector(s),norm=p=>{p=String(p||"").trim();if(!p)return"";if(p.startsWith("http://")||p.startsWith("https://")){try{p=new URL(p).pathname}catch{}}
-if(p[0]!="/")p="/"+p;return p.replace(/\/$/,"")},fj=async(u,i)=>{const r=await fetch(u,i),t=await r.text();let d=null;try{d=t?JSON.parse(t):null}catch{d={ok:!1,error:"Invalid JSON response",raw:t}}return{r,d}},fm=v=>{v=Number(v);return Number.isFinite(v)?"$"+v.toFixed(2):"$0.00"},rc=root=>{const n=parseInt(root.getAttribute("data-cart-subtotal-cents")||"",10);return Number.isFinite(n)?n:null},fc=async()=>{try{const{r,d}=await fj("/cart.js",{method:"GET",headers:{Accept:"application/json"}});if(!r.ok||!d)return null;const c=Number(d.items_subtotal_price??d.total_price);return Number.isFinite(c)?c:null}catch{return null}},dls=c=>{c=Number(c);return Number.isFinite(c)?c/100:null},min=s=>{const n=Number(s?.settings?.minOrderDollars??s?.settings?.redemptionMinOrder);return Number.isFinite(n)&&n>0?n:0},prog=(bal,opts)=>{bal=Number(bal);if(!Number.isFinite(bal))return"";opts=(Array.isArray(opts)?opts:[]).filter(o=>o&&Number.isFinite(+o.points)&&Number.isFinite(+o.valueDollars)).slice().sort((a,b)=>+a.points-+b.points);if(!opts.length)return"";const first=opts[0],next=opts.find(o=>+o.points>bal);if(bal<+first.points){const diff=Math.max(0,+first.points-bal);return`You're ${diff} point${diff==1?"":"s"} away from ${fm(first.valueDollars)} off.`}if(next){const diff=Math.max(0,+next.points-bal);return`Next reward: ${diff} more point${diff==1?"":"s"} to unlock ${fm(next.valueDollars)} off.`}return"You're at the top reward tier."},set=(root,msg,html)=>{$(root,"[data-lcr-status]").textContent=msg||"";$(root,"[data-lcr-body]").innerHTML=html||""},render=(root,state,subC)=>{const bal=state?.points?.balance??0,opts=Array.isArray(state?.redemptionOptions)?state.redemptionOptions:[],minD=min(state),subD=subC!=null?dls(subC):null,subOk=minD<=0||subD==null?1:subD>=minD,pl=prog(bal,opts),eff=opts.map(o=>({...o,can:!!o?.canRedeem&&subOk})),redeemable=eff.filter(o=>o&&o.can);let h=`<div class="lcr-row"><strong>Points balance:</strong> ${bal}</div>`;if(pl)h+=`<div class="lcr-muted">${pl}</div>`;if(minD>0&&subD!=null){if(subOk)h+=`<div class="lcr-muted">Cart subtotal: ${fm(subD)} (min: ${fm(minD)}).</div>`;else{const need=Math.max(0,minD-subD);h+=`<div class="lcr-muted">Add ${fm(need)} more to redeem (min: ${fm(minD)}).</div>`}}if(state?.redemption?.code){h+=`<div class="lcr-active">Active code: <strong>${state.redemption.code}</strong> (expires ${new Date(state.redemption.expiresAt).toLocaleString()})</div><div class="lcr-muted">Use this code at checkout before it expires.</div>`}if(!eff.length){set(root,"",h+`<div class="lcr-muted">No redemption options configured.</div>`);return}h+=`<div class="lcr-options"><div class="lcr-muted">Redeem now:</div>`;const def=redeemable.length?+redeemable[0].points:null;for(const o of eff){const dis=o.can?"":"disabled",label=`${o.points} points → ${fm(o.valueDollars)} off`,chk=!state?.redemption&&def!=null&&+o.points===def&&o.can?"checked":"";h+=`<label class="lcr-option"><input type="radio" name="lcr-redeem" value="${o.points}" ${dis} ${chk}/> ${label}</label>`}h+=`</div>`;const btnDis=!redeemable.length||!!state?.redemption;h+=`<button type="button" class="lcr-btn" data-lcr-redeem-btn ${btnDis?"disabled":""}>Redeem &amp; checkout</button>`;h+=state?.redemption?`<div class="lcr-muted lcr-hint">You already have an active code. Use it at checkout.</div>`:`<div class="lcr-muted lcr-hint">We’ll apply your code and redirect you to checkout.</div>`;set(root,"",h)},initOne=async root=>{const proxy=norm(root.getAttribute("data-proxy-path")||"");if(!proxy){set(root,"Missing app proxy path. Configure the block settings.","");return}set(root,"Loading rewards…","");const loyaltyUrl=`${proxy}/loyalty.json`,{r,d}=await fj(loyaltyUrl,{method:"GET",headers:{Accept:"application/json"}});if(r.status===401||r.status===403){set(root,"Log in to view and redeem rewards.","");return}if(!d||d.ok!==!0){set(root,d?.error||"Unable to load rewards.","");return}let subC=rc(root);render(root,d,subC);const btn=$(root,"[data-lcr-redeem-btn]");if(!btn||btn.hasAttribute("disabled"))return;btn.addEventListener("click",async()=>{try{const sel=$(root,"input[name='lcr-redeem']:checked"),pts=sel?+sel.value:NaN;if(!Number.isFinite(pts)||pts<=0){alert("Please select a reward to redeem.");return}const minD=min(d);if(minD>0){const fresh=await fc();if(fresh!=null)subC=fresh;const subD=subC!=null?dls(subC):null;if(subD!=null&&subD<minD){alert(`Minimum cart subtotal to redeem points is ${fm(minD)}.`);return}}btn.setAttribute("disabled","disabled");btn.textContent="Creating code…";const idem=(typeof crypto!=="undefined"&&crypto.randomUUID&&crypto.randomUUID())||`idem_${Date.now()}_${Math.random().toString(16).slice(2)}`,redeemUrl=`${proxy}/redeem.json`,{d:issued}=await fj(redeemUrl,{method:"POST",headers:{"content-type":"application/json",Accept:"application/json"},body:JSON.stringify({pointsToRedeem:pts,idempotencyKey:idem})});if(!issued||issued.ok!==!0||!issued.code){alert(issued?.error||"Failed to redeem points.");btn.removeAttribute("disabled");btn.textContent="Redeem & checkout";return}window.location.href=`/discount/${encodeURIComponent(issued.code)}?redirect=/checkout`}catch(e){console.error(e);alert("Unexpected error redeeming points.");btn.removeAttribute("disabled");btn.textContent="Redeem & checkout"}})},initAll=()=>document.querySelectorAll("[data-lcr-cart-rewards]").forEach(initOne);document.readyState==="loading"?document.addEventListener("DOMContentLoaded",initAll):initAll})();
+(() => {
+  function $(root, selector) {
+    return root.querySelector(selector);
+  }
+
+  function normalizePath(input) {
+    let value = String(input || "").trim();
+    if (!value) return "";
+    if (!value.startsWith("/")) value = `/${value}`;
+    return value.replace(/\/$/, "");
+  }
+
+  async function fetchJson(url, options) {
+    const response = await fetch(url, options);
+    const text = await response.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { ok: false, error: "Invalid JSON response", raw: text };
+    }
+    return { response, data };
+  }
+
+  function formatMoney(value) {
+    const amount = Number(value);
+    return Number.isFinite(amount) ? `$${amount.toFixed(2)}` : "$0.00";
+  }
+
+  function readSubtotalCents(root) {
+    const cents = parseInt(root.getAttribute("data-cart-subtotal-cents") || "", 10);
+    return Number.isFinite(cents) ? cents : null;
+  }
+
+  async function fetchSubtotalCents() {
+    try {
+      const { response, data } = await fetchJson("/cart.js", {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok || !data) return null;
+      const cents = Number(data.items_subtotal_price ?? data.total_price);
+      return Number.isFinite(cents) ? cents : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function centsToDollars(cents) {
+    const value = Number(cents);
+    return Number.isFinite(value) ? value / 100 : null;
+  }
+
+  function getMinOrderDollars(state) {
+    const value = Number(state?.settings?.minOrderDollars ?? state?.settings?.redemptionMinOrder);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function progressMessage(balance, options) {
+    const numericBalance = Number(balance);
+    if (!Number.isFinite(numericBalance)) return "";
+    const normalized = (Array.isArray(options) ? options : [])
+      .filter((option) => option && Number.isFinite(Number(option.points)) && Number.isFinite(Number(option.valueDollars)))
+      .slice()
+      .sort((a, b) => Number(a.points) - Number(b.points));
+
+    if (!normalized.length) return "";
+
+    const first = normalized[0];
+    const next = normalized.find((option) => Number(option.points) > numericBalance);
+
+    if (numericBalance < Number(first.points)) {
+      const diff = Math.max(0, Number(first.points) - numericBalance);
+      return `You're ${diff} point${diff === 1 ? "" : "s"} away from ${formatMoney(first.valueDollars)} off.`;
+    }
+
+    if (next) {
+      const diff = Math.max(0, Number(next.points) - numericBalance);
+      return `Next reward: ${diff} more point${diff === 1 ? "" : "s"} to unlock ${formatMoney(next.valueDollars)} off.`;
+    }
+
+    return "You're at the top reward tier.";
+  }
+
+  function metricProgressText(tier) {
+    if (!tier?.nextTierName || tier?.remainingToNext == null) return "";
+    const remaining = Number(tier.remainingToNext);
+    if (!Number.isFinite(remaining)) return "";
+
+    if (tier.remainingMetricType === "lifetimeEligibleSpend") {
+      return `${formatMoney(remaining)} more lifetime eligible spend to reach ${tier.nextTierName}.`;
+    }
+
+    return `${remaining} more lifetime point${remaining === 1 ? "" : "s"} to reach ${tier.nextTierName}.`;
+  }
+
+  function setContent(root, statusText, bodyHtml) {
+    $(root, "[data-lcr-status]").textContent = statusText || "";
+    $(root, "[data-lcr-body]").innerHTML = bodyHtml || "";
+  }
+
+  function render(root, state, subtotalCents) {
+    const balance = state?.points?.balance ?? 0;
+    const tierName = state?.tier?.currentTierName || "";
+    const tierProgress = metricProgressText(state?.tier);
+    const options = Array.isArray(state?.redemptionOptions) ? state.redemptionOptions : [];
+    const minOrderDollars = getMinOrderDollars(state);
+    const subtotalDollars = subtotalCents != null ? centsToDollars(subtotalCents) : null;
+    const subtotalEligible = minOrderDollars <= 0 || subtotalDollars == null ? true : subtotalDollars >= minOrderDollars;
+    const pointsProgress = progressMessage(balance, options);
+    const effectiveOptions = options.map((option) => ({ ...option, can: Boolean(option?.canRedeem) && subtotalEligible }));
+    const redeemableOptions = effectiveOptions.filter((option) => option && option.can);
+
+    let html = `<div class="lcr-row"><strong>Points balance:</strong> ${balance}</div>`;
+
+    if (tierName) {
+      html += `<div class="lcr-row"><strong>Tier:</strong> ${tierName}</div>`;
+    }
+    if (tierProgress) {
+      html += `<div class="lcr-muted">${tierProgress}</div>`;
+    }
+    if (pointsProgress) {
+      html += `<div class="lcr-muted">${pointsProgress}</div>`;
+    }
+
+    if (minOrderDollars > 0 && subtotalDollars != null) {
+      if (subtotalEligible) {
+        html += `<div class="lcr-muted">Cart subtotal: ${formatMoney(subtotalDollars)} (min: ${formatMoney(minOrderDollars)}).</div>`;
+      } else {
+        const needed = Math.max(0, minOrderDollars - subtotalDollars);
+        html += `<div class="lcr-muted">Add ${formatMoney(needed)} more to redeem (min: ${formatMoney(minOrderDollars)}).</div>`;
+      }
+    }
+
+    if (state?.redemption?.code) {
+      html += `<div class="lcr-active">Active code: <strong>${state.redemption.code}</strong> (expires ${new Date(state.redemption.expiresAt).toLocaleString()})</div>`;
+      html += `<div class="lcr-muted">Use this code at checkout before it expires.</div>`;
+    }
+
+    if (!effectiveOptions.length) {
+      setContent(root, "", `${html}<div class="lcr-muted">No redemption options configured.</div>`);
+      return;
+    }
+
+    html += `<div class="lcr-options"><div class="lcr-muted">Redeem now:</div>`;
+    const defaultPoints = redeemableOptions.length ? Number(redeemableOptions[0].points) : null;
+
+    for (const option of effectiveOptions) {
+      const disabled = option.can ? "" : "disabled";
+      const label = `${option.points} points → ${formatMoney(option.valueDollars)} off`;
+      const checked = !state?.redemption && defaultPoints != null && Number(option.points) === defaultPoints && option.can ? "checked" : "";
+      html += `<label class="lcr-option"><input type="radio" name="lcr-redeem" value="${option.points}" ${disabled} ${checked}/> ${label}</label>`;
+    }
+
+    html += `</div>`;
+    const buttonDisabled = !redeemableOptions.length || Boolean(state?.redemption);
+    html += `<button type="button" class="lcr-btn" data-lcr-redeem-btn ${buttonDisabled ? "disabled" : ""}>Redeem &amp; checkout</button>`;
+    html += state?.redemption
+      ? `<div class="lcr-muted lcr-hint">You already have an active code. Use it at checkout.</div>`
+      : `<div class="lcr-muted lcr-hint">We’ll apply your code and redirect you to checkout.</div>`;
+
+    setContent(root, "", html);
+  }
+
+  async function initOne(root) {
+    const proxyPath = normalizePath(root.getAttribute("data-proxy-path") || "");
+    if (!proxyPath) {
+      setContent(root, "Missing app proxy path. Configure the block settings.", "");
+      return;
+    }
+
+    setContent(root, "Loading rewards…", "");
+
+    const loyaltyUrl = `${proxyPath}/loyalty.json`;
+    const { response, data } = await fetchJson(loyaltyUrl, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      setContent(root, "Log in to view and redeem rewards.", "");
+      return;
+    }
+
+    if (!data || data.ok !== true) {
+      setContent(root, data?.error || "Unable to load rewards.", "");
+      return;
+    }
+
+    let subtotalCents = readSubtotalCents(root);
+    render(root, data, subtotalCents);
+
+    const button = $(root, "[data-lcr-redeem-btn]");
+    if (!button || button.hasAttribute("disabled")) return;
+
+    button.addEventListener("click", async () => {
+      try {
+        const selected = $(root, "input[name='lcr-redeem']:checked");
+        const pointsToRedeem = selected ? Number(selected.value) : NaN;
+        if (!Number.isFinite(pointsToRedeem) || pointsToRedeem <= 0) {
+          alert("Please select a reward to redeem.");
+          return;
+        }
+
+        const minOrderDollars = getMinOrderDollars(data);
+        if (minOrderDollars > 0) {
+          const freshSubtotal = await fetchSubtotalCents();
+          if (freshSubtotal != null) subtotalCents = freshSubtotal;
+          const subtotalDollars = subtotalCents != null ? centsToDollars(subtotalCents) : null;
+          if (subtotalDollars != null && subtotalDollars < minOrderDollars) {
+            alert(`Minimum cart subtotal to redeem points is ${formatMoney(minOrderDollars)}.`);
+            return;
+          }
+        }
+
+        button.setAttribute("disabled", "disabled");
+        button.textContent = "Creating code…";
+
+        const idempotencyKey =
+          (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID()) ||
+          `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+        const redeemUrl = `${proxyPath}/redeem.json`;
+        const { data: issued } = await fetchJson(redeemUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({ pointsToRedeem, idempotencyKey }),
+        });
+
+        if (!issued || issued.ok !== true || !issued.code) {
+          alert(issued?.error || "Failed to redeem points.");
+          button.removeAttribute("disabled");
+          button.textContent = "Redeem & checkout";
+          return;
+        }
+
+        window.location.href = `/discount/${encodeURIComponent(issued.code)}?redirect=/checkout`;
+      } catch (error) {
+        console.error(error);
+        alert("Unexpected error redeeming points.");
+        button.removeAttribute("disabled");
+        button.textContent = "Redeem & checkout";
+      }
+    });
+  }
+
+  function initAll() {
+    document.querySelectorAll("[data-lcr-cart-rewards]").forEach((root) => initOne(root));
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();

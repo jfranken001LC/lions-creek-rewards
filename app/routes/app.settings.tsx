@@ -15,6 +15,7 @@ import {
   Banner,
   List,
   Divider,
+  Select,
 } from "@shopify/polaris";
 import db from "../db.server";
 import { apiVersion, authenticate } from "../shopify.server";
@@ -170,6 +171,43 @@ function parseRedemptionSteps(raw: FormDataEntryValue | null, fallback: number[]
 }
 
 
+function normalizeTierId(raw: string, idx: number): string {
+  const normalized = String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-");
+  return normalized || `tier-${idx + 1}`;
+}
+
+function normalizeThresholdTypeInput(value: unknown): "lifetimeEarned" | "lifetimeEligibleSpend" {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (
+    raw === "lifetimeeligiblespend" ||
+    raw === "lifetime_eligible_spend" ||
+    raw === "eligible_spend" ||
+    raw === "eligiblespend" ||
+    raw === "lifetimespend" ||
+    raw === "spend"
+  ) {
+    return "lifetimeEligibleSpend";
+  }
+  return "lifetimeEarned";
+}
+
+function createEmptyTier(idx: number): TierDefinitionNormalized {
+  return {
+    tierId: idx === 0 ? "member" : `tier-${idx + 1}`,
+    name: idx === 0 ? "Member" : `Tier ${idx + 1}`,
+    sortOrder: idx,
+    thresholdType: "lifetimeEarned",
+    thresholdValue: idx === 0 ? 0 : idx * 500,
+    earnRateMultiplier: 1,
+    pointsPerDollarOverride: idx === 0 ? 1 : null,
+    effectiveFrom: null,
+  };
+}
+
 function parseTierDefinitions(
   raw: FormDataEntryValue | null,
   fallback: TierDefinitionNormalized[],
@@ -181,17 +219,17 @@ function parseTierDefinitions(
     if (!Array.isArray(parsed)) return fallback;
     return parsed
       .map((row: any, idx: number) => ({
-        tierId: String(row?.tierId ?? row?.name ?? `tier-${idx + 1}`).trim().toLowerCase().replace(/\s+/g, "-"),
+        tierId: normalizeTierId(String(row?.tierId ?? row?.name ?? `tier-${idx + 1}`), idx),
         name: String(row?.name ?? "").trim(),
         sortOrder: Number.isFinite(Number(row?.sortOrder)) ? Math.floor(Number(row.sortOrder)) : idx,
-        thresholdType: "lifetimeEarned" as const,
+        thresholdType: normalizeThresholdTypeInput(row?.thresholdType),
         thresholdValue: Math.max(0, Math.floor(Number(row?.thresholdValue ?? 0))),
         earnRateMultiplier:
           row?.pointsPerDollarOverride != null && row?.pointsPerDollarOverride !== ""
             ? 1
             : Number.isFinite(Number(row?.earnRateMultiplier))
-            ? Number(row.earnRateMultiplier)
-            : 1,
+              ? Number(row.earnRateMultiplier)
+              : 1,
         pointsPerDollarOverride:
           row?.pointsPerDollarOverride != null && row?.pointsPerDollarOverride !== ""
             ? Math.max(1, Math.floor(Number(row.pointsPerDollarOverride)))
@@ -202,6 +240,46 @@ function parseTierDefinitions(
   } catch {
     return fallback;
   }
+}
+
+function validateTierDefinitions(tiers: TierDefinitionNormalized[]): string[] {
+  const errors: string[] = [];
+  if (!tiers.length) {
+    errors.push("At least one tier is required.");
+    return errors;
+  }
+
+  const idSeen = new Set<string>();
+  const lastByType: Record<string, number> = {};
+
+  tiers.forEach((tier, idx) => {
+    const label = tier.name || `Tier ${idx + 1}`;
+    if (!tier.name.trim()) errors.push(`Tier ${idx + 1} is missing a name.`);
+    if (!tier.tierId.trim()) errors.push(`${label}: tier ID is required.`);
+    if (idSeen.has(tier.tierId)) errors.push(`${label}: tier ID "${tier.tierId}" must be unique.`);
+    idSeen.add(tier.tierId);
+
+    if (!Number.isFinite(Number(tier.thresholdValue)) || Number(tier.thresholdValue) < 0) {
+      errors.push(`${label}: threshold value must be 0 or greater.`);
+    }
+
+    const key = tier.thresholdType;
+    const currentThreshold = Number(tier.thresholdValue);
+    if (lastByType[key] != null && currentThreshold < lastByType[key]) {
+      errors.push(`${label}: ${key === "lifetimeEligibleSpend" ? "lifetime spend" : "lifetime points"} thresholds must be non-decreasing.`);
+    }
+    lastByType[key] = currentThreshold;
+
+    if (tier.pointsPerDollarOverride != null) {
+      if (!Number.isFinite(Number(tier.pointsPerDollarOverride)) || Number(tier.pointsPerDollarOverride) < 1) {
+        errors.push(`${label}: points-per-dollar override must be at least 1 when set.`);
+      }
+    } else if (!Number.isFinite(Number(tier.earnRateMultiplier)) || Number(tier.earnRateMultiplier) <= 0) {
+      errors.push(`${label}: earn-rate multiplier must be greater than 0.`);
+    }
+  });
+
+  return errors;
 }
 
 function parseRedemptionValueMap(
@@ -583,6 +661,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const redemptionSteps = parseRedemptionSteps(form.get("redemptionSteps"), existing.redemptionSteps);
     const redemptionValueMap = parseRedemptionValueMap(form.get("redemptionValueMap"), existing.redemptionValueMap);
     const tiers = parseTierDefinitions(form.get("tiersJson"), existing.tiers);
+    const tierErrors = validateTierDefinitions(tiers);
+    if (tierErrors.length) throw new Error(tierErrors.join(" "));
 
     // Discount-scope collection handle/GID (optional)
     const eligibleCollectionHandle = String(form.get("eligibleCollectionHandle") ?? "").trim();
@@ -655,7 +735,59 @@ export default function SettingsPage() {
 
   const [redemptionSteps, setRedemptionSteps] = React.useState(settings.redemptionSteps.join(", "));
   const [redemptionValueMap, setRedemptionValueMap] = React.useState(JSON.stringify(settings.redemptionValueMap, null, 2));
-  const [tiersJson, setTiersJson] = React.useState(JSON.stringify(settings.tiers, null, 2));
+  const [tierDefinitions, setTierDefinitions] = React.useState<TierDefinitionNormalized[]>(settings.tiers.length ? settings.tiers : [createEmptyTier(0)]);
+
+  const tierValidationErrors = React.useMemo(() => validateTierDefinitions(tierDefinitions), [tierDefinitions]);
+  const tiersJson = React.useMemo(
+    () => JSON.stringify(tierDefinitions.map((tier, idx) => ({ ...tier, sortOrder: idx })), null, 2),
+    [tierDefinitions],
+  );
+
+  const updateTier = React.useCallback((index: number, patch: Partial<TierDefinitionNormalized>) => {
+    setTierDefinitions((current) =>
+      current.map((tier, idx) => {
+        if (idx !== index) return tier;
+        const nextName = patch.name !== undefined ? String(patch.name) : tier.name;
+        const nextTierId =
+          patch.tierId !== undefined
+            ? normalizeTierId(String(patch.tierId), index)
+            : patch.name !== undefined
+              ? normalizeTierId(nextName, index)
+              : tier.tierId;
+        return { ...tier, ...patch, tierId: nextTierId, sortOrder: index };
+      }),
+    );
+  }, []);
+
+  const moveTier = React.useCallback((index: number, direction: -1 | 1) => {
+    setTierDefinitions((current) => {
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= current.length) return current;
+      const copy = [...current];
+      const [item] = copy.splice(index, 1);
+      copy.splice(nextIndex, 0, item);
+      return copy.map((tier, idx) => ({ ...tier, sortOrder: idx }));
+    });
+  }, []);
+
+  const addTier = React.useCallback(() => {
+    setTierDefinitions((current) => {
+      const next = [...current, createEmptyTier(current.length)];
+      return next.map((tier, idx) => ({ ...tier, sortOrder: idx }));
+    });
+  }, []);
+
+  const removeTier = React.useCallback((index: number) => {
+    setTierDefinitions((current) => {
+      const filtered = current.filter((_, idx) => idx !== index);
+      const next = filtered.length ? filtered : [createEmptyTier(0)];
+      return next.map((tier, idx) => ({
+        ...tier,
+        sortOrder: idx,
+        tierId: normalizeTierId(tier.tierId || tier.name, idx),
+      }));
+    });
+  }, []);
 
   const hasWarnings = diagnostics.warnings.length > 0;
   const hasNotes = diagnostics.notes.length > 0;
@@ -705,6 +837,7 @@ export default function SettingsPage() {
 
         <Layout.Section>
           <Form id="settings-form" method="post">
+            <input type="hidden" name="tiersJson" value={tiersJson} />
             <Layout>
               <Layout.Section>
                 <Card>
@@ -909,15 +1042,121 @@ export default function SettingsPage() {
                         helpText='Keys must match the step values. Example: {"500": 10, "1000": 25}.'
                       />
 
-                      <TextField
-                        label="Tier definitions (JSON)"
-                        name="tiersJson"
-                        value={tiersJson}
-                        onChange={setTiersJson}
-                        multiline={8}
-                        autoComplete="off"
-                        helpText='Ordered tier configuration. Example: [{"name":"Member","thresholdValue":0,"pointsPerDollarOverride":1},{"name":"Gold","thresholdValue":1000,"earnRateMultiplier":1.5}]'
-                      />
+                      <BlockStack gap="300">
+                        <InlineStack align="space-between" blockAlign="center">
+                          <Text as="h3" variant="headingSm">Tier definitions</Text>
+                          <Button onClick={addTier}>Add tier</Button>
+                        </InlineStack>
+
+                        {tierValidationErrors.length ? (
+                          <Banner tone="warning" title="Tier validation">
+                            <List type="bullet">
+                              {tierValidationErrors.map((error, index) => (
+                                <List.Item key={index}>{error}</List.Item>
+                              ))}
+                            </List>
+                          </Banner>
+                        ) : null}
+
+                        {tierDefinitions.map((tier, index) => (
+                          <Card key={`${tier.tierId}-${index}`}>
+                            <BlockStack gap="300">
+                              <InlineStack align="space-between" blockAlign="center">
+                                <Text as="h4" variant="headingSm">{tier.name || `Tier ${index + 1}`}</Text>
+                                <InlineStack gap="200">
+                                  <Button onClick={() => moveTier(index, -1)} disabled={index === 0}>Up</Button>
+                                  <Button onClick={() => moveTier(index, 1)} disabled={index === tierDefinitions.length - 1}>Down</Button>
+                                  <Button tone="critical" onClick={() => removeTier(index)} disabled={tierDefinitions.length === 1}>Remove</Button>
+                                </InlineStack>
+                              </InlineStack>
+
+                              <InlineStack gap="400">
+                                <div style={{ flex: 1 }}>
+                                  <TextField
+                                    label="Tier name"
+                                    value={tier.name}
+                                    onChange={(value) => updateTier(index, { name: value, tierId: normalizeTierId(value, index) })}
+                                    autoComplete="off"
+                                  />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                  <TextField
+                                    label="Tier ID"
+                                    value={tier.tierId}
+                                    onChange={(value) => updateTier(index, { tierId: normalizeTierId(value, index) })}
+                                    autoComplete="off"
+                                    helpText="Stable internal key stored per shop."
+                                  />
+                                </div>
+                              </InlineStack>
+
+                              <InlineStack gap="400">
+                                <div style={{ flex: 1 }}>
+                                  <Select
+                                    label="Threshold type"
+                                    options={[
+                                      { label: "Lifetime points earned", value: "lifetimeEarned" },
+                                      { label: "Lifetime eligible spend ($)", value: "lifetimeEligibleSpend" },
+                                    ]}
+                                    value={tier.thresholdType}
+                                    onChange={(value) => updateTier(index, { thresholdType: normalizeThresholdTypeInput(value) })}
+                                  />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                  <TextField
+                                    label={tier.thresholdType === "lifetimeEligibleSpend" ? "Threshold value ($ whole dollars)" : "Threshold value (points)"}
+                                    type="number"
+                                    inputMode="numeric"
+                                    value={String(tier.thresholdValue)}
+                                    onChange={(value) => updateTier(index, { thresholdValue: Math.max(0, Math.floor(Number(value || 0))) })}
+                                    autoComplete="off"
+                                  />
+                                </div>
+                              </InlineStack>
+
+                              <InlineStack gap="400">
+                                <div style={{ flex: 1 }}>
+                                  <TextField
+                                    label="Earn-rate multiplier"
+                                    type="number"
+                                    inputMode="decimal"
+                                    value={tier.pointsPerDollarOverride != null ? "1" : String(tier.earnRateMultiplier)}
+                                    onChange={(value) => updateTier(index, { earnRateMultiplier: Number(value || 1) || 1 })}
+                                    autoComplete="off"
+                                    disabled={tier.pointsPerDollarOverride != null}
+                                    helpText="Use this when points-per-dollar override is blank."
+                                  />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                  <TextField
+                                    label="Points per $ override (optional)"
+                                    type="number"
+                                    inputMode="numeric"
+                                    value={tier.pointsPerDollarOverride != null ? String(tier.pointsPerDollarOverride) : ""}
+                                    onChange={(value) =>
+                                      updateTier(index, {
+                                        pointsPerDollarOverride: value === "" ? null : Math.max(1, Math.floor(Number(value || 1))),
+                                        earnRateMultiplier: value === "" ? tier.earnRateMultiplier : 1,
+                                      })
+                                    }
+                                    autoComplete="off"
+                                    helpText="When set, this overrides the multiplier for the tier."
+                                  />
+                                </div>
+                              </InlineStack>
+                            </BlockStack>
+                          </Card>
+                        ))}
+
+                        <TextField
+                          label="Tier JSON preview"
+                          value={tiersJson}
+                          multiline={8}
+                          autoComplete="off"
+                          readOnly
+                          helpText='Generated from the tier editor. Supports thresholdType of lifetimeEarned or lifetimeEligibleSpend.'
+                        />
+                      </BlockStack>
                     </FormLayout>
                   </BlockStack>
                 </Card>

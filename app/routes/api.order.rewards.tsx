@@ -4,7 +4,7 @@ import { authenticate } from "../shopify.server";
 import { shopFromDest } from "../lib/proxy.server";
 import { normalizeCustomerId } from "../lib/loyalty.server";
 import { getOrCreateShopSettings } from "../lib/shopSettings.server";
-import { buildTierProgress, computeEffectiveEarnRate, resolveTierForMetric } from "../lib/tier.server";
+import { buildTierProgress, computeEffectiveEarnRate, getCustomerTierMetrics } from "../lib/tier.server";
 
 type ReadyPayload = {
   ok: true;
@@ -15,6 +15,7 @@ type ReadyPayload = {
   effectiveEarnRate: number | null;
   nextTierName: string | null;
   remainingToNext: number | null;
+  remainingMetricType: "lifetimeEarned" | "lifetimeEligibleSpend" | null;
   nextRewardMessage: string | null;
 };
 
@@ -27,6 +28,7 @@ type PendingPayload = {
   effectiveEarnRate: null;
   nextTierName: null;
   remainingToNext: null;
+  remainingMetricType: null;
   nextRewardMessage: string | null;
 };
 
@@ -152,6 +154,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
       effectiveEarnRate: null,
       nextTierName: null,
       remainingToNext: null,
+      remainingMetricType: null,
       nextRewardMessage: null,
     };
 
@@ -174,13 +177,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
     where: { shop_customerId: { shop, customerId: snapshotCustomerId } },
     select: {
       balance: true,
-      lifetimeEarned: true,
       currentTierName: true,
     } as any,
   } as any);
 
   const settings = await getOrCreateShopSettings(shop);
-  const progress = buildTierProgress(settings, Number((bal as any)?.lifetimeEarned ?? 0));
+  const metrics = await getCustomerTierMetrics(shop, snapshotCustomerId);
+  const progress = buildTierProgress(settings, metrics);
   const nextRewardMessage = buildNextRewardMessage({
     balance: (bal as any)?.balance ?? 0,
     steps: Array.isArray(settings.redemptionSteps) ? (settings.redemptionSteps as any) : [],
@@ -193,11 +196,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
     pointsEarned: (snapshot as any).pointsAwarded ?? 0,
     balance: (bal as any)?.balance ?? 0,
     currentTierName: (bal as any)?.currentTierName ?? (snapshot as any).effectiveTierName ?? progress.currentTier.name,
-    effectiveEarnRate:
-      (snapshot as any).effectiveEarnRate ??
-      computeEffectiveEarnRate(settings, resolveTierForMetric(settings, Number((bal as any)?.lifetimeEarned ?? 0))),
+    effectiveEarnRate: (snapshot as any).effectiveEarnRate ?? computeEffectiveEarnRate(settings, progress.currentTier),
     nextTierName: progress.nextTier?.name ?? null,
     remainingToNext: progress.nextTier ? progress.remainingToNext : null,
+    remainingMetricType: progress.nextTier ? progress.remainingMetricType : null,
     nextRewardMessage,
   };
 

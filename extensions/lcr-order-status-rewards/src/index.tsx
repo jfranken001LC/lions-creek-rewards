@@ -5,6 +5,8 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 
 declare const shopify: any;
 
+type TierMetricType = "lifetimeEarned" | "lifetimeEligibleSpend";
+
 type RewardsPending = {
   ok: true;
   status: "pending";
@@ -14,6 +16,7 @@ type RewardsPending = {
   effectiveEarnRate: null;
   nextTierName: null;
   remainingToNext: null;
+  remainingMetricType: null;
   nextRewardMessage: string | null;
 };
 
@@ -26,6 +29,7 @@ type RewardsReady = {
   effectiveEarnRate: number | null;
   nextTierName: string | null;
   remainingToNext: number | null;
+  remainingMetricType: TierMetricType | null;
   nextRewardMessage: string | null;
 };
 
@@ -142,10 +146,7 @@ function Extension() {
     if (!state || (state.ok === true && state.status === "pending")) return "Processing rewards…";
     if (state.ok === false) return `Rewards: ${state.error}`;
     const tierText = state.currentTierName ? ` Tier: ${state.currentTierName}.` : "";
-    const nextTierText =
-      state.nextTierName && state.remainingToNext != null
-        ? ` ${state.remainingToNext} point(s) to reach ${state.nextTierName}.`
-        : "";
+    const nextTierText = formatNextTierText(state.nextTierName, state.remainingToNext, state.remainingMetricType);
     return `You earned ${state.pointsEarned} point(s). Balance: ${state.balance}.${tierText}${nextTierText}`;
   }, [appBaseUrl, orderId, state]);
 
@@ -164,4 +165,22 @@ function Extension() {
       </s-stack>
     </s-section>
   );
+}
+
+function formatNextTierText(
+  nextTierName: string | null,
+  remainingToNext: number | null,
+  remainingMetricType: TierMetricType | null,
+): string {
+  if (!nextTierName || remainingToNext == null || !remainingMetricType) return "";
+  if (remainingMetricType === "lifetimeEligibleSpend") {
+    return ` ${formatCurrency(remainingToNext)} more lifetime eligible spend to reach ${nextTierName}.`;
+  }
+  return ` ${remainingToNext} point(s) to reach ${nextTierName}.`;
+}
+
+function formatCurrency(value: number): string {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "$0.00";
+  return `$${n.toFixed(2)}`;
 }

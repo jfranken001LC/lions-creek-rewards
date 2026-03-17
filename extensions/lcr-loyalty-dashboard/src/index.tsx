@@ -5,6 +5,7 @@ import {useEffect, useMemo, useState} from 'preact/hooks';
 
 declare const shopify: any;
 
+type TierMetricType = 'lifetimeEarned' | 'lifetimeEligibleSpend';
 type RedemptionStatus = 'ISSUED' | 'APPLIED' | 'EXPIRED' | 'CANCELED';
 
 type LoyaltyPayloadOk = {
@@ -15,6 +16,7 @@ type LoyaltyPayloadOk = {
     balance: number;
     lifetimeEarned: number;
     lifetimeRedeemed: number;
+    lifetimeEligibleSpend: number;
     lastActivityAt: string | null;
     expireAfterDays: number | null;
   };
@@ -24,7 +26,9 @@ type LoyaltyPayloadOk = {
     effectiveEarnRate: number;
     nextTierName: string | null;
     remainingToNext: number;
+    remainingMetricType: TierMetricType;
     currentMetric: number;
+    currentMetricType: TierMetricType;
     tierComputedAt: string | null;
   };
   redemption:
@@ -61,6 +65,7 @@ type LoyaltyPayloadOk = {
     tiers: Array<{
       tierId: string;
       name: string;
+      thresholdType: TierMetricType;
       thresholdValue: number;
       earnRateMultiplier: number;
       pointsPerDollarOverride: number | null;
@@ -238,6 +243,7 @@ function Extension() {
   }
 
   const available = payload?.points?.balance ?? 0;
+  const usesSpendTiers = Boolean(payload?.settings?.tiers?.some((tier) => tier.thresholdType === 'lifetimeEligibleSpend'));
 
   return (
     <s-page heading="Lions Creek Rewards" subheading="Earn points on every order. Redeem points for discounts.">
@@ -288,9 +294,7 @@ function Extension() {
                 Earn rate: {formatNumber(payload.tier.effectiveEarnRate)} point(s) per {formatCurrency(1)} spent
               </s-text>
               {payload.tier.nextTierName ? (
-                <s-text type="small">
-                  {formatNumber(payload.tier.remainingToNext)} lifetime point(s) to reach {payload.tier.nextTierName}
-                </s-text>
+                <s-text type="small">{formatTierProgress(payload.tier.remainingToNext, payload.tier.remainingMetricType, payload.tier.nextTierName)}</s-text>
               ) : (
                 <s-text type="small">You are at the highest available tier.</s-text>
               )}
@@ -299,6 +303,10 @@ function Extension() {
                 Lifetime earned: {formatNumber(payload.points.lifetimeEarned)} · Lifetime redeemed:{' '}
                 {formatNumber(payload.points.lifetimeRedeemed)}
               </s-text>
+
+              {usesSpendTiers ? (
+                <s-text type="small">Lifetime eligible spend: {formatCurrency(payload.points.lifetimeEligibleSpend)}</s-text>
+              ) : null}
 
               {payload.points.expireAfterDays ? (
                 <s-text type="small">
@@ -354,19 +362,21 @@ function Extension() {
                     Redeem
                   </s-button>
 
-                  {selectedPoints ? (() => {
-                    const opt = redemptionOptions.find((o) => o.points === selectedPoints) || null;
-                    if (!opt) return null;
-                    if (opt.canRedeem) return null;
-                    const hasActive = Boolean(payload.redemption && payload.redemption.status === 'ISSUED');
-                    if (hasActive && payload.settings.preventMultipleActiveRedemptions) {
-                      return <s-text type="small">You already have an active discount code. Use it at checkout before redeeming again.</s-text>;
-                    }
-                    if (opt.points > available) {
-                      return <s-text type="small">You don’t have enough points for that reward.</s-text>;
-                    }
-                    return <s-text type="small">This reward is not currently available.</s-text>;
-                  })() : null}
+                  {selectedPoints
+                    ? (() => {
+                        const opt = redemptionOptions.find((o) => o.points === selectedPoints) || null;
+                        if (!opt) return null;
+                        if (opt.canRedeem) return null;
+                        const hasActive = Boolean(payload.redemption && payload.redemption.status === 'ISSUED');
+                        if (hasActive && payload.settings.preventMultipleActiveRedemptions) {
+                          return <s-text type="small">You already have an active discount code. Use it at checkout before redeeming again.</s-text>;
+                        }
+                        if (opt.points > available) {
+                          return <s-text type="small">You don’t have enough points for that reward.</s-text>;
+                        }
+                        return <s-text type="small">This reward is not currently available.</s-text>;
+                      })()
+                    : null}
 
                   <s-text type="small">
                     Base earn rate: {formatNumber(payload.settings.baseEarnRate)} point(s) per {formatCurrency(1)} spent · Minimum
@@ -383,10 +393,13 @@ function Extension() {
                 {payload.recentActivity.slice(0, 5).map((a) => (
                   <s-stack key={a.id} direction="block" gap="tight">
                     <s-text>
-                      {a.delta >= 0 ? '+' : ''}{formatNumber(a.delta)} ({a.type})
+                      {a.delta >= 0 ? '+' : ''}
+                      {formatNumber(a.delta)} ({a.type})
                     </s-text>
                     <s-text type="small">
-                      {a.description ? a.description : ''}{a.description ? ' · ' : ''}{formatDate(a.createdAt)}
+                      {a.description ? a.description : ''}
+                      {a.description ? ' · ' : ''}
+                      {formatDate(a.createdAt)}
                     </s-text>
                   </s-stack>
                 ))}
@@ -479,6 +492,13 @@ function formatNumber(value: number): string {
     if (shopify?.i18n?.formatNumber) return shopify.i18n.formatNumber(n);
   } catch {}
   return String(n);
+}
+
+function formatTierProgress(remaining: number, metricType: TierMetricType, nextTierName: string): string {
+  if (metricType === 'lifetimeEligibleSpend') {
+    return `${formatCurrency(remaining)} more lifetime eligible spend to reach ${nextTierName}`;
+  }
+  return `${formatNumber(remaining)} lifetime point(s) to reach ${nextTierName}`;
 }
 
 function formatDate(iso: string): string {

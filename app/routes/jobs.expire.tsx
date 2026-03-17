@@ -63,8 +63,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
             const expiredInactiveCustomers = await expireInactiveCustomers({ shop, now });
             results.push({
               shop,
-              expiredRedemptions,
-              expiredInactiveCustomers,
+              expiredRedemptions: expiredRedemptions.expiredCount,
+              expiredInactiveCustomers: expiredInactiveCustomers.expiredCustomersCount,
               skipped: false,
               message: "processed",
             });
@@ -121,8 +121,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
           scope: "single",
           shop,
           now: now.toISOString(),
-          expiredRedemptions,
-          expiredInactiveCustomers,
+          expiredRedemptions: expiredRedemptions.expiredCount,
+          expiredInactiveCustomers: expiredInactiveCustomers.expiredCustomersCount,
+          expiredRedemptionsDetail: expiredRedemptions,
+          expiredInactiveCustomersDetail: expiredInactiveCustomers,
           message: `Processed expiry for ${shop}.`,
         },
         { status: 200 },

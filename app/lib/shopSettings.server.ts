@@ -1,11 +1,13 @@
 import db from "../db.server";
 
+export type TierThresholdType = "lifetimeEarned" | "lifetimeEligibleSpend";
+
 export type TierDefinitionNormalized = {
   id?: string;
   tierId: string;
   name: string;
   sortOrder: number;
-  thresholdType: "lifetimeEarned";
+  thresholdType: TierThresholdType;
   thresholdValue: number;
   earnRateMultiplier: number;
   pointsPerDollarOverride: number | null;
@@ -85,11 +87,28 @@ function toValueMap(value: unknown, fallback: Record<string, number>): Record<st
   return fallback;
 }
 
+function normalizeThresholdType(raw: unknown): TierThresholdType {
+  const value = String(raw ?? "").trim().toLowerCase();
+  if (
+    value === "lifetimeeligiblespend" ||
+    value === "lifetime_eligible_spend" ||
+    value === "lifetimeeligiblespenddollars" ||
+    value === "eligible_spend" ||
+    value === "eligiblespend" ||
+    value === "lifetimespend" ||
+    value === "spend"
+  ) {
+    return "lifetimeEligibleSpend";
+  }
+  return "lifetimeEarned";
+}
+
 function normalizeTier(input: any, idx: number, defaultEarnRate: number): TierDefinitionNormalized | null {
   if (!input || typeof input !== "object") return null;
   const name = String(input.name ?? "").trim();
   if (!name) return null;
 
+  const thresholdType = normalizeThresholdType(input.thresholdType);
   const thresholdValue = Math.max(0, Math.floor(Number(input.thresholdValue ?? 0)));
   const sortOrder = Number.isFinite(Number(input.sortOrder)) ? Math.floor(Number(input.sortOrder)) : idx;
   const tierId =
@@ -102,8 +121,8 @@ function normalizeTier(input: any, idx: number, defaultEarnRate: number): TierDe
     input.pointsPerDollarOverride != null && input.pointsPerDollarOverride !== ""
       ? 1
       : Number.isFinite(Number(input.earnRateMultiplier))
-      ? Number(input.earnRateMultiplier)
-      : 1;
+        ? Number(input.earnRateMultiplier)
+        : 1;
 
   const override =
     input.pointsPerDollarOverride != null && input.pointsPerDollarOverride !== ""
@@ -115,7 +134,7 @@ function normalizeTier(input: any, idx: number, defaultEarnRate: number): TierDe
     tierId,
     name,
     sortOrder,
-    thresholdType: "lifetimeEarned",
+    thresholdType,
     thresholdValue,
     earnRateMultiplier: override != null ? 1 : Math.max(0.01, multiplier || 1),
     pointsPerDollarOverride: override,
@@ -123,13 +142,13 @@ function normalizeTier(input: any, idx: number, defaultEarnRate: number): TierDe
   };
 }
 
-function defaultTiers(baseEarnRate: number): TierDefinitionNormalized[] {
+function defaultTiers(baseEarnRate: number, thresholdType: TierThresholdType = "lifetimeEarned"): TierDefinitionNormalized[] {
   return [
     {
       tierId: "member",
       name: "Member",
       sortOrder: 0,
-      thresholdType: "lifetimeEarned",
+      thresholdType,
       thresholdValue: 0,
       earnRateMultiplier: 1,
       pointsPerDollarOverride: Math.max(1, Math.floor(Number(baseEarnRate || 1))),
@@ -147,8 +166,8 @@ function normalizeTierList(raw: unknown, baseEarnRate: number): TierDefinitionNo
   if (!out.length) return defaultTiers(baseEarnRate);
 
   const sorted = out.sort((a, b) => {
-    if (a.thresholdValue !== b.thresholdValue) return a.thresholdValue - b.thresholdValue;
     if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+    if (a.thresholdValue !== b.thresholdValue) return a.thresholdValue - b.thresholdValue;
     return a.name.localeCompare(b.name);
   });
 
@@ -157,7 +176,7 @@ function normalizeTierList(raw: unknown, baseEarnRate: number): TierDefinitionNo
       tierId: "member",
       name: "Member",
       sortOrder: -1,
-      thresholdType: "lifetimeEarned",
+      thresholdType: sorted[0]?.thresholdType ?? "lifetimeEarned",
       thresholdValue: 0,
       earnRateMultiplier: 1,
       pointsPerDollarOverride: Math.max(1, Math.floor(Number(baseEarnRate || 1))),
@@ -174,7 +193,7 @@ async function loadTierDefinitions(shop: string, baseEarnRate: number): Promise<
 
   const rows = await prismaAny.tierDefinition.findMany({
     where: { shop },
-    orderBy: [{ thresholdValue: "asc" }, { sortOrder: "asc" }, { name: "asc" }],
+    orderBy: [{ sortOrder: "asc" }, { thresholdValue: "asc" }, { name: "asc" }],
   });
 
   return normalizeTierList(rows, baseEarnRate);

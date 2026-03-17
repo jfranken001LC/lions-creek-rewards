@@ -1,7 +1,7 @@
 import db from "../db.server";
 import { RedemptionStatus } from "@prisma/client";
 import { getOrCreateShopSettings } from "./shopSettings.server";
-import { buildTierProgress, computeEffectiveEarnRate, resolveTierForMetric } from "./tier.server";
+import { buildTierProgress, computeEffectiveEarnRate, getCustomerTierMetrics } from "./tier.server";
 
 export function normalizeCustomerId(raw: string): string {
   if (!raw) return "";
@@ -19,6 +19,7 @@ export type CustomerLoyaltyPayload = {
     balance: number;
     lifetimeEarned: number;
     lifetimeRedeemed: number;
+    lifetimeEligibleSpend: number;
     lastActivityAt: string | null;
     expireAfterDays: number | null;
   };
@@ -28,7 +29,9 @@ export type CustomerLoyaltyPayload = {
     effectiveEarnRate: number;
     nextTierName: string | null;
     remainingToNext: number;
+    remainingMetricType: "lifetimeEarned" | "lifetimeEligibleSpend";
     currentMetric: number;
+    currentMetricType: "lifetimeEarned" | "lifetimeEligibleSpend";
     tierComputedAt: string | null;
   };
   redemption:
@@ -67,6 +70,7 @@ export type CustomerLoyaltyPayload = {
     tiers: Array<{
       tierId: string;
       name: string;
+      thresholdType: "lifetimeEarned" | "lifetimeEligibleSpend";
       thresholdValue: number;
       earnRateMultiplier: number;
       pointsPerDollarOverride: number | null;
@@ -149,8 +153,8 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
   } as any);
 
   const activeRedemption = await getActiveRedemption(shop, customerId);
-  const currentMetric = Number(bal.lifetimeEarned ?? 0);
-  const progress = buildTierProgress(settings, currentMetric);
+  const metrics = await getCustomerTierMetrics(shop, customerId);
+  const progress = buildTierProgress(settings, metrics);
   const effectiveEarnRate = computeEffectiveEarnRate(settings, progress.currentTier);
 
   let tierComputedAt = (bal as any).tierComputedAt ? new Date((bal as any).tierComputedAt) : null;
@@ -215,6 +219,7 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
       balance: bal.balance,
       lifetimeEarned: bal.lifetimeEarned,
       lifetimeRedeemed: bal.lifetimeRedeemed,
+      lifetimeEligibleSpend: metrics.lifetimeEligibleSpend,
       lastActivityAt: bal.lastActivityAt ? bal.lastActivityAt.toISOString() : null,
       expireAfterDays: settings.pointsExpireInactivityDays ?? null,
     },
@@ -224,7 +229,9 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
       effectiveEarnRate,
       nextTierName: progress.nextTier?.name ?? null,
       remainingToNext: progress.remainingToNext,
-      currentMetric,
+      remainingMetricType: progress.remainingMetricType,
+      currentMetric: progress.currentMetric,
+      currentMetricType: progress.currentMetricType,
       tierComputedAt: tierComputedAt ? tierComputedAt.toISOString() : null,
     },
     redemption: activeRedemption,
@@ -233,7 +240,7 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
     settings: {
       earnRate: effectiveEarnRate,
       baseEarnRate: settings.baseEarnRate,
-      minOrderDollars: settings.redemptionMinOrder,
+      minOrderDollars: Number(settings.redemptionMinOrder ?? 0) / 100,
       redemptionExpiryHours: settings.redemptionExpiryHours,
       preventMultipleActiveRedemptions: settings.preventMultipleActiveRedemptions,
       redemptionSteps: settings.redemptionSteps,
@@ -241,6 +248,7 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
       tiers: settings.tiers.map((tier) => ({
         tierId: tier.tierId,
         name: tier.name,
+        thresholdType: tier.thresholdType,
         thresholdValue: tier.thresholdValue,
         earnRateMultiplier: tier.earnRateMultiplier,
         pointsPerDollarOverride: tier.pointsPerDollarOverride,
