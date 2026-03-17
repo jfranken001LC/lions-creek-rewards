@@ -153,16 +153,20 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
   const progress = buildTierProgress(settings, currentMetric);
   const effectiveEarnRate = computeEffectiveEarnRate(settings, progress.currentTier);
 
+  let tierComputedAt = (bal as any).tierComputedAt ? new Date((bal as any).tierComputedAt) : null;
+
   if (
     (bal as any).currentTierId !== progress.currentTier.tierId ||
-    (bal as any).currentTierName !== progress.currentTier.name
+    (bal as any).currentTierName !== progress.currentTier.name ||
+    !tierComputedAt
   ) {
+    tierComputedAt = new Date();
     await db.customerPointsBalance.update({
       where: { shop_customerId: { shop, customerId } },
       data: {
         currentTierId: progress.currentTier.tierId,
         currentTierName: progress.currentTier.name,
-        tierComputedAt: new Date(),
+        tierComputedAt,
       } as any,
     } as any);
   }
@@ -221,7 +225,7 @@ export async function getCustomerLoyaltyPayload(shop: string, customerId: string
       nextTierName: progress.nextTier?.name ?? null,
       remainingToNext: progress.remainingToNext,
       currentMetric,
-      tierComputedAt: (bal as any).tierComputedAt ? new Date((bal as any).tierComputedAt).toISOString() : null,
+      tierComputedAt: tierComputedAt ? tierComputedAt.toISOString() : null,
     },
     redemption: activeRedemption,
     redemptionOptions,

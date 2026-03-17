@@ -9,6 +9,8 @@ type PerShopResult = {
   shop: string;
   expiredRedemptions: number;
   expiredInactiveCustomers: number;
+  skipped?: boolean;
+  message?: string;
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
@@ -26,19 +28,46 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
       try {
         const now = new Date();
+        if (shops.length === 0) {
+          return Response.json(
+            {
+              ok: true,
+              scope: "all",
+              now: now.toISOString(),
+              noShopsInstalled: true,
+              shopsProcessed: 0,
+              perShopResults: [] as PerShopResult[],
+              message: "No shops installed. Expiry job exited cleanly.",
+            },
+            { status: 200 },
+          );
+        }
+
         const results: PerShopResult[] = [];
 
         for (const shop of shops) {
           const lock = await acquireJobLock(`jobs.expire:${shop}`);
           if (!lock.acquired) {
-            results.push({ shop, expiredRedemptions: 0, expiredInactiveCustomers: 0 });
+            results.push({
+              shop,
+              expiredRedemptions: 0,
+              expiredInactiveCustomers: 0,
+              skipped: true,
+              message: lock.error ?? "job_already_running",
+            });
             continue;
           }
 
           try {
             const expiredRedemptions = await expireIssuedRedemptions({ shop, now });
             const expiredInactiveCustomers = await expireInactiveCustomers({ shop, now });
-            results.push({ shop, expiredRedemptions, expiredInactiveCustomers });
+            results.push({
+              shop,
+              expiredRedemptions,
+              expiredInactiveCustomers,
+              skipped: false,
+              message: "processed",
+            });
           } finally {
             await releaseJobLock(lock);
           }
@@ -49,9 +78,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
             ok: true,
             scope: "all",
             now: now.toISOString(),
-            noShopsInstalled: shops.length === 0,
+            noShopsInstalled: false,
             shopsProcessed: shops.length,
             perShopResults: results,
+            message: `Processed expiry across ${shops.length} installed shop(s).`,
           },
           { status: 200 },
         );
@@ -63,7 +93,14 @@ export async function loader({ request }: LoaderFunctionArgs) {
     const shop = await resolveShopForJob(request);
     if (!shop) {
       return Response.json(
-        { ok: true, scope: "single", noShopsInstalled: true, shopsProcessed: 0, perShopResults: [] },
+        {
+          ok: true,
+          scope: "single",
+          noShopsInstalled: true,
+          shopsProcessed: 0,
+          perShopResults: [] as PerShopResult[],
+          message: "No shop specified and no installed shops were found.",
+        },
         { status: 200 },
       );
     }
@@ -86,6 +123,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           now: now.toISOString(),
           expiredRedemptions,
           expiredInactiveCustomers,
+          message: `Processed expiry for ${shop}.`,
         },
         { status: 200 },
       );
