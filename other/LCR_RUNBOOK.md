@@ -4,10 +4,12 @@ This runbook is the *repo-local* operational companion to the architecture/requi
 
 ## Canonical ports
 
-- **SSR app server:** `PORT=3000` (Node/React Router SSR)
+- **Local app web port (Windows 11 / PowerShell):** `3010` from `shopify.web.toml`
+- **Production SSR app server (Lightsail + nginx):** `PORT=3000` (Node/React Router SSR)
 - **Vite dev UI:** `FRONTEND_PORT=8002` (default in `vite.config.ts`)
 
-Your nginx reverse proxy and the systemd expiry job **must** point at the same SSR port (`3000`).
+The Shopify CLI manages its own preview proxy during `shopify app dev`. Do **not** tunnel directly to `3010`.
+Your nginx reverse proxy and the systemd expiry job **must** point at the production SSR port (`3000`).
 
 ## Local development (Windows 11 + PowerShell)
 
@@ -33,7 +35,7 @@ shopify app dev --store <your-dev-store>
 
 ### **Rule: do not tunnel directly to the app port**
 
-Do **not** run a custom tunnel (Cloudflare/ngrok/etc.) that points at `localhost:3000` during development.
+Do **not** run a custom tunnel (Cloudflare/ngrok/etc.) that points at `localhost:3010` during development.
 
 Use **`shopify app dev`** so the CLI can:
 

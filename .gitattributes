@@ -1,0 +1,19 @@
+# Keep release archives clean when using git archive.
+.git export-ignore
+.github export-ignore
+.cursor export-ignore
+.gemini export-ignore
+.mcp.json export-ignore
+.shopify export-ignore
+.react-router export-ignore
+build export-ignore
+node_modules export-ignore
+extensions/*/dist export-ignore
+extensions/*/node_modules export-ignore
+other/*.docx export-ignore
+other/deploy_samples export-ignore
+prisma/dev.sqlite export-ignore
+prisma/dev.sqlite-journal export-ignore
+prisma/prod.sqlite export-ignore
+prisma/prod.sqlite-journal export-ignore
+prisma/prisma export-ignore

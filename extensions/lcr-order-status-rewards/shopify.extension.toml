@@ -19,3 +19,9 @@ key = "app_base_url"
 name = "LCR Base URL"
 type = "single_line_text_field"
 description = "Public base URL for the app (used to call /api/order/rewards). Example: https://loyalty.basketbooster.ca"
+
+[[extensions.settings.fields]]
+key = "rewards_page_url"
+name = "Rewards page URL"
+type = "single_line_text_field"
+description = "Optional direct link to the rewards page. Defaults to extension:lcr-loyalty-dashboard/"
