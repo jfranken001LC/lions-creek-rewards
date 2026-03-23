@@ -178,9 +178,17 @@ export default function SetupPage() {
             </Banner>
           ) : null}
 
+          <Banner tone="info" title="Before you run a backfill">
+            <List type="bullet">
+              <List.Item>Confirm your earn rate, eligibility filters, redemption steps, and tiers on the Settings page first.</List.Item>
+              <List.Item>Save stores the configuration only; Run historical backfill now performs the rebuild immediately.</List.Item>
+              <List.Item>Choose the earliest date you want reflected in customer balances and tier history.</List.Item>
+            </List>
+          </Banner>
+
           {loaderData.requiresReadAllOrders ? (
             <Banner tone="warning" title="Older than 60 days may require read_all_orders">
-              Historical backfill from this start date may require the app to be granted the <code>read_all_orders</code> scope in addition to <code>read_orders</code>. After scope changes, reinstall or re-authorize the app before running the backfill.
+              Historical backfill from this start date may require the app to be granted the <code>read_all_orders</code> scope in addition to <code>read_orders</code>. After the scope change, re-authorize or reinstall the app before you run the backfill; otherwise older orders will not be available to scan.
             </Banner>
           ) : null}
         </Layout.Section>
@@ -192,7 +200,7 @@ export default function SetupPage() {
               <BlockStack gap="400">
                 <Text as="h2" variant="headingMd">Optional installation configuration</Text>
                 <Text as="p" tone="subdued">
-                  v1.12 adds an optional setup path that lets the merchant choose a historical start date and then retroactively work forward through paid order history to calculate points balances and tier standing through today.
+                  Use this page when you want the app to rebuild customer balances from past paid orders. Saving stores the chosen settings only. Running the backfill performs a one-time historical rebuild from the selected date through today.
                 </Text>
 
                 <FormLayout>
@@ -201,7 +209,7 @@ export default function SetupPage() {
                     name="historicalBackfillEnabled"
                     checked={historicalBackfillEnabled}
                     onChange={(checked) => setHistoricalBackfillEnabled(checked)}
-                    helpText="This stores the installation backfill preference in shop settings. Running the backfill remains a deliberate admin action."
+                    helpText="Stores whether this shop intends to use historical backfill. Turning this on does not start a backfill by itself; an admin must still click Run historical backfill now."
                   />
 
                   <TextField
@@ -211,8 +219,10 @@ export default function SetupPage() {
                     value={historicalBackfillStartDate}
                     onChange={setHistoricalBackfillStartDate}
                     autoComplete="off"
-                    helpText="Orders from this date through the current date are scanned in chronological order. Existing snapshots and refund/cancel reversal ledgers remain idempotent."
+                    helpText="The app scans paid orders from this date through today in chronological order. Re-running the same range is safe because existing snapshots and reversal ledgers prevent double-counting."
                   />
+
+                  <Text as="p" tone="subdued">Through date: today (the app always rebuilds from the selected start date up to the current date and time).</Text>
                 </FormLayout>
 
                 <InlineStack gap="300">
@@ -245,6 +255,9 @@ export default function SetupPage() {
           <Card>
             <BlockStack gap="300">
               <Text as="h2" variant="headingMd">What the backfill does</Text>
+              <Text as="p" tone="subdued">
+                This process rebuilds loyalty history using the current settings and tier rules. It is intended for onboarding or controlled corrections, not for day-to-day live processing.
+              </Text>
               <List type="bullet">
                 <List.Item>Loads orders from the chosen start date through today using the shop’s offline Admin API session.</List.Item>
                 <List.Item>Applies the current eligibility filters, base earn rate, redemption configuration, and tier definitions.</List.Item>

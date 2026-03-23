@@ -1,67 +1,59 @@
+Lions Creek Rewards - Lightsail quick rebuild and troubleshooting
+
+Code refresh
+-----------
 git fetch --all --prune
-
 git checkout main
-
 git reset --hard origin/main
-
 git log --oneline --decorate --graph --all
 
-===
-
-TROUBLESHOOTING
-# 1) Is nginx complaining about upstream?
+Service checks
+--------------
+# nginx errors
 sudo tail -n 200 /var/log/nginx/error.log
 
-# 2) Is your node service running?
-sudo systemctl status basketbooster -l --no-pager
-journalctl -u basketbooster -n 200 -l --no-pager
+# app service
+sudo systemctl status lions-creek-rewards -l --no-pager
+sudo journalctl -u lions-creek-rewards -n 200 -l --no-pager
 
-# 3) Is anything actually listening on port 3000?
+# expiry timer + job
+sudo systemctl status lions-creek-rewards-expire.timer -l --no-pager
+sudo journalctl -u lions-creek-rewards-expire.service -n 100 -l --no-pager
+
+# confirm app is listening on 3000 locally
 sudo ss -ltnp | grep ':3000' || true
 
-# 4) Can we hit the app locally (bypassing nginx)?
+# bypass nginx and hit the node app directly
 curl -sv http://127.0.0.1:3000/ -o /dev/null
 
+Deploy using the repo helper
+----------------------------
+bash scripts/Server_Git_Code_Deploy.sh
 
-===
+Environment file
+----------------
+Production secrets should live in:
 
-Setting box environment variables
-1) Identify the systemd unit for the running Node process
+/etc/lions-creek-rewards/lions-creek-rewards.env
 
-Run:
+Check the effective systemd configuration:
 
-cat /proc/$(pgrep -f "react-router-serve ./build/server/index.js" | head -n 1)/cgroup | sed -n 's#.*system.slice/\(.*\.service\).*#\1#p' | head -n 1
+sudo systemctl show lions-creek-rewards -p FragmentPath -p EnvironmentFiles -p ExecStart
+sudo systemctl cat lions-creek-rewards
 
+Manual expiry job test
+----------------------
+sudo bash -lc 'set -a; source /etc/lions-creek-rewards/lions-creek-rewards.env; set +a; curl -i -fsS -H "x-job-token: ${JOB_TOKEN}" "http://127.0.0.1:3000/jobs/expire?all=1"'
 
-This prints something like: basketbooster.service (or similar).
-
-Save it as UNIT:
-
-UNIT=$(cat /proc/$(pgrep -f "react-router-serve ./build/server/index.js" | head -n 1)/cgroup | sed -n 's#.*system.slice/\(.*\.service\).*#\1#p' | head -n 1)
-echo $UNIT
-
-2) Show where the environment is defined
-sudo systemctl show "$UNIT" -p FragmentPath -p EnvironmentFiles -p Environment -p ExecStart
-
-3) sudo systemctl cat "$UNIT"
-
-
-from inside file =>  EnvironmentFile=/var/www/basketbooster/.env
-===
-
-If the box becomes unresponsive again: quick recovery
-
-When you can get in via the Lightsail browser SSH:
-
-# see if you had an out-of-memory kill
+If the box becomes unhealthy
+---------------------------
+# check for OOM kills
 dmesg | egrep -i 'killed process|oom' | tail -n 50
 
-# kill any stuck npm/node
+# stop stuck npm/node processes
 sudo pkill -f npm || true
 sudo pkill -f node || true
 
-
-Check disk:
-
+# check disk use
 df -h
-du -sh /var/www/basketbooster/node_modules 2>/dev/null
+du -sh /var/www/lions-creek-rewards/node_modules 2>/dev/null

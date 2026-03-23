@@ -16,12 +16,12 @@ network_access = true
 
 [[extensions.settings.fields]]
 key = "app_base_url"
-name = "LCR Base URL"
+name = "App base URL"
 type = "single_line_text_field"
-description = "Public base URL for the app (used to call /api/order/rewards). Example: https://loyalty.basketbooster.ca"
+description = "Required. Public HTTPS base URL of this app, with no trailing slash. This block calls /api/order/rewards on this host. Example: https://rewards.example.com"
 
 [[extensions.settings.fields]]
 key = "rewards_page_url"
-name = "Rewards page URL"
+name = "Rewards page URL (optional override)"
 type = "single_line_text_field"
-description = "Optional direct link to the rewards page. Defaults to extension:lcr-loyalty-dashboard/"
+description = "Optional full URL to the Rewards page in customer accounts. Leave blank to use extension:lcr-loyalty-dashboard/. Only set this when your storefront uses a custom accounts domain, market prefix, or redirect pattern."

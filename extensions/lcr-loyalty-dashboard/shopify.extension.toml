@@ -21,6 +21,6 @@ network_access = true
 
 [[extensions.settings.fields]]
 key = "app_base_url"
-name = "LCR Base URL"
+name = "App base URL"
 type = "single_line_text_field"
-description = "Public base URL for the app (used by the customer account extension to call /api/customer/*). Example: https://loyalty.basketbooster.ca"
+description = "Required. Public HTTPS base URL of this app, with no trailing slash. The Rewards page calls /api/customer/* on this host. Example: https://rewards.example.com"

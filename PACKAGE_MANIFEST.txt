@@ -1,0 +1,10 @@
+Lions Creek Rewards remediated source package
+
+This package intentionally excludes local build output, local databases, Shopify CLI local state, and editor-specific folders.
+
+Rebuild steps:
+1. npm ci
+2. npm run setup
+3. shopify app dev --store <dev-store> --reset   (local dev)
+   or
+   bash scripts/Server_Git_Code_Deploy.sh        (server-side deploy)

@@ -814,6 +814,14 @@ export default function SettingsPage() {
             </Banner>
           ) : null}
 
+          <Banner tone="info" title="How to use this page">
+            <List type="bullet">
+              <List.Item>Core program rules control earning, redemption minimums, and expiry behavior.</List.Item>
+              <List.Item>Earning defaults to all products unless you add exclusions in Eligibility filters.</List.Item>
+              <List.Item>Historical rebuilds are configured on <Link to="/app/setup">Setup &amp; Historical Backfill</Link>, not on this page.</List.Item>
+            </List>
+          </Banner>
+
           {hasWarnings ? (
             <Banner tone="warning" title="Warnings">
               <List type="bullet">
@@ -842,7 +850,10 @@ export default function SettingsPage() {
               <Layout.Section>
                 <Card>
                   <BlockStack gap="400">
-                    <Text as="h2" variant="headingMd">Core</Text>
+                    <Text as="h2" variant="headingMd">Core program rules</Text>
+                    <Text as="p" tone="subdued">
+                      Use this section to define how customers earn points, when issued discount codes expire, and whether customers can hold more than one open redemption at a time.
+                    </Text>
 
                     <FormLayout>
                       <TextField
@@ -854,6 +865,7 @@ export default function SettingsPage() {
                         autoComplete="off"
                         min={"1"}
                         max={"100"}
+                        helpText="Whole-number points earned per $1 of eligible net merchandise before any tier multiplier or fixed tier override is applied. Example: 1 means a $42.50 eligible order earns about 42 points on the default tier."
                       />
 
                       <TextField
@@ -863,7 +875,7 @@ export default function SettingsPage() {
                         value={minOrderDollars}
                         onChange={setMinOrderDollars}
                         autoComplete="off"
-                        helpText="Example: 25.00 means a $25 minimum subtotal requirement on the discount code."
+                        helpText="Minimum merchandise subtotal required before a redemption discount code can apply. Enter 0 to allow redemption on any order subtotal."
                       />
 
                       <InlineStack gap="400">
@@ -877,7 +889,7 @@ export default function SettingsPage() {
                             autoComplete="off"
                             min={"1"}
                             max={"3650"}
-                            helpText="Points expire after this many days with no qualifying activity (earn or redeem)."
+                            helpText="If a customer has no qualifying loyalty activity for this many days, their remaining points expire the next time the scheduled expiry job runs."
                           />
                         </div>
 
@@ -891,7 +903,7 @@ export default function SettingsPage() {
                             autoComplete="off"
                             min={"1"}
                             max={"720"}
-                            helpText="Issued discount codes expire after this many hours."
+                            helpText="How long a generated redemption code remains usable. If the code expires unused, the expiry job can restore the points to the customer balance."
                           />
                         </div>
                       </InlineStack>
@@ -901,7 +913,7 @@ export default function SettingsPage() {
                         name="preventMultipleActiveRedemptions"
                         checked={preventMultipleActiveRedemptions}
                         onChange={(checked) => setPreventMultipleActiveRedemptions(checked)}
-                        helpText="If enabled, a customer may only have one active redemption code at a time. Redeeming again returns the existing active code."
+                        helpText="On: each customer can have only one unexpired redemption code at a time. Off: customers may generate multiple open codes before using them."
                       />
                     </FormLayout>
                   </BlockStack>
@@ -918,6 +930,10 @@ export default function SettingsPage() {
                       </InlineStack>
                     </InlineStack>
 
+                    <Text as="p" tone="subdued">
+                      Earning defaults to all products unless you exclude collections, products, or tags below. The optional discount-scope collection only limits where redemption codes can be spent; it does not limit earning by itself.
+                    </Text>
+
                     <FormLayout>
                       <InlineStack gap="400">
                         <div style={{ flex: 1 }}>
@@ -928,7 +944,7 @@ export default function SettingsPage() {
                             onChange={setEligibleCollectionHandle}
                             autoComplete="off"
                             placeholder="lcr_loyalty_eligible"
-                            helpText="Optional. If set, redemption codes are scoped to this collection. Leave blank to apply redemption codes to ALL products."
+                            helpText="Optional. Limits where redemption discount codes can be spent. Leave blank to let redemption codes apply to all eligible products in the cart."
                           />
                         </div>
                         <div style={{ flex: 1 }}>
@@ -938,7 +954,7 @@ export default function SettingsPage() {
                             value={eligibleCollectionGid}
                             onChange={setEligibleCollectionGid}
                             autoComplete="off"
-                            helpText="Normally resolved from handle. Leave blank and save to auto-resolve."
+                            helpText="Cached Shopify collection ID for the handle above. Most merchants should leave this alone and let the app refresh it from the handle."
                           />
                         </div>
                       </InlineStack>
@@ -948,6 +964,7 @@ export default function SettingsPage() {
                         name="resolveCollectionNow"
                         checked={resolveCollectionNow}
                         onChange={(checked) => setResolveCollectionNow(checked)}
+                        helpText="Recommended. When enabled, saving settings looks up the handle above and refreshes the cached collection ID so discount scoping stays in sync."
                       />
 
                       <Divider />
@@ -961,7 +978,7 @@ export default function SettingsPage() {
                             onChange={setExcludedCollectionHandles}
                             multiline={3}
                             autoComplete="off"
-                            helpText="Products in ANY of these collections will not earn points (default is earn on all products). Use collection handles, e.g. wholesale-only."
+                            helpText="Products found in any listed collections do not earn points. Use collection handles, not collection titles. Example: wholesale-only, staff-only."
                             placeholder="wholesale-only, staff-only"
                           />
                         </div>
@@ -973,7 +990,7 @@ export default function SettingsPage() {
                             onChange={setExcludedProductIds}
                             multiline={3}
                             autoComplete="off"
-                            helpText="Explicit product exclusions from earning. Accepts numeric IDs or Product GIDs."
+                            helpText="Direct do-not-earn list for specific products. Accepts Shopify numeric product IDs or full Product GIDs."
                             placeholder="1234567890, gid://shopify/Product/1234567890"
                           />
                         </div>
@@ -986,7 +1003,7 @@ export default function SettingsPage() {
                         onChange={setExcludedCustomerTags}
                         multiline={3}
                         autoComplete="off"
-                        helpText="Customers with any of these tags cannot earn or redeem."
+                        helpText="A customer with any listed tag cannot earn points and cannot redeem points. Useful for wholesale, staff, or internal-test accounts."
                         placeholder="Wholesale"
                       />
 
@@ -999,7 +1016,7 @@ export default function SettingsPage() {
                             onChange={setIncludeProductTags}
                             multiline={3}
                             autoComplete="off"
-                            helpText="If set, a product must have at least one include tag (subject to exclude tags)."
+                            helpText="Optional allow-list for earning. When blank, products are allowed unless excluded elsewhere. When set, a product must have at least one listed tag to earn points."
                           />
                         </div>
                         <div style={{ flex: 1 }}>
@@ -1010,7 +1027,7 @@ export default function SettingsPage() {
                             onChange={setExcludeProductTags}
                             multiline={3}
                             autoComplete="off"
-                            helpText="If set, any excluded tag makes a product ineligible."
+                            helpText="Optional block-list for earning. If a product has any listed tag, it will not earn points. Exclude takes priority over Include when the same tag appears in both lists."
                           />
                         </div>
                       </InlineStack>
@@ -1022,7 +1039,14 @@ export default function SettingsPage() {
               <Layout.Section>
                 <Card>
                   <BlockStack gap="400">
-                    <Text as="h2" variant="headingMd">Redemption options</Text>
+                    <Text as="h2" variant="headingMd">Redemption and tiers</Text>
+                    <Text as="p" tone="subdued">
+                      Configure which fixed redemption amounts customers can choose and how tier progression changes the effective earn rate over time.
+                    </Text>
+                    <Text as="p" tone="subdued">
+                      Earning defaults to all products unless you exclude collections, products, or tags below. The optional discount-scope collection only limits where redemption codes can be spent; it does not limit earning by itself.
+                    </Text>
+
                     <FormLayout>
                       <TextField
                         label="Redemption steps (points, comma-separated)"
@@ -1030,7 +1054,7 @@ export default function SettingsPage() {
                         value={redemptionSteps}
                         onChange={setRedemptionSteps}
                         autoComplete="off"
-                        helpText="Example: 500, 1000, 1500"
+                        helpText="Comma-separated point amounts a customer is allowed to redeem. Each step should also exist in the value map below. Example: 500, 1000, 1500"
                       />
                       <TextField
                         label="Redemption value map (JSON: points → dollars)"
@@ -1039,7 +1063,7 @@ export default function SettingsPage() {
                         onChange={setRedemptionValueMap}
                         multiline={6}
                         autoComplete="off"
-                        helpText='Keys must match the step values. Example: {"500": 10, "1000": 25}.'
+                        helpText='Maps each redemption step to a fixed discount value in dollars. Every step should have a matching key. Example: {"500": 10, "1000": 25}.'
                       />
 
                       <BlockStack gap="300">
@@ -1047,6 +1071,10 @@ export default function SettingsPage() {
                           <Text as="h3" variant="headingSm">Tier definitions</Text>
                           <Button onClick={addTier}>Add tier</Button>
                         </InlineStack>
+
+                        <Text as="p" tone="subdued">
+                          Order tiers from lowest to highest. Thresholds should increase as customers move up. Use either a multiplier on the base earn rate or a fixed points-per-dollar override for each tier.
+                        </Text>
 
                         {tierValidationErrors.length ? (
                           <Banner tone="warning" title="Tier validation">
@@ -1077,6 +1105,7 @@ export default function SettingsPage() {
                                     value={tier.name}
                                     onChange={(value) => updateTier(index, { name: value, tierId: normalizeTierId(value, index) })}
                                     autoComplete="off"
+                                    helpText={tier.thresholdType === "lifetimeEligibleSpend" ? "Whole-dollar threshold required to enter this tier. Use 0 for the starting tier." : "Minimum lifetime points earned required to enter this tier. Use 0 for the starting tier."}
                                   />
                                 </div>
                                 <div style={{ flex: 1 }}>
@@ -1085,7 +1114,7 @@ export default function SettingsPage() {
                                     value={tier.tierId}
                                     onChange={(value) => updateTier(index, { tierId: normalizeTierId(value, index) })}
                                     autoComplete="off"
-                                    helpText="Stable internal key stored per shop."
+                                    helpText="Stable internal key stored per shop. It is safest to leave this unchanged once the tier is live."
                                   />
                                 </div>
                               </InlineStack>
@@ -1100,6 +1129,7 @@ export default function SettingsPage() {
                                     ]}
                                     value={tier.thresholdType}
                                     onChange={(value) => updateTier(index, { thresholdType: normalizeThresholdTypeInput(value) })}
+                                    helpText="Choose whether customers qualify for this tier using lifetime points earned or lifetime eligible spend."
                                   />
                                 </div>
                                 <div style={{ flex: 1 }}>
@@ -1110,6 +1140,7 @@ export default function SettingsPage() {
                                     value={String(tier.thresholdValue)}
                                     onChange={(value) => updateTier(index, { thresholdValue: Math.max(0, Math.floor(Number(value || 0))) })}
                                     autoComplete="off"
+                                    helpText={tier.thresholdType === "lifetimeEligibleSpend" ? "Whole-dollar threshold required to enter this tier. Use 0 for the starting tier." : "Minimum lifetime points earned required to enter this tier. Use 0 for the starting tier."}
                                   />
                                 </div>
                               </InlineStack>
@@ -1124,7 +1155,7 @@ export default function SettingsPage() {
                                     onChange={(value) => updateTier(index, { earnRateMultiplier: Number(value || 1) || 1 })}
                                     autoComplete="off"
                                     disabled={tier.pointsPerDollarOverride != null}
-                                    helpText="Use this when points-per-dollar override is blank."
+                                    helpText="Multiplier applied to the base earn rate. Example: base earn rate 1 with multiplier 1.5 awards 1.5x the base points for this tier."
                                   />
                                 </div>
                                 <div style={{ flex: 1 }}>
@@ -1140,7 +1171,7 @@ export default function SettingsPage() {
                                       })
                                     }
                                     autoComplete="off"
-                                    helpText="When set, this overrides the multiplier for the tier."
+                                    helpText="Optional fixed whole-number points per $1 for this tier. When filled in, this takes priority over the multiplier."
                                   />
                                 </div>
                               </InlineStack>
@@ -1154,7 +1185,7 @@ export default function SettingsPage() {
                           multiline={8}
                           autoComplete="off"
                           readOnly
-                          helpText='Generated from the tier editor. Supports thresholdType of lifetimeEarned or lifetimeEligibleSpend.'
+                          helpText='Read-only preview generated from the tier editor. Useful for support or export; editing happens in the tier cards above.'
                         />
                       </BlockStack>
                     </FormLayout>
