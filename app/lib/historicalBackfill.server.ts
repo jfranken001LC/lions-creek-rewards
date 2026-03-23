@@ -1,6 +1,6 @@
 import { LedgerType } from "@prisma/client";
 import db from "../db.server";
-import { apiVersion } from "../shopify.server";
+import { unauthenticated } from "../shopify.server";
 import { buildTierProgress, computeEffectiveEarnRate, getCustomerTierMetrics, refreshCustomerTierSnapshot } from "./tier.server";
 import { getOrCreateShopSettings, upsertShopSettings } from "./shopSettings.server";
 
@@ -92,34 +92,17 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
   }
 `;
 
-async function getOfflineAccessToken(shop: string): Promise<string | null> {
-  const id = `offline_${shop}`;
-  const session = await db.session.findUnique({ where: { id } }).catch(() => null);
-  return session?.accessToken ?? null;
-}
+async function makeAdminGraphql(shop: string): Promise<AdminGraphql> {
+  const { admin } = await unauthenticated.admin(shop);
+  if (!admin) throw new Error("Missing unauthenticated admin client for shop. Reinstall/re-auth the app.");
 
-function makeAdminGraphql(shop: string, accessToken: string): AdminGraphql {
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
   return async (query: string, variables?: Record<string, any>) => {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": accessToken,
-      },
-      body: JSON.stringify({ query, variables: variables ?? {} }),
-    });
-
-    const text = await response.text().catch(() => "");
-    let json: any = null;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      json = null;
-    }
+    const response = await admin.graphql(query, { variables: variables ?? {} });
+    const json = await response.json().catch(() => null);
 
     if (!response.ok) {
-      throw new Error(`Shopify GraphQL failed: ${response.status} ${response.statusText}${text ? ` ${text}` : ""}`);
+      const details = json ? ` ${JSON.stringify(json)}` : "";
+      throw new Error(`Shopify GraphQL failed: ${response.status} ${response.statusText}${details}`);
     }
     if (json?.errors?.length) {
       throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
@@ -529,13 +512,11 @@ export async function runHistoricalOrderBackfill(args: {
   startDate: string;
   requestedBy?: string | null;
   persistConfiguration?: boolean;
+  adminGraphql?: AdminGraphql;
 }): Promise<HistoricalBackfillSummary> {
   const settings = await getOrCreateShopSettings(args.shop);
   const startDate = dayStartUtc(args.startDate);
   const throughDate = dayEndUtc(new Date());
-  const accessToken = await getOfflineAccessToken(args.shop);
-  if (!accessToken) throw new Error("Missing offline access token for shop. Reinstall/re-auth the app.");
-
   const run = await (db as any).historicalBackfillRun.create({
     data: {
       shop: args.shop,
@@ -546,7 +527,7 @@ export async function runHistoricalOrderBackfill(args: {
     },
   });
 
-  const adminGraphql = makeAdminGraphql(args.shop, accessToken);
+  const adminGraphql = args.adminGraphql ?? (await makeAdminGraphql(args.shop));
   const query = `status:any created_at:>=${dateOnly(startDate)} created_at:<=${dateOnly(throughDate)}`;
 
   let after: string | null = null;

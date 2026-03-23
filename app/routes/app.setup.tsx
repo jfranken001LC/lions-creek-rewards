@@ -79,7 +79,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   const existing = await getOrCreateShopSettings(shop);
   const form = await request.formData();
@@ -113,6 +113,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         startDate: historicalBackfillStartDate,
         requestedBy: String((session as any)?.email ?? (session as any)?.userId ?? "admin"),
         persistConfiguration: historicalBackfillEnabled,
+        adminGraphql: async (query, variables) => {
+          const response = await admin.graphql(query, { variables: variables ?? {} });
+          const json = await response.json().catch(() => null);
+          if (!response.ok) {
+            const details = json ? ` ${JSON.stringify(json)}` : "";
+            throw new Error(`Shopify GraphQL failed: ${response.status} ${response.statusText}${details}`);
+          }
+          if (json?.errors?.length) {
+            throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+          }
+          return json?.data ?? null;
+        },
       });
 
       return data<ActionData>({
