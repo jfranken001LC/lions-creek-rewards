@@ -92,12 +92,37 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
   }
 `;
 
+async function describeResponseError(response: Response): Promise<string> {
+  const parts = [`${response.status} ${response.statusText}`.trim()];
+  const location = response.headers.get("Location");
+  if (location) parts.push(`Location: ${location}`);
+
+  try {
+    const body = (await response.clone().text()).trim();
+    if (body) parts.push(body.slice(0, 1000));
+  } catch {
+    // ignore unreadable bodies
+  }
+
+  return parts.filter(Boolean).join(" - ");
+}
+
 async function makeAdminGraphql(shop: string): Promise<AdminGraphql> {
   const { admin } = await unauthenticated.admin(shop);
   if (!admin) throw new Error("Missing unauthenticated admin client for shop. Reinstall/re-auth the app.");
 
   return async (query: string, variables?: Record<string, any>) => {
-    const response = await admin.graphql(query, { variables: variables ?? {} });
+    let response: Response;
+
+    try {
+      response = await admin.graphql(query, { variables: variables ?? {} });
+    } catch (error) {
+      if (error instanceof Response) {
+        throw new Error(`Shopify GraphQL request was redirected or rejected: ${await describeResponseError(error)}`);
+      }
+      throw error;
+    }
+
     const json = await response.json().catch(() => null);
 
     if (!response.ok) {

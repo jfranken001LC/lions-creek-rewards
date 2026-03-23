@@ -136,6 +136,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     return data<ActionData>({ ok: false, error: "Unknown action." }, { status: 400 });
   } catch (error: any) {
+    if (error instanceof Response) throw error;
+
     return data<ActionData>(
       { ok: false, error: String(error?.message ?? error ?? "Historical backfill failed.") },
       { status: 400 },
