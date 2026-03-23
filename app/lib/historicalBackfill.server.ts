@@ -28,7 +28,7 @@ type BackfillOrderNode = any;
 
 const HISTORICAL_ORDERS_QUERY = `#graphql
   query HistoricalOrdersForLoyaltyBackfill($query: String!, $after: String) {
-    orders(first: 50, after: $after, sortKey: CREATED_AT, reverse: false, query: $query) {
+    orders(first: 10, after: $after, sortKey: CREATED_AT, reverse: false, query: $query) {
       edges {
         cursor
         node {
@@ -44,7 +44,7 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
             legacyResourceId
             tags
           }
-          lineItems(first: 250) {
+          lineItems(first: 100) {
             nodes {
               id
               quantity
@@ -55,14 +55,13 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
                 id
                 legacyResourceId
                 tags
-                collections(first: 50) { nodes { handle } }
               }
             }
           }
-          refunds(first: 100) {
+          refunds(first: 25) {
             id
             createdAt
-            refundLineItems(first: 250) {
+            refundLineItems(first: 100) {
               nodes {
                 quantity
                 subtotalSet { shopMoney { amount } }
@@ -76,7 +75,6 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
                     id
                     legacyResourceId
                     tags
-                    collections(first: 50) { nodes { handle } }
                   }
                 }
               }
@@ -92,37 +90,28 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
   }
 `;
 
-async function describeResponseError(response: Response): Promise<string> {
-  const parts = [`${response.status} ${response.statusText}`.trim()];
-  const location = response.headers.get("Location");
-  if (location) parts.push(`Location: ${location}`);
-
-  try {
-    const body = (await response.clone().text()).trim();
-    if (body) parts.push(body.slice(0, 1000));
-  } catch {
-    // ignore unreadable bodies
+const PRODUCT_COLLECTIONS_QUERY = `#graphql
+  query HistoricalBackfillProductCollections($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Product {
+        id
+        legacyResourceId
+        collections(first: 50) {
+          nodes {
+            handle
+          }
+        }
+      }
+    }
   }
-
-  return parts.filter(Boolean).join(" - ");
-}
+`;
 
 async function makeAdminGraphql(shop: string): Promise<AdminGraphql> {
   const { admin } = await unauthenticated.admin(shop);
   if (!admin) throw new Error("Missing unauthenticated admin client for shop. Reinstall/re-auth the app.");
 
   return async (query: string, variables?: Record<string, any>) => {
-    let response: Response;
-
-    try {
-      response = await admin.graphql(query, { variables: variables ?? {} });
-    } catch (error) {
-      if (error instanceof Response) {
-        throw new Error(`Shopify GraphQL request was redirected or rejected: ${await describeResponseError(error)}`);
-      }
-      throw error;
-    }
-
+    const response = await admin.graphql(query, { variables: variables ?? {} });
     const json = await response.json().catch(() => null);
 
     if (!response.ok) {
@@ -210,19 +199,27 @@ function isProductEligibleByTags(productTags: string[], includeTags: string[], e
   return false;
 }
 
-function buildProductEligibilityMap(orderNode: BackfillOrderNode, excludedCollectionHandles: string[]): Map<string, ProductEligibility> {
+function buildProductEligibilityMap(
+  orderNode: BackfillOrderNode,
+  excludedCollectionHandles: string[],
+  productCollections: Map<string, string[]>,
+): Map<string, ProductEligibility> {
   const excludedHandles = new Set((excludedCollectionHandles ?? []).map((h) => String(h).trim().toLowerCase()).filter(Boolean));
   const map = new Map<string, ProductEligibility>();
 
-  for (const line of orderNode?.lineItems?.nodes ?? []) {
-    const product = line?.product;
+  const visitProduct = (product: any) => {
     const numericProductId = numericIdFromShopifyId(product?.legacyResourceId ?? product?.id);
-    if (!numericProductId) continue;
-    const collections = (product?.collections?.nodes ?? []).map((node: any) => String(node?.handle ?? "").trim().toLowerCase());
+    if (!numericProductId || map.has(numericProductId)) return;
+    const collections = (productCollections.get(numericProductId) ?? []).map((handle) => String(handle ?? "").trim().toLowerCase());
     map.set(numericProductId, {
       tags: (product?.tags ?? []).map((tag: any) => String(tag)),
       isExcludedByCollection: collections.some((handle: string) => excludedHandles.has(handle)),
     });
+  };
+
+  for (const line of orderNode?.lineItems?.nodes ?? []) visitProduct(line?.product);
+  for (const refund of orderNode?.refunds ?? []) {
+    for (const refundLine of refund?.refundLineItems?.nodes ?? []) visitProduct(refundLine?.lineItem?.product);
   }
 
   return map;
@@ -259,7 +256,11 @@ function computeEligibleNetMerchandiseCents(orderNode: BackfillOrderNode, settin
   return Math.max(0, total);
 }
 
-function computeEligibleRefundCents(refundNode: any, settings: Awaited<ReturnType<typeof getOrCreateShopSettings>>): number {
+function computeEligibleRefundCents(
+  refundNode: any,
+  settings: Awaited<ReturnType<typeof getOrCreateShopSettings>>,
+  productEligibility: Map<string, ProductEligibility>,
+): number {
   const excludedProductIds = makeProductIdSet(settings.excludedProductIds);
   let total = 0;
 
@@ -269,17 +270,54 @@ function computeEligibleRefundCents(refundNode: any, settings: Awaited<ReturnTyp
     if (!productId) continue;
     if (excludedProductIds.has(productId) || excludedProductIds.has(`gid://shopify/Product/${productId}`)) continue;
 
-    const collections = (lineItem?.product?.collections?.nodes ?? []).map((node: any) => String(node?.handle ?? "").trim().toLowerCase());
-    const isExcludedByCollection = (settings.excludedCollectionHandles ?? []).some((handle) => collections.includes(String(handle).trim().toLowerCase()));
-    if (isExcludedByCollection) continue;
-
-    const tags = (lineItem?.product?.tags ?? []).map((tag: any) => String(tag));
-    if (!isProductEligibleByTags(tags, settings.includeProductTags, settings.excludeProductTags)) continue;
+    const info = productEligibility.get(productId) ?? { tags: [], isExcludedByCollection: false };
+    if (info.isExcludedByCollection) continue;
+    if (!isProductEligibleByTags(info.tags, settings.includeProductTags, settings.excludeProductTags)) continue;
 
     total += moneyToCents(refundLine?.subtotalSet?.shopMoney?.amount);
   }
 
   return Math.max(0, total);
+}
+
+function collectOrderBatchProductIds(edges: any[]): string[] {
+  const ids = new Set<string>();
+
+  const addProduct = (product: any) => {
+    const gid = String(product?.id ?? "").trim();
+    if (gid.startsWith("gid://shopify/Product/")) ids.add(gid);
+  };
+
+  for (const edge of edges ?? []) {
+    const orderNode = edge?.node;
+    for (const line of orderNode?.lineItems?.nodes ?? []) addProduct(line?.product);
+    for (const refund of orderNode?.refunds ?? []) {
+      for (const refundLine of refund?.refundLineItems?.nodes ?? []) addProduct(refundLine?.lineItem?.product);
+    }
+  }
+
+  return [...ids];
+}
+
+async function fetchProductCollections(adminGraphql: AdminGraphql, productIds: string[]): Promise<Map<string, string[]>> {
+  const map = new Map<string, string[]>();
+  const ids = [...new Set((productIds ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))];
+  if (!ids.length) return map;
+
+  for (let index = 0; index < ids.length; index += 50) {
+    const batch = ids.slice(index, index + 50);
+    const data = await adminGraphql(PRODUCT_COLLECTIONS_QUERY, { ids: batch });
+    for (const node of data?.nodes ?? []) {
+      const numericProductId = numericIdFromShopifyId(node?.legacyResourceId ?? node?.id);
+      if (!numericProductId) continue;
+      map.set(
+        numericProductId,
+        (node?.collections?.nodes ?? []).map((entry: any) => String(entry?.handle ?? "").trim()).filter(Boolean),
+      );
+    }
+  }
+
+  return map;
 }
 
 function normalizeFinancialStatus(value: unknown): string {
@@ -339,6 +377,7 @@ async function processHistoricalOrder(
   shop: string,
   settings: Awaited<ReturnType<typeof getOrCreateShopSettings>>,
   orderNode: BackfillOrderNode,
+  productCollections: Map<string, string[]>,
 ): Promise<{
   scanned: number;
   awarded: number;
@@ -359,7 +398,7 @@ async function processHistoricalOrder(
   const cancelledAt = orderNode?.cancelledAt ? new Date(orderNode.cancelledAt) : null;
   const customerTags = Array.isArray(orderNode?.customer?.tags) ? orderNode.customer.tags.map((tag: any) => String(tag)) : [];
   const excludedCustomer = customerIsExcluded(customerTags, settings.excludedCustomerTags);
-  const productEligibility = buildProductEligibilityMap(orderNode, settings.excludedCollectionHandles);
+  const productEligibility = buildProductEligibilityMap(orderNode, settings.excludedCollectionHandles, productCollections);
   const eligibleNetCents = excludedCustomer ? 0 : computeEligibleNetMerchandiseCents(orderNode, settings, productEligibility);
 
   let awarded = 0;
@@ -451,7 +490,7 @@ async function processHistoricalOrder(
       const remaining = Math.max(0, freshSnapshot.pointsAwarded - freshSnapshot.pointsReversedToDate);
       if (remaining <= 0) continue;
 
-      const eligibleRefundCents = computeEligibleRefundCents(refundNode, settings);
+      const eligibleRefundCents = computeEligibleRefundCents(refundNode, settings, productEligibility);
       if (eligibleRefundCents <= 0 || freshSnapshot.eligibleNetMerchandise <= 0) continue;
 
       const baseUnits = Math.floor(freshSnapshot.eligibleNetMerchandise / 100);
@@ -572,11 +611,14 @@ export async function runHistoricalOrderBackfill(args: {
       const data = await adminGraphql(HISTORICAL_ORDERS_QUERY, { query, after });
       const edges = data?.orders?.edges ?? [];
       const pageInfo = data?.orders?.pageInfo ?? { hasNextPage: false, endCursor: null };
+      const productCollections = settings.excludedCollectionHandles?.length
+        ? await fetchProductCollections(adminGraphql, collectOrderBatchProductIds(edges))
+        : new Map<string, string[]>();
 
       for (const edge of edges) {
         const node = edge?.node;
         if (!node) continue;
-        const result = await processHistoricalOrder(args.shop, settings, node);
+        const result = await processHistoricalOrder(args.shop, settings, node, productCollections);
         counters.ordersScanned += result.scanned;
         counters.awardedOrders += result.awarded;
         counters.skippedOrders += result.skipped;
