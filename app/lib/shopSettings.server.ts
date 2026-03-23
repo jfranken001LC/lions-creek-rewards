@@ -14,6 +14,14 @@ export type TierDefinitionNormalized = {
   effectiveFrom: string | null;
 };
 
+export type HistoricalBackfillSummary = {
+  enabled: boolean;
+  startDate: string | null;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  lastSummary: Record<string, any> | null;
+};
+
 export type ShopSettingsNormalized = {
   shop: string;
   earnRate: number;
@@ -36,6 +44,12 @@ export type ShopSettingsNormalized = {
   redemptionSteps: number[];
   redemptionValueMap: Record<string, number>;
   tiers: TierDefinitionNormalized[];
+
+  historicalBackfillEnabled: boolean;
+  historicalBackfillStartDate: string | null;
+  historicalBackfillLastRunAt: string | null;
+  historicalBackfillLastStatus: string | null;
+  historicalBackfillLastSummary: Record<string, any> | null;
 };
 
 const DEFAULT_STEPS = [500, 1000];
@@ -85,6 +99,28 @@ function toValueMap(value: unknown, fallback: Record<string, number>): Record<st
     }
   }
   return fallback;
+}
+
+function toPlainObject(value: unknown): Record<string, any> | null {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, any>;
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+    try {
+      const parsed = JSON.parse(s);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, any>;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function toIsoOrNull(value: unknown): string | null {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 function normalizeThresholdType(raw: unknown): TierThresholdType {
@@ -243,6 +279,15 @@ export function normalizeShopSettings(row: any, shop: string, tiers?: TierDefini
     redemptionSteps,
     redemptionValueMap,
     tiers: normalizeTierList(tiers, baseEarnRate),
+
+    historicalBackfillEnabled: typeof row?.historicalBackfillEnabled === "boolean" ? row.historicalBackfillEnabled : false,
+    historicalBackfillStartDate: toIsoOrNull(row?.historicalBackfillStartDate),
+    historicalBackfillLastRunAt: toIsoOrNull(row?.historicalBackfillLastRunAt),
+    historicalBackfillLastStatus:
+      typeof row?.historicalBackfillLastStatus === "string" && row.historicalBackfillLastStatus.trim()
+        ? row.historicalBackfillLastStatus.trim()
+        : null,
+    historicalBackfillLastSummary: toPlainObject(row?.historicalBackfillLastSummary),
   };
 }
 
@@ -277,6 +322,11 @@ export async function upsertShopSettings(shop: string, input: Partial<ShopSettin
     excludeProductTags: input.excludeProductTags,
     redemptionSteps: input.redemptionSteps,
     redemptionValueMap: input.redemptionValueMap,
+    historicalBackfillEnabled: input.historicalBackfillEnabled,
+    historicalBackfillStartDate: input.historicalBackfillStartDate ? new Date(input.historicalBackfillStartDate) : input.historicalBackfillStartDate,
+    historicalBackfillLastRunAt: input.historicalBackfillLastRunAt ? new Date(input.historicalBackfillLastRunAt) : input.historicalBackfillLastRunAt,
+    historicalBackfillLastStatus: input.historicalBackfillLastStatus,
+    historicalBackfillLastSummary: input.historicalBackfillLastSummary,
   };
 
   for (const k of Object.keys(data)) {

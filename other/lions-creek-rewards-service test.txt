@@ -1,0 +1,4 @@
+sudo bash -lc 'set -a; source /etc/lions-creek-rewards/lions-creek-rewards.env; set +a; curl -i -fsS -H "x-job-token: ${JOB_TOKEN}" "http://127.0.0.1:3000/jobs/expire?all=1"'
+
+sudo systemctl start lions-creek-rewards-expire.service
+sudo journalctl -u lions-creek-rewards-expire.service -n 20 --no-pager

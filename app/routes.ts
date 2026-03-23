@@ -41,6 +41,7 @@ export default [
     route("redemptions", "routes/app.redemptions.tsx"),
     route("reports", "routes/app.reports.tsx"),
     route("settings", "routes/app.settings.tsx"),
+    route("setup", "routes/app.setup.tsx"),
     route("webhooks", "routes/app.webhooks.tsx"),
     route("support", "routes/app.support.tsx"),
   ]),

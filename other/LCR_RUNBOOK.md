@@ -77,6 +77,21 @@ This footer link navigates to:
 - `extension:lcr-loyalty-dashboard/`
 
 
+## v1.12 historical backfill setup
+
+The embedded admin now includes **Setup** (`/app/setup`) for optional install-time historical backfill configuration.
+
+Use it to:
+
+- store a merchant-selected historical start date
+- optionally enable historical backfill in shop settings
+- run a one-shot retroactive recalculation from the selected start date through the current date
+- rebuild points balances and tier standing from historical paid orders, refunds, and cancellations
+
+### Scope requirement for older order history
+
+If the selected start date is older than Shopify's default 60-day order window, the app needs **`read_all_orders`** in addition to **`read_orders`**. After changing scopes, re-deploy and reinstall/re-authorize the app before running the backfill.
+
 ## Production deployment (Lightsail Ubuntu + nginx)
 
 ### 1) nginx reverse proxy

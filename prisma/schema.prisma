@@ -76,8 +76,38 @@ model ShopSettings {
   redemptionSteps                   Json?
   redemptionValueMap                Json?
 
+  historicalBackfillEnabled         Boolean  @default(false)
+  historicalBackfillStartDate       DateTime?
+  historicalBackfillLastRunAt       DateTime?
+  historicalBackfillLastStatus      String?
+  historicalBackfillLastSummary     Json?
+
   createdAt                         DateTime @default(now())
   updatedAt                         DateTime @updatedAt
+}
+
+model HistoricalBackfillRun {
+  id                    String   @id @default(cuid())
+  shop                  String
+  requestedBy           String?
+  startDate             DateTime
+  throughDate           DateTime
+  status                String   @default("PENDING")
+  ordersScanned         Int      @default(0)
+  awardedOrders         Int      @default(0)
+  skippedOrders         Int      @default(0)
+  pointsAwarded         Int      @default(0)
+  refundsProcessed      Int      @default(0)
+  cancellationsProcessed Int     @default(0)
+  errorCount            Int      @default(0)
+  lastError             String?
+  startedAt             DateTime @default(now())
+  completedAt           DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([shop, createdAt])
+  @@index([shop, status, startedAt])
 }
 
 model TierDefinition {

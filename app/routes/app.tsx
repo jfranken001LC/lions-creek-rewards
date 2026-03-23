@@ -23,6 +23,7 @@ export default function App() {
           Dashboard
         </Link>
         <Link to="/app/settings">Settings</Link>
+        <Link to="/app/setup">Setup</Link>
         <Link to="/app/customers">Customers</Link>
         <Link to="/app/redemptions">Redemptions</Link>
         <Link to="/app/webhooks">Webhooks</Link>
