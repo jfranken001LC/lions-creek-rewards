@@ -60,25 +60,23 @@ const HISTORICAL_ORDERS_QUERY = `#graphql
             }
           }
           refunds(first: 100) {
-            nodes {
-              id
-              createdAt
-              refundLineItems(first: 250) {
-                nodes {
+            id
+            createdAt
+            refundLineItems(first: 250) {
+              nodes {
+                quantity
+                subtotalSet { shopMoney { amount } }
+                lineItem {
+                  id
                   quantity
-                  subtotalSet { shopMoney { amount } }
-                  lineItem {
+                  originalUnitPriceSet { shopMoney { amount } }
+                  discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } }
+                  totalDiscountSet { shopMoney { amount } }
+                  product {
                     id
-                    quantity
-                    originalUnitPriceSet { shopMoney { amount } }
-                    discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } }
-                    totalDiscountSet { shopMoney { amount } }
-                    product {
-                      id
-                      legacyResourceId
-                      tags
-                      collections(first: 50) { nodes { handle } }
-                    }
+                    legacyResourceId
+                    tags
+                    collections(first: 50) { nodes { handle } }
                   }
                 }
               }
@@ -429,7 +427,7 @@ async function processHistoricalOrder(
   }
 
   if (snapshot.pointsAwarded > 0) {
-    for (const refundNode of orderNode?.refunds?.nodes ?? []) {
+    for (const refundNode of orderNode?.refunds ?? []) {
       const refundId = numericIdFromShopifyId(refundNode?.id);
       if (!refundId) continue;
 
