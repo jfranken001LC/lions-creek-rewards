@@ -159,19 +159,25 @@ export default function AppIndex() {
                 <Text as="p" tone="subdued">Open <Link to={withSearch("/app/setup")}>Setup</Link> if you want to backfill historical orders from a chosen start date through today and retroactively calculate points/tier standing.</Text>
 
                 <InlineStack align="space-between" blockAlign="center">
-                  <Text as="p">3) Enable customer account extension</Text>
-                  <Badge tone="info">Manual check</Badge>
+                  <Text as="p">3) Add customer account and post-purchase surfaces</Text>
+                  <Badge tone="info">One-time setup</Badge>
                 </InlineStack>
-                <Text as="p" tone="subdued">Ensure the extension setting <b>App Base URL</b> points to the correct environment (dev tunnel vs production domain).</Text>
+                <Text as="p" tone="subdued">In Shopify&apos;s Checkout and accounts editor, add the Rewards page to customer accounts and place the Thank you and Order status blocks. Save the configuration when you are done. These UI extensions now follow the active app environment automatically, so merchants no longer need to enter an App Base URL for dev versus production.</Text>
 
                 <InlineStack align="space-between" blockAlign="center">
-                  <Text as="p">4) Verify webhooks</Text>
+                  <Text as="p">4) Add the cart rewards block</Text>
+                  <Badge tone="info">One-time setup</Badge>
+                </InlineStack>
+                <Text as="p" tone="subdued">In the theme editor, add the Lions Creek Rewards cart block to the cart template so signed-in customers can see their points balance and redeem before checkout.</Text>
+
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="p">5) Verify webhooks</Text>
                   <Badge tone={unprocessedWebhooks > 0 ? "attention" : "success"}>{unprocessedWebhooks > 0 ? "Queue" : "OK"}</Badge>
                 </InlineStack>
                 <Text as="p" tone="subdued">Use <Link to={withSearch("/app/webhooks")}>Webhooks</Link> to confirm events are being processed and investigate failures.</Text>
 
                 <InlineStack align="space-between" blockAlign="center">
-                  <Text as="p">5) Schedule expiry job</Text>
+                  <Text as="p">6) Schedule expiry job</Text>
                   <Badge tone="info">Manual check</Badge>
                 </InlineStack>
                 <Text as="p" tone="subdued">Schedule a local call to <code>GET /jobs/expire?all=1</code> using your <code>JOB_TOKEN</code>.</Text>

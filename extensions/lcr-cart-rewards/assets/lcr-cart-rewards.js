@@ -93,6 +93,10 @@
     $(root, "[data-lcr-body]").innerHTML = bodyHtml || "";
   }
 
+  function setStatus(root, message) {
+    $(root, "[data-lcr-status]").textContent = message || "";
+  }
+
   function render(root, state, subtotalCents) {
     const balance = state?.points?.balance ?? 0;
     const options = Array.isArray(state?.redemptionOptions) ? state.redemptionOptions : [];
@@ -183,7 +187,7 @@
         const selected = $(root, "input[name='lcr-redeem']:checked");
         const pointsToRedeem = Number(selected?.value);
         if (!Number.isFinite(pointsToRedeem) || pointsToRedeem <= 0) {
-          alert("Please select a reward to redeem.");
+          setStatus(root, "Choose a reward before continuing.");
           return;
         }
 
@@ -193,11 +197,12 @@
           if (freshSubtotal != null) subtotalCents = freshSubtotal;
           const subtotalDollars = subtotalCents == null ? null : centsToDollars(subtotalCents);
           if (subtotalDollars != null && subtotalDollars < minOrderDollars) {
-            alert(`Minimum cart subtotal to redeem points is ${formatMoney(minOrderDollars)}.`);
+            setStatus(root, `Minimum cart subtotal to redeem points is ${formatMoney(minOrderDollars)}.`);
             return;
           }
         }
 
+        setStatus(root, "Creating your reward code…");
         button.disabled = true;
         button.textContent = "Creating code…";
 
@@ -215,7 +220,7 @@
         });
 
         if (issued?.ok !== true || !issued.code) {
-          alert(issued?.error || "Failed to redeem points.");
+          setStatus(root, issued?.error || "We could not redeem that reward right now.");
           button.disabled = false;
           button.textContent = "Redeem & checkout";
           return;
@@ -224,7 +229,7 @@
         window.location.href = `/discount/${encodeURIComponent(issued.code)}?redirect=/checkout`;
       } catch (error) {
         console.error(error);
-        alert("Unexpected error redeeming points.");
+        setStatus(root, "Unexpected error redeeming points.");
         button.disabled = false;
         button.textContent = "Redeem & checkout";
       }

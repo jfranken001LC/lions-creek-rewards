@@ -14,14 +14,9 @@ target = "customer-account.order-status.block.render"
 api_access = true
 network_access = true
 
-[[extensions.settings.fields]]
-key = "app_base_url"
-name = "App base URL"
-type = "single_line_text_field"
-description = "Required. Public HTTPS base URL of this app, with no trailing slash. This block calls /api/order/rewards on this host. Example: https://rewards.example.com"
 
 [[extensions.settings.fields]]
 key = "rewards_page_url"
 name = "Rewards page URL (optional override)"
 type = "single_line_text_field"
-description = "Optional full URL to the Rewards page in customer accounts. Leave blank to use extension:lcr-loyalty-dashboard/. Only set this when your storefront uses a custom accounts domain, market prefix, or redirect pattern."
+description = "Optional override for the customer account Rewards page link. Leave blank for the built-in Rewards page. Use this only when your store routes customer accounts through a custom URL pattern."

@@ -1,0 +1,8 @@
+api_version = "2026-01"
+
+[[extensions]]
+name = "Lions Creek Rewards surfaces"
+type = "editor_extension_collection"
+uid = "55d0b515-7b9d-4e47-aaf3-2bd6d9959122"
+handle = "lcr-rewards-surfaces"
+includes = ["lcr-loyalty-dashboard", "lcr-loyalty-nav", "lcr-thank-you-rewards", "lcr-order-status-rewards"]

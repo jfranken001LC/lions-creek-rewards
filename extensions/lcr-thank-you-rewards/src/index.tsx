@@ -4,6 +4,7 @@ import { render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 
 declare const shopify: any;
+declare const process: { env?: Record<string, string | undefined> };
 
 type TierMetricType = "lifetimeEarned" | "lifetimeEligibleSpend";
 
@@ -45,10 +46,22 @@ function normalizeBaseUrl(u: string): string {
   return String(u || "").trim().replace(/\/+$/, "");
 }
 
-function getAppBaseUrlFromSettings(): string {
+function getInjectedAppBaseUrl(): string {
+  try {
+    return normalizeBaseUrl(String(process?.env?.APP_URL ?? ""));
+  } catch {
+    return "";
+  }
+}
+
+function getLegacyAppBaseUrlFromSettings(): string {
   const s = shopify?.settings?.current ?? shopify?.settings?.value ?? {};
   const raw = (s && (s.app_base_url || s.appBaseUrl || s.baseUrl)) || "";
   return normalizeBaseUrl(String(raw || ""));
+}
+
+function getResolvedAppBaseUrl(): string {
+  return getInjectedAppBaseUrl() || getLegacyAppBaseUrlFromSettings();
 }
 
 function getRewardsPageUrlFromSettings(): string {
@@ -59,7 +72,7 @@ function getRewardsPageUrlFromSettings(): string {
 }
 
 function Extension() {
-  const [appBaseUrl, setAppBaseUrl] = useState<string>(() => getAppBaseUrlFromSettings());
+  const [appBaseUrl, setAppBaseUrl] = useState<string>(() => getResolvedAppBaseUrl());
   const [rewardsPageUrl, setRewardsPageUrl] = useState<string>(() => getRewardsPageUrlFromSettings());
   const [orderId, setOrderId] = useState<string | null>(null);
   const [state, setState] = useState<RewardsResponse | null>(null);
@@ -69,10 +82,9 @@ function Extension() {
     const signal = shopify?.settings;
     if (signal && typeof signal.subscribe === "function") {
       return signal.subscribe((next: any) => {
-        const rawBase = next?.app_base_url ?? next?.appBaseUrl ?? next?.baseUrl ?? "";
-        setAppBaseUrl(normalizeBaseUrl(String(rawBase || "")));
         const rawRewards = next?.rewards_page_url ?? next?.rewardsPageUrl ?? next?.rewards_url ?? "";
         setRewardsPageUrl(String(rawRewards || "").trim() || "extension:lcr-loyalty-dashboard/");
+        setAppBaseUrl(getInjectedAppBaseUrl() || normalizeBaseUrl(String(next?.app_base_url ?? next?.appBaseUrl ?? next?.baseUrl ?? "")));
       });
     }
   }, []);
@@ -141,9 +153,9 @@ function Extension() {
   }, [appBaseUrl, orderId]);
 
   const message = useMemo(() => {
-    if (!appBaseUrl) return "Rewards block is missing its base URL configuration.";
-    if (!orderId) return "Loading order…";
-    if (!state || (state.ok === true && state.status === "pending")) return "Processing rewards…";
+    if (!appBaseUrl) return "Rewards details are not available right now.";
+    if (!orderId) return "Loading your order…";
+    if (!state || (state.ok === true && state.status === "pending")) return "We’re calculating your rewards…";
     if (state.ok === false) return `Rewards: ${state.error}`;
     const tierText = state.currentTierName ? ` Tier: ${state.currentTierName}.` : "";
     const nextTierText = formatNextTierText(state.nextTierName, state.remainingToNext, state.remainingMetricType);

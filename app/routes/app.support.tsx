@@ -151,8 +151,10 @@ export default function AppSupportPage() {
                   Configure the program in <Link to={withSearch("/app/settings")}>Settings</Link> (earn rate, redemption steps/value map, and optional exclusions). Set a discount-scope collection handle only if you want redemption codes to apply to a specific collection.
                 </List.Item>
                 <List.Item>
-                  Enable the Customer Account UI extension in your store’s customer accounts. Ensure the extension setting
-                  <b> App Base URL</b> points to your current environment (dev tunnel or production domain).
+                  Add the Rewards customer account page plus the Thank you and Order status blocks in Shopify&apos;s Checkout and accounts editor. The app now follows the active environment automatically, so no App Base URL entry is required for dev versus production.
+                </List.Item>
+                <List.Item>
+                  Add the Lions Creek Rewards cart block to the cart template in the theme editor.
                 </List.Item>
                 <List.Item>
                   Confirm webhooks are receiving and processing under <Link to={withSearch("/app/webhooks")}>Webhooks</Link>.

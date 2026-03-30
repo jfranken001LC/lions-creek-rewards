@@ -19,8 +19,3 @@ allow_direct_linking = true
 api_access = true
 network_access = true
 
-[[extensions.settings.fields]]
-key = "app_base_url"
-name = "App base URL"
-type = "single_line_text_field"
-description = "Required. Public HTTPS base URL of this app, with no trailing slash. The Rewards page calls /api/customer/* on this host. Example: https://rewards.example.com"

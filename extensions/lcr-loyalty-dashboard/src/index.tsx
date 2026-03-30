@@ -4,6 +4,7 @@ import {render} from 'preact';
 import {useEffect, useMemo, useState} from 'preact/hooks';
 
 declare const shopify: any;
+declare const process: { env?: Record<string, string | undefined> };
 
 type TierMetricType = 'lifetimeEarned' | 'lifetimeEligibleSpend';
 type RedemptionStatus = 'ISSUED' | 'APPLIED' | 'EXPIRED' | 'CANCELED';
@@ -98,8 +99,14 @@ export default async () => {
   render(<Extension />, document.body);
 };
 
+
+
+function getResolvedAppBaseUrl(): string {
+  return getInjectedAppBaseUrl() || getAppBaseUrlFromSettings();
+}
+
 function Extension() {
-  const [appBaseUrl, setAppBaseUrl] = useState<string>(() => getAppBaseUrlFromSettings());
+  const [appBaseUrl, setAppBaseUrl] = useState<string>(() => getResolvedAppBaseUrl());
   const [loading, setLoading] = useState<boolean>(true);
   const [payload, setPayload] = useState<LoyaltyPayloadOk | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -112,8 +119,8 @@ function Extension() {
     const signal = shopify?.settings;
     if (signal && typeof signal.subscribe === 'function') {
       return signal.subscribe((next: any) => {
-        const nextBase = normalizeBaseUrl(String(next?.app_base_url ?? ''));
-        if (nextBase) setAppBaseUrl(nextBase);
+        const nextBase = getInjectedAppBaseUrl() || normalizeBaseUrl(String(next?.app_base_url ?? next?.appBaseUrl ?? next?.baseUrl ?? ""));
+        setAppBaseUrl(nextBase);
       });
     }
     return undefined;
@@ -248,13 +255,10 @@ function Extension() {
   return (
     <s-page heading="Lions Creek Rewards" subheading="Earn points on every order. Redeem points for discounts.">
       {!appBaseUrl ? (
-        <s-banner tone="info" heading="Rewards not configured yet">
+        <s-banner tone="info" heading="Rewards are temporarily unavailable">
           <s-stack direction="block" gap="base">
-            <s-text>This rewards dashboard needs one store setting before it can load your points.</s-text>
-            <s-text type="small">
-              Store staff: open Shopify Admin → Apps → Lions Creek Rewards → Support &amp; Setup, then set the Customer
-              Account extension setting “App Base URL” to your current environment.
-            </s-text>
+            <s-text>We could not load your rewards details right now.</s-text>
+            <s-text type="small">Please refresh this page in a moment. If the problem continues, contact the store.</s-text>
           </s-stack>
         </s-banner>
       ) : null}
@@ -464,10 +468,18 @@ async function redeemPoints(appBaseUrl: string, pointsToRedeem: number): Promise
   return body as RedeemResponseOk;
 }
 
+function getInjectedAppBaseUrl(): string {
+  try {
+    return normalizeBaseUrl(String(process?.env?.APP_URL ?? ""));
+  } catch {
+    return "";
+  }
+}
+
 function getAppBaseUrlFromSettings(): string {
   const signal = shopify?.settings;
   const current = signal?.value ?? signal?.current ?? {};
-  return normalizeBaseUrl(String(current?.app_base_url ?? ''));
+  return normalizeBaseUrl(String(current?.app_base_url ?? current?.appBaseUrl ?? current?.baseUrl ?? ''));
 }
 
 function normalizeBaseUrl(input: string): string {
